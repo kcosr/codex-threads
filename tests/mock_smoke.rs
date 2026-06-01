@@ -595,6 +595,10 @@ fn run_json(server: &MockServer, args: &[&str]) -> Value {
     serde_json::from_slice(&output).expect("json output")
 }
 
+fn write_config(server: &MockServer, contents: impl AsRef<str>) {
+    fs::write(&server.config, contents.as_ref()).expect("config");
+}
+
 fn assert_thread_yolo_params(params: &Value) {
     assert_eq!(params["approvalPolicy"], "never");
     assert_eq!(params["sandbox"], "danger-full-access");
@@ -963,6 +967,121 @@ fn new_send_and_settings_commands_return_follow_up_ids() {
     let thread_resume_params = server.params_for("thread/resume");
     assert_eq!(thread_resume_params.len(), 1);
     assert_no_yolo_params(&thread_resume_params[0]);
+}
+
+#[test]
+fn config_model_defaults_apply_to_new_thread_creation_only() {
+    let server = MockServer::start();
+    let cwd = server
+        .config
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    write_config(
+        &server,
+        format!(
+            r#"model = "gpt-5.5"
+model_reasoning_effort = "high"
+
+[servers.work]
+type = "uds"
+path = "{}"
+"#,
+            server.socket.display()
+        ),
+    );
+
+    let completed = run_json(
+        &server,
+        &[
+            "new", "--server", "work", "--cwd", &cwd, "--json", "say done",
+        ],
+    );
+    assert_eq!(completed["threadId"], "thread_new");
+
+    let accepted = run_json(
+        &server,
+        &[
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ],
+    );
+    assert_eq!(accepted["threadId"], "thread_1");
+
+    let thread_start_params = server.params_for("thread/start");
+    assert_eq!(thread_start_params.len(), 1);
+    assert_eq!(thread_start_params[0]["model"], "gpt-5.5");
+    assert_eq!(
+        thread_start_params[0]["config"]["model_reasoning_effort"],
+        "high"
+    );
+
+    let turn_start_params = server.params_for("turn/start");
+    assert_eq!(turn_start_params.len(), 2);
+    assert!(turn_start_params[0].get("model").is_none());
+    assert!(turn_start_params[0].get("effort").is_none());
+    assert!(turn_start_params[1].get("model").is_none());
+    assert!(turn_start_params[1].get("effort").is_none());
+}
+
+#[test]
+fn server_model_defaults_override_global_and_cli_overrides_config() {
+    let server = MockServer::start();
+    let cwd = server
+        .config
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    write_config(
+        &server,
+        format!(
+            r#"model = "gpt-global"
+model_reasoning_effort = "low"
+
+[servers.work]
+type = "uds"
+path = "{}"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+"#,
+            server.socket.display()
+        ),
+    );
+
+    let created = run_json(
+        &server,
+        &["new", "--server", "work", "--cwd", &cwd, "--json"],
+    );
+    assert_eq!(created["threadId"], "thread_new");
+
+    let created = run_json(
+        &server,
+        &[
+            "new", "--server", "work", "--cwd", &cwd, "--model", "gpt-cli", "--effort", "medium",
+            "--json",
+        ],
+    );
+    assert_eq!(created["threadId"], "thread_new");
+
+    let thread_start_params = server.params_for("thread/start");
+    assert_eq!(thread_start_params.len(), 2);
+    assert_eq!(thread_start_params[0]["model"], "gpt-5.5");
+    assert_eq!(
+        thread_start_params[0]["config"]["model_reasoning_effort"],
+        "high"
+    );
+    assert_eq!(thread_start_params[1]["model"], "gpt-cli");
+    assert_eq!(
+        thread_start_params[1]["config"]["model_reasoning_effort"],
+        "medium"
+    );
 }
 
 #[test]

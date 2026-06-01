@@ -7,7 +7,9 @@ use clap::Parser;
 use serde_json::{Map, Value, json};
 
 use crate::cli::*;
-use crate::config::{AppConfig, Target, load_config, resolve_config_path, resolve_target};
+use crate::config::{
+    AppConfig, Target, is_valid_reasoning_effort, load_config, resolve_config_path, resolve_target,
+};
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
@@ -291,6 +293,11 @@ async fn servers_command(
                     .map(|(server, cfg)| Target {
                         server: server.clone(),
                         path: cfg.path.clone(),
+                        model: cfg.model.clone().or_else(|| config.model.clone()),
+                        model_reasoning_effort: cfg
+                            .model_reasoning_effort
+                            .clone()
+                            .or_else(|| config.model_reasoning_effort.clone()),
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -577,11 +584,16 @@ async fn new_command(
     if yolo {
         insert_thread_yolo_permissions(&mut params);
     }
-    insert_opt(&mut params, "model", command.model.clone());
+    let thread_model = command.model.clone().or_else(|| target.model.clone());
+    let thread_effort = command
+        .effort
+        .clone()
+        .or_else(|| target.model_reasoning_effort.clone());
+    insert_opt(&mut params, "model", thread_model);
     if let Some(tier) = &command.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
     }
-    if let Some(effort) = command.effort.as_deref() {
+    if let Some(effort) = thread_effort.as_deref() {
         validate_effort(effort)?;
         params.insert(
             "config".to_string(),
@@ -1724,9 +1736,10 @@ fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
 }
 
 fn validate_effort(effort: &str) -> Result<()> {
-    match effort {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
-        _ => Err(usage_error(format!("invalid effort `{effort}`"))),
+    if is_valid_reasoning_effort(effort) {
+        Ok(())
+    } else {
+        Err(usage_error(format!("invalid effort `{effort}`")))
     }
 }
 

@@ -101,6 +101,9 @@ For the common one-server case, configure one server at
 `~/.config/codex-threads/config.toml`:
 
 ```toml
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+
 [servers.main]
 type = "uds"
 path = "/var/run/user/1000/codex.sock"
@@ -124,6 +127,8 @@ path = "/var/run/user/1000/codex.sock"
 [servers.work]
 type = "uds"
 path = "/home/kevin/.codex-work/app-server-control/app-server-control.sock"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
 ```
 
 Then run commands against a server:
@@ -197,6 +202,17 @@ When more than one server is configured, app-server commands require an explicit
 target through `--server` or `CODEX_THREADS_SERVER`.
 This avoids cursor merging and prevents accidentally sending work to the wrong
 server. `servers ping --all` is the only aggregate command.
+
+New-thread model defaults:
+
+1. `new --model MODEL` and `new --effort EFFORT`
+2. The selected server's `model` and `model_reasoning_effort`
+3. Top-level `model` and `model_reasoning_effort`
+4. Codex app-server defaults
+
+Config model defaults are applied only when creating a thread with `new`.
+Follow-up `send` commands keep the thread's existing app-server settings unless
+`--model` or `--effort` is passed explicitly.
 
 ## Commands
 

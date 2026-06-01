@@ -8,6 +8,10 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_reasoning_effort: Option<String>,
+    #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
 }
 
@@ -16,12 +20,18 @@ pub struct ServerConfig {
     #[serde(rename = "type")]
     pub kind: String,
     pub path: PathBuf,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Target {
     pub server: String,
     pub path: PathBuf,
+    pub model: Option<String>,
+    pub model_reasoning_effort: Option<String>,
 }
 
 pub fn load_config(path: &Path) -> Result<AppConfig> {
@@ -34,6 +44,11 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
 }
 
 pub fn validate_config(config: &AppConfig) -> Result<()> {
+    validate_defaults(
+        "global config",
+        config.model.as_deref(),
+        config.model_reasoning_effort.as_deref(),
+    )?;
     for (alias, server) in &config.servers {
         if alias.trim().is_empty() {
             return Err(anyhow!("server alias must not be empty"));
@@ -47,8 +62,34 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         if server.path.as_os_str().is_empty() {
             return Err(anyhow!("server `{alias}` is missing `path`"));
         }
+        validate_defaults(
+            &format!("server `{alias}`"),
+            server.model.as_deref(),
+            server.model_reasoning_effort.as_deref(),
+        )?;
     }
     Ok(())
+}
+
+fn validate_defaults(scope: &str, model: Option<&str>, effort: Option<&str>) -> Result<()> {
+    if model.is_some_and(|model| model.trim().is_empty()) {
+        return Err(anyhow!("{scope} has empty `model`"));
+    }
+    if let Some(effort) = effort
+        && !is_valid_reasoning_effort(effort)
+    {
+        return Err(anyhow!(
+            "{scope} has invalid `model_reasoning_effort` `{effort}`"
+        ));
+    }
+    Ok(())
+}
+
+pub fn is_valid_reasoning_effort(effort: &str) -> bool {
+    matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    )
 }
 
 pub fn home_dir() -> PathBuf {
@@ -111,6 +152,8 @@ pub fn resolve_target_from(
         return Ok(Target {
             server: endpoint.to_string(),
             path: PathBuf::from(path),
+            model: None,
+            model_reasoning_effort: None,
         });
     }
 
@@ -122,6 +165,11 @@ pub fn resolve_target_from(
         return Ok(Target {
             server: alias.to_string(),
             path: server.path.clone(),
+            model: server.model.clone().or_else(|| config.model.clone()),
+            model_reasoning_effort: server
+                .model_reasoning_effort
+                .clone()
+                .or_else(|| config.model_reasoning_effort.clone()),
         });
     }
 
@@ -130,6 +178,11 @@ pub fn resolve_target_from(
         return Ok(Target {
             server: alias.clone(),
             path: server.path.clone(),
+            model: server.model.clone().or_else(|| config.model.clone()),
+            model_reasoning_effort: server
+                .model_reasoning_effort
+                .clone()
+                .or_else(|| config.model_reasoning_effort.clone()),
         });
     }
 
