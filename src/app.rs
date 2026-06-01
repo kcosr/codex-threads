@@ -13,6 +13,8 @@ const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
 const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
+const THREAD_LABEL_WIDTH: usize = 96;
+const SEARCH_SNIPPET_WIDTH: usize = 96;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -259,14 +261,18 @@ async fn servers_command(
             if command.json {
                 print_json(&json!({ "servers": rows }))?;
             } else {
-                for row in rows {
-                    println!(
-                        "{}\t{}\t{}",
-                        row["alias"].as_str().unwrap_or(""),
-                        row["type"].as_str().unwrap_or(""),
-                        row["path"].as_str().unwrap_or("")
-                    );
-                }
+                print_table(
+                    &["ALIAS", "TYPE", "PATH"],
+                    rows.iter()
+                        .map(|row| {
+                            vec![
+                                table_cell(row["alias"].as_str().unwrap_or("")),
+                                table_cell(row["type"].as_str().unwrap_or("")),
+                                table_cell(row["path"].as_str().unwrap_or("")),
+                            ]
+                        })
+                        .collect(),
+                );
             }
             Ok(0)
         }
@@ -291,13 +297,27 @@ async fn servers_command(
             let mut results = Vec::new();
             for target in targets {
                 let ok = RpcClient::connect(&target.path).await.is_ok();
-                if !ping.json {
-                    println!("{}\t{}", target.server, if ok { "ok" } else { "error" });
-                }
                 results.push(json!({"server": target.server, "ok": ok}));
             }
             if ping.json {
                 print_json(&json!({"servers": results}))?;
+            } else {
+                print_table(
+                    &["SERVER", "STATUS"],
+                    results
+                        .iter()
+                        .map(|row| {
+                            vec![
+                                table_cell(row["server"].as_str().unwrap_or("")),
+                                table_cell(if row["ok"].as_bool() == Some(true) {
+                                    "ok"
+                                } else {
+                                    "error"
+                                }),
+                            ]
+                        })
+                        .collect(),
+                );
             }
             Ok(if results.iter().all(|r| r["ok"].as_bool() == Some(true)) {
                 0
@@ -343,7 +363,7 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
             .request("thread/list", Value::Object(params), |_| {})
             .await?
     };
-    emit_result(&target, command.json, result, "threads")
+    emit_threads_result(&target, command.json, result, ThreadProjection::Direct)
 }
 
 async fn search_command(
@@ -376,7 +396,12 @@ async fn search_command(
             .request("thread/search", Value::Object(params), |_| {})
             .await?
     };
-    emit_result(&target, command.json, result, "results")
+    emit_threads_result(
+        &target,
+        command.json,
+        result,
+        ThreadProjection::SearchResult,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -584,8 +609,10 @@ async fn new_command(target: Target, mut client: RpcClient, command: NewCommand)
     if command.json {
         print_json(&output)?;
     } else {
-        println!("server\t{}", target.server);
-        println!("threadId\t{}", output["threadId"].as_str().unwrap_or(""));
+        print_key_values(&[
+            ("server", target.server.as_str()),
+            ("threadId", output["threadId"].as_str().unwrap_or("")),
+        ]);
     }
     Ok(0)
 }
@@ -654,10 +681,12 @@ async fn start_turn(
     } else if options.json && options.no_wait {
         print_json(&acceptance)?;
     } else if !options.json {
-        println!("server\t{}", target.server);
-        println!("threadId\t{}", thread_id);
-        println!("turnId\t{}", turn_id);
-        println!("status\taccepted");
+        print_key_values(&[
+            ("server", target.server.as_str()),
+            ("threadId", thread_id.as_str()),
+            ("turnId", turn_id.as_str()),
+            ("status", "accepted"),
+        ]);
     }
     if options.no_wait {
         return Ok(0);
@@ -692,9 +721,11 @@ async fn start_turn(
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("interrupted locally; turn is still running");
-                eprintln!("server\t{}", target.server);
-                eprintln!("threadId\t{}", thread_id);
-                eprintln!("turnId\t{}", turn_id);
+                eprint!("{}", key_values_text(&[
+                    ("server", target.server.as_str()),
+                    ("threadId", thread_id.as_str()),
+                    ("turnId", turn_id.as_str()),
+                ]));
                 return Ok(130);
             }
             notification = client.next_notification_or_request() => {
@@ -833,10 +864,12 @@ fn emit_turn_terminal(
         if events.iter().any(|event| event.get("delta").is_some()) {
             println!();
         }
-        println!("status\t{}", output["status"].as_str().unwrap_or(""));
-        println!("server\t{}", wait.target.server);
-        println!("threadId\t{}", wait.thread_id);
-        println!("turnId\t{}", wait.turn_id);
+        print_key_values(&[
+            ("status", output["status"].as_str().unwrap_or("")),
+            ("server", wait.target.server.as_str()),
+            ("threadId", wait.thread_id),
+            ("turnId", wait.turn_id),
+        ]);
     }
     Ok(Some(if output["status"].as_str() == Some("completed") {
         0
@@ -886,13 +919,12 @@ async fn settings_show_command(
     if command.json {
         print_json(&output)?;
     } else {
-        println!("model\t{}", output["model"].as_str().unwrap_or(""));
-        println!("effort\t{}", output["effort"].as_str().unwrap_or(""));
-        println!(
-            "serviceTier\t{}",
-            output["serviceTier"].as_str().unwrap_or("")
-        );
-        println!("cwd\t{}", output["cwd"].as_str().unwrap_or(""));
+        print_key_values(&[
+            ("model", output["model"].as_str().unwrap_or("")),
+            ("effort", output["effort"].as_str().unwrap_or("")),
+            ("serviceTier", output["serviceTier"].as_str().unwrap_or("")),
+            ("cwd", output["cwd"].as_str().unwrap_or("")),
+        ]);
     }
     Ok(0)
 }
@@ -959,16 +991,18 @@ async fn status_command(
         if command.json {
             print_json(&output)?;
         } else {
-            println!("server\t{}", target.server);
-            println!("threadId\t{}", thread_id);
-            println!(
-                "status\t{}",
-                thread["thread"]["status"]["type"].as_str().unwrap_or("")
-            );
-            println!(
-                "activeTurnId\t{}",
-                output["activeTurnId"].as_str().unwrap_or("")
-            );
+            print_key_values(&[
+                ("server", target.server.as_str()),
+                ("threadId", thread_id.as_str()),
+                (
+                    "status",
+                    thread["thread"]["status"]["type"].as_str().unwrap_or(""),
+                ),
+                (
+                    "activeTurnId",
+                    output["activeTurnId"].as_str().unwrap_or(""),
+                ),
+            ]);
         }
     } else {
         let loaded = client
@@ -982,10 +1016,19 @@ async fn status_command(
         if command.json {
             print_json(&output)?;
         } else {
-            println!("server\t{}", target.server);
-            println!("reachable\ttrue");
-            for id in output["loadedThreadIds"].as_array().unwrap_or(&Vec::new()) {
-                println!("loaded\t{}", id.as_str().unwrap_or(""));
+            print_key_values(&[("server", target.server.as_str()), ("reachable", "true")]);
+            if let Some(loaded) = output["loadedThreadIds"]
+                .as_array()
+                .filter(|loaded| !loaded.is_empty())
+            {
+                println!();
+                print_table(
+                    &["LOADED THREAD ID"],
+                    loaded
+                        .iter()
+                        .map(|id| vec![table_cell(id.as_str().unwrap_or(""))])
+                        .collect(),
+                );
             }
         }
     }
@@ -1070,17 +1113,26 @@ async fn models_command(
     if command.json {
         print_json(&output)?;
     } else {
-        for model in output["models"].as_array().unwrap_or(&Vec::new()) {
-            println!(
-                "{}\t{}",
-                model["id"].as_str().unwrap_or(""),
-                model["displayName"]
-                    .as_str()
-                    .or_else(|| model["name"].as_str())
-                    .or_else(|| model["model"].as_str())
-                    .unwrap_or("")
-            );
-        }
+        print_table(
+            &["MODEL", "NAME"],
+            output["models"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|model| {
+                    vec![
+                        table_cell(model["id"].as_str().unwrap_or("")),
+                        table_cell(
+                            model["displayName"]
+                                .as_str()
+                                .or_else(|| model["name"].as_str())
+                                .or_else(|| model["model"].as_str())
+                                .unwrap_or(""),
+                        ),
+                    ]
+                })
+                .collect(),
+        );
     }
     Ok(0)
 }
@@ -1102,8 +1154,8 @@ async fn goal_get_command(
     if command.json {
         print_json(&output)?;
     } else {
-        println!("threadId\t{}", command.thread_id);
-        println!("goal\t{}", output["goal"]);
+        let goal = output["goal"].to_string();
+        print_key_values(&[("threadId", command.thread_id.as_str()), ("goal", &goal)]);
     }
     Ok(0)
 }
@@ -1277,41 +1329,75 @@ fn message_role_name(role: MessageRole) -> &'static str {
 
 fn print_thread_detail(result: &Value) {
     let thread = &result["thread"];
-    println!("server\t{}", result["server"].as_str().unwrap_or(""));
-    println!("id\t{}", thread["id"].as_str().unwrap_or(""));
-    println!("name\t{}", thread["name"].as_str().unwrap_or(""));
-    println!("cwd\t{}", thread["cwd"].as_str().unwrap_or(""));
-    println!(
-        "status\t{}",
-        thread["status"]["type"].as_str().unwrap_or("")
-    );
-    for turn in result["turns"]["data"].as_array().unwrap_or(&Vec::new()) {
-        println!(
-            "turn\t{}\t{}",
-            turn["id"].as_str().unwrap_or(""),
-            turn_status(turn)
+    print_key_values(&[
+        ("server", result["server"].as_str().unwrap_or("")),
+        ("id", thread["id"].as_str().unwrap_or("")),
+        ("name", thread["name"].as_str().unwrap_or("")),
+        ("cwd", thread["cwd"].as_str().unwrap_or("")),
+        ("status", thread["status"]["type"].as_str().unwrap_or("")),
+    ]);
+    if let Some(turns) = result["turns"]["data"]
+        .as_array()
+        .filter(|turns| !turns.is_empty())
+    {
+        println!();
+        print_table(
+            &["TURN ID", "STATUS"],
+            turns
+                .iter()
+                .map(|turn| {
+                    vec![
+                        table_cell(turn["id"].as_str().unwrap_or("")),
+                        table_cell(turn_status(turn)),
+                    ]
+                })
+                .collect(),
         );
     }
 }
 
-fn emit_result(target: &Target, json_out: bool, result: Value, label: &str) -> Result<i32> {
+fn emit_threads_result(
+    target: &Target,
+    json_out: bool,
+    result: Value,
+    projection: ThreadProjection,
+) -> Result<i32> {
+    let label = match projection {
+        ThreadProjection::Direct => "threads",
+        ThreadProjection::SearchResult => "results",
+    };
     let output = json!({"server": target.server, label: result["data"], "nextCursor": result["nextCursor"], "backwardsCursor": result["backwardsCursor"]});
     if json_out {
         print_json(&output)?;
     } else {
-        for item in output[label].as_array().unwrap_or(&Vec::new()) {
-            let thread = item.get("thread").unwrap_or(item);
-            println!(
-                "{}\t{}\t{}\t{}",
-                thread["updatedAt"].as_i64().unwrap_or_default(),
-                thread["status"]["type"].as_str().unwrap_or(""),
-                thread["name"]
-                    .as_str()
-                    .or_else(|| thread["preview"].as_str())
-                    .unwrap_or(""),
-                thread["id"].as_str().unwrap_or("")
-            );
-        }
+        let headers = match projection {
+            ThreadProjection::Direct => vec!["UPDATED", "STATUS", "TITLE/PREVIEW", "THREAD ID"],
+            ThreadProjection::SearchResult => {
+                vec!["UPDATED", "STATUS", "TITLE/PREVIEW", "SNIPPET", "THREAD ID"]
+            }
+        };
+        let rows = output[label]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|item| {
+                let thread = item.get("thread").unwrap_or(item);
+                let mut row = vec![
+                    table_cell(thread["updatedAt"].as_i64().unwrap_or_default().to_string()),
+                    table_cell(thread["status"]["type"].as_str().unwrap_or("")),
+                    capped_cell(thread_label(thread), THREAD_LABEL_WIDTH),
+                ];
+                if matches!(projection, ThreadProjection::SearchResult) {
+                    row.push(capped_cell(
+                        item["snippet"].as_str().unwrap_or(""),
+                        SEARCH_SNIPPET_WIDTH,
+                    ));
+                }
+                row.push(table_cell(thread["id"].as_str().unwrap_or("")));
+                row
+            })
+            .collect();
+        print_table(&headers, rows);
     }
     Ok(0)
 }
@@ -1320,21 +1406,142 @@ fn emit_json_or_status(json_out: bool, output: &Value) -> Result<i32> {
     if json_out {
         print_json(output)?;
     } else {
+        let mut rows = Vec::new();
         if let Some(server) = output["server"].as_str() {
-            println!("server\t{server}");
+            rows.push(("server", server));
         }
         if let Some(thread_id) = output["threadId"].as_str() {
-            println!("threadId\t{thread_id}");
+            rows.push(("threadId", thread_id));
         }
         if let Some(turn_id) = output["turnId"].as_str() {
-            println!("turnId\t{turn_id}");
+            rows.push(("turnId", turn_id));
         }
-        println!(
-            "status\t{}",
-            output["status"].as_str().unwrap_or("accepted")
-        );
+        rows.push(("status", output["status"].as_str().unwrap_or("accepted")));
+        print_key_values(&rows);
     }
     Ok(0)
+}
+
+#[derive(Clone)]
+struct TableCell {
+    text: String,
+    max_width: Option<usize>,
+}
+
+fn table_cell(text: impl Into<String>) -> TableCell {
+    TableCell {
+        text: text.into(),
+        max_width: None,
+    }
+}
+
+fn capped_cell(text: impl Into<String>, max_width: usize) -> TableCell {
+    TableCell {
+        text: text.into(),
+        max_width: Some(max_width),
+    }
+}
+
+fn print_table(headers: &[&str], rows: Vec<Vec<TableCell>>) {
+    let rendered_rows = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(render_table_cell)
+                .collect::<Vec<String>>()
+        })
+        .collect::<Vec<_>>();
+    let mut widths = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect::<Vec<_>>();
+    for row in &rendered_rows {
+        for (index, value) in row.iter().enumerate() {
+            if index >= widths.len() {
+                widths.push(0);
+            }
+            widths[index] = widths[index].max(value.chars().count());
+        }
+    }
+    print_table_row(
+        &headers
+            .iter()
+            .map(|header| (*header).to_string())
+            .collect::<Vec<_>>(),
+        &widths,
+    );
+    for row in rendered_rows {
+        print_table_row(&row, &widths);
+    }
+}
+
+fn print_table_row(row: &[String], widths: &[usize]) {
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            print!("  ");
+        }
+        let value = row.get(index).map(String::as_str).unwrap_or("");
+        if index + 1 == widths.len() {
+            print!("{value}");
+        } else {
+            print!("{value:<width$}");
+        }
+    }
+    println!();
+}
+
+fn print_key_values(rows: &[(&str, &str)]) {
+    print!("{}", key_values_text(rows));
+}
+
+fn key_values_text(rows: &[(&str, &str)]) -> String {
+    let width = rows
+        .iter()
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or_default();
+    rows.iter()
+        .map(|(key, value)| {
+            format!(
+                "{key:<width$}  {}",
+                sanitize_table_text(value),
+                width = width
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn render_table_cell(cell: TableCell) -> String {
+    let text = sanitize_table_text(&cell.text);
+    match cell.max_width {
+        Some(max_width) => truncate_text(&text, max_width),
+        None => text,
+    }
+}
+
+fn sanitize_table_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_text(text: &str, max_width: usize) -> String {
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return text.chars().take(max_width).collect();
+    }
+    let mut value = text.chars().take(max_width - 3).collect::<String>();
+    value.push_str("...");
+    value
+}
+
+fn thread_label(thread: &Value) -> &str {
+    thread["name"]
+        .as_str()
+        .or_else(|| thread["preview"].as_str())
+        .unwrap_or("")
 }
 
 fn print_json(value: &Value) -> Result<()> {

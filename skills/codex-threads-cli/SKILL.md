@@ -43,6 +43,7 @@ codex-threads servers ping
 Expected shape:
 
 ```text
+SERVER  STATUS
 main    ok
 ```
 

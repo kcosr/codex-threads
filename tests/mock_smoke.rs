@@ -223,6 +223,9 @@ fn mock_result(method: &str, request: &Value, malformed_turn_start: bool) -> Val
         "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/paged") => {
             paged_threads(request)
         }
+        "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/multiline") => {
+            page(json!([sample_multiline_preview_thread("thread_multiline")]))
+        }
         "thread/list" => page(json!([sample_thread("thread_1")])),
         "thread/search" if request["params"]["searchTerm"].as_str() == Some("paged") => {
             paged_search_results(request)
@@ -328,6 +331,18 @@ fn sample_thread_with_updated(id: &str, updated_at: i64) -> Value {
     })
 }
 
+fn sample_multiline_preview_thread(id: &str) -> Value {
+    json!({
+        "id": id,
+        "name": Value::Null,
+        "preview": "First line of a very long preview\nsecond line\twith a tab and enough text to force truncation because this should not spill across terminal rows",
+        "cwd": "/tmp/mock-work",
+        "status": { "type": "notLoaded" },
+        "createdAt": 1_700_000_000_i64,
+        "updatedAt": 1_700_000_100_i64
+    })
+}
+
 fn sample_turn() -> Value {
     json!({
         "id": "turn_1",
@@ -397,10 +412,10 @@ fn connect_bypasses_config_for_servers_ping() {
         .args(["servers", "ping"])
         .assert()
         .success()
-        .stdout(predicates::str::contains(format!(
-            "{}\tok",
-            server.endpoint()
-        )));
+        .stdout(predicates::str::contains("SERVER"))
+        .stdout(predicates::str::contains("STATUS"))
+        .stdout(predicates::str::contains(server.endpoint()))
+        .stdout(predicates::str::contains("ok"));
 }
 
 #[test]
@@ -541,6 +556,30 @@ fn messages_role_filter_omits_redundant_role_in_human_output() {
     assert!(!text.contains(" user\n"));
     assert!(!text.contains("assistant"));
     assert!(!text.contains("done"));
+}
+
+#[test]
+fn list_human_output_uses_compact_aligned_table() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["list", "--server", "work", "--cwd", "/tmp/multiline"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("UPDATED"));
+    assert!(lines[0].contains("STATUS"));
+    assert!(lines[0].contains("TITLE/PREVIEW"));
+    assert!(lines[0].contains("THREAD ID"));
+    assert!(lines[1].contains("First line of a very long preview second line with a tab"));
+    assert!(lines[1].contains("..."));
+    assert!(lines[1].contains("thread_multiline"));
+    assert!(!lines[1].contains('\t'));
 }
 
 #[test]
@@ -711,7 +750,8 @@ fn send_human_stream_does_not_duplicate_completed_agent_message() {
         .clone();
     let text = String::from_utf8(output).expect("utf8");
     assert_eq!(text.matches("done").count(), 1);
-    assert!(text.contains("done\nstatus\tcompleted"));
+    assert!(text.contains("done\nstatus"));
+    assert!(text.contains("completed"));
 }
 
 #[test]
@@ -726,8 +766,11 @@ fn models_human_output_uses_model_fields() {
         .stdout
         .clone();
     let text = String::from_utf8(output).expect("utf8");
-    assert!(text.contains("gpt-5.5\tGPT-5.5"));
-    assert!(!text.starts_with("0\t\t\t"));
+    assert!(text.contains("MODEL"));
+    assert!(text.contains("NAME"));
+    assert!(text.contains("gpt-5.5"));
+    assert!(text.contains("GPT-5.5"));
+    assert!(!text.starts_with("0"));
 }
 
 #[test]

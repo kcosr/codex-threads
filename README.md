@@ -95,6 +95,7 @@ codex-threads --config ./config.toml new --server main --cwd "$PWD" "Run the tes
 Successful `servers ping` human output is tabular:
 
 ```text
+SERVER  STATUS
 main    ok
 ```
 
