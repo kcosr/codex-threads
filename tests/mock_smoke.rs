@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
@@ -17,6 +18,23 @@ struct MockServer {
     socket: PathBuf,
     config: PathBuf,
     received: Arc<Mutex<Vec<Value>>>,
+}
+
+#[derive(Clone)]
+struct GoalState {
+    objective: String,
+    status: String,
+    token_budget: i64,
+}
+
+impl Default for GoalState {
+    fn default() -> Self {
+        Self {
+            objective: "Finish".to_string(),
+            status: "active".to_string(),
+            token_budget: 1234,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +176,8 @@ impl MockServer {
         std_listener.set_nonblocking(true).expect("nonblocking");
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_for_thread = Arc::clone(&received);
+        let goal_state = Arc::new(Mutex::new(HashMap::new()));
+        let goal_state_for_thread = Arc::clone(&goal_state);
         let rejected_first_method = Arc::new(Mutex::new(false));
         let rejected_first_method_for_thread = Arc::clone(&rejected_first_method);
         thread::spawn(move || {
@@ -168,6 +188,7 @@ impl MockServer {
                     let (stream, _) = listener.accept().await.expect("accept");
                     let received = Arc::clone(&received_for_thread);
                     let rejected_first_method = Arc::clone(&rejected_first_method_for_thread);
+                    let goal_state = Arc::clone(&goal_state_for_thread);
                     tokio::spawn(async move {
                         handle_connection(
                             stream,
@@ -176,6 +197,7 @@ impl MockServer {
                             malformed_turn_start,
                             reject_first,
                             rejected_first_method,
+                            goal_state,
                         )
                         .await;
                     });
@@ -232,6 +254,7 @@ async fn handle_connection(
     malformed_turn_start: bool,
     reject_first: RejectFirst,
     rejected_first_method: Arc<Mutex<bool>>,
+    goal_state: Arc<Mutex<HashMap<String, GoalState>>>,
 ) {
     let mut ws = accept_async(stream).await.expect("websocket accept");
     while let Some(message) = ws.next().await {
@@ -263,7 +286,7 @@ async fn handle_connection(
                     }
                     continue;
                 }
-                let result = mock_result(method, &value, malformed_turn_start);
+                let result = mock_result(method, &value, malformed_turn_start, &goal_state);
                 if method == "turn/start" {
                     let thread_id = value["params"]["threadId"].as_str().unwrap_or("thread_1");
                     send_turn_notifications(&mut ws, thread_id, turn_notification_mode).await;
@@ -363,7 +386,12 @@ async fn send_turn_notifications(
         .await;
 }
 
-fn mock_result(method: &str, request: &Value, malformed_turn_start: bool) -> Value {
+fn mock_result(
+    method: &str,
+    request: &Value,
+    malformed_turn_start: bool,
+    goal_state: &Arc<Mutex<HashMap<String, GoalState>>>,
+) -> Value {
     match method {
         "initialize" => json!({
             "userAgent": "mock-codex",
@@ -412,16 +440,56 @@ fn mock_result(method: &str, request: &Value, malformed_turn_start: bool) -> Val
         "thread/archive" => json!({}),
         "thread/unarchive" => json!({ "thread": sample_thread(thread_id(request)) }),
         "model/list" => page(json!([{ "id": "gpt-5.5", "name": "GPT-5.5" }])),
-        "thread/goal/get" => json!({ "goal": { "objective": "Finish", "status": "active" } }),
+        "thread/goal/get" => {
+            json!({ "goal": goal_to_value(&goal_for_thread(request, goal_state)) })
+        }
         "thread/goal/set" => json!({
-            "goal": {
-                "objective": request["params"]["objective"].as_str().unwrap_or("Finish"),
-                "status": request["params"]["status"].as_str().unwrap_or("active")
-            }
+            "goal": goal_to_value(&set_goal_for_thread(request, goal_state))
         }),
-        "thread/goal/clear" => json!({ "cleared": true }),
+        "thread/goal/clear" => {
+            if let Some(thread_id) = request["params"]["threadId"].as_str() {
+                goal_state.lock().expect("goal state").remove(thread_id);
+            }
+            json!({ "cleared": true })
+        }
         other => panic!("unexpected method {other}"),
     }
+}
+
+fn goal_for_thread(
+    request: &Value,
+    goal_state: &Arc<Mutex<HashMap<String, GoalState>>>,
+) -> GoalState {
+    let thread_id = request["params"]["threadId"].as_str().unwrap_or("thread_1");
+    let mut goals = goal_state.lock().expect("goal state");
+    goals.entry(thread_id.to_string()).or_default().clone()
+}
+
+fn set_goal_for_thread(
+    request: &Value,
+    goal_state: &Arc<Mutex<HashMap<String, GoalState>>>,
+) -> GoalState {
+    let thread_id = request["params"]["threadId"].as_str().unwrap_or("thread_1");
+    let mut goals = goal_state.lock().expect("goal state");
+    let goal = goals.entry(thread_id.to_string()).or_default();
+    if let Some(objective) = request["params"]["objective"].as_str() {
+        goal.objective = objective.to_string();
+    }
+    if let Some(status) = request["params"]["status"].as_str() {
+        goal.status = status.to_string();
+    }
+    if let Some(token_budget) = request["params"]["tokenBudget"].as_i64() {
+        goal.token_budget = token_budget;
+    }
+    goal.clone()
+}
+
+fn goal_to_value(goal: &GoalState) -> Value {
+    json!({
+        "objective": goal.objective,
+        "status": goal.status,
+        "tokenBudget": goal.token_budget,
+    })
 }
 
 fn page(data: Value) -> Value {
@@ -1329,26 +1397,30 @@ fn control_and_goal_commands_return_acknowledgements() {
         )["goal"]["status"],
         "active"
     );
-    assert_eq!(
-        run_json(
-            &server,
-            &[
-                "goal",
-                "set",
-                "--server",
-                "work",
-                "--json",
-                "thread_1",
-                "--objective",
-                "Ship",
-                "--status",
-                "active",
-                "--token-budget",
-                "1000",
-            ],
-        )["goal"]["objective"],
-        "Ship"
+    let goal_set = run_json(
+        &server,
+        &[
+            "goal",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_1",
+            "--objective",
+            "Ship",
+            "--status",
+            "active",
+            "--token-budget",
+            "1000",
+        ],
     );
+    assert_eq!(goal_set["goal"]["objective"], "Ship");
+    assert_eq!(goal_set["goal"]["tokenBudget"].as_i64().unwrap(), 1000);
+    let goal_get = run_json(
+        &server,
+        &["goal", "get", "--server", "work", "--json", "thread_1"],
+    );
+    assert_eq!(goal_get["goal"]["tokenBudget"].as_i64().unwrap(), 1000);
     assert_eq!(
         run_json(
             &server,
