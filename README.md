@@ -54,10 +54,11 @@ Build the CLI:
 cargo build
 ```
 
-Install it on your `PATH` for the bare `codex-threads` examples:
+Install it on your `PATH` for the bare `codex-threads` examples. If you use
+`~/.local/bin`:
 
 ```bash
-cargo install --path .
+cargo install --path . --root ~/.local
 ```
 
 When asking another agent to use this CLI, point it at the included skill:
@@ -93,10 +94,27 @@ app-server that `codex-threads` queries and controls.
 Use a direct socket when you do not want to create a config file:
 
 ```bash
-cargo run -- --connect "$CODEX_SOCK" models --json
+codex-threads --connect "$CODEX_SOCK" models --json
 ```
 
-Or configure named servers:
+For the common one-server case, configure one server at
+`~/.config/codex-threads/config.toml`:
+
+```toml
+[servers.main]
+type = "uds"
+path = "/var/run/user/1000/codex.sock"
+```
+
+Then omit `--server`:
+
+```bash
+codex-threads servers ping
+codex-threads list
+codex-threads new --cwd "$PWD" "Run the tests"
+```
+
+Or configure named servers when you have multiple app-server sockets:
 
 ```toml
 [servers.main]
@@ -111,9 +129,9 @@ path = "/home/kevin/.codex-work/app-server-control/app-server-control.sock"
 Then run commands against a server:
 
 ```bash
-codex-threads --config ./config.toml servers ping --server main
-codex-threads --config ./config.toml list --server main
-codex-threads --config ./config.toml new --server main --cwd "$PWD" "Run the tests"
+codex-threads servers ping --server main
+codex-threads list --server main
+codex-threads new --server main --cwd "$PWD" "Run the tests"
 ```
 
 Successful `servers ping` human output is tabular:
