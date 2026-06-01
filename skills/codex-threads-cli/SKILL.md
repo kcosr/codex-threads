@@ -15,6 +15,23 @@ codex-threads
 
 The user normally has config at `~/.config/codex-threads/config.toml` pointing at the main Unix socket, so do **not** pass `--connect` unless debugging or explicitly targeting another server.
 
+`codex-threads` only sees threads served by a running Codex app-server. The app-server must be started with a listener such as:
+
+```bash
+CODEX_SOCK=unix:///var/run/user/1000/codex.sock
+codex app-server --listen "$CODEX_SOCK"
+```
+
+Interactive Codex CLI sessions that should be visible here should connect to the same app-server:
+
+```bash
+codex --remote "$CODEX_SOCK" --cd "$PWD"
+```
+
+If an interactive Codex session was not started with `--remote`, do not assume `codex-threads` can find or control that session.
+
+The target app-server must grant Codex's experimental API capability. If a command fails with an `experimentalApi` capability error, the app-server is not compatible with this CLI session.
+
 ## First Checks
 
 Verify connectivity when the tool or server state is uncertain:
@@ -100,10 +117,10 @@ codex-threads messages <thread_id> --last 10 --max-turns 100 --json \
 
 Use this skill when the user asks things like:
 
-- “What was I working on recently?”
-- “Summarize my Codex work from the last day.”
-- “What is the status of the projects I worked on today?”
-- “Find the recent thread about <topic>.”
+- "What was I working on recently?"
+- "Summarize my Codex work from the last day."
+- "What is the status of the projects I worked on today?"
+- "Find the recent thread about <topic>."
 
 ### 1. List recent threads by time window
 
@@ -114,8 +131,9 @@ Examples:
 ```bash
 codex-threads list --since 24h --limit 100 --json
 codex-threads list --since 1d --limit 100 --json
-codex-threads list --since 2026-06-01 --limit 100 --json
 ```
+
+`--since` accepts epoch seconds or relative durations ending in `s`, `m`, `h`, or `d`; it does not accept calendar dates such as `2026-06-01`.
 
 Then group by cwd/project and keep the output compact:
 
@@ -124,7 +142,7 @@ codex-threads list --since 24h --limit 100 --json \
   | jq -r '.threads[] | [.updatedAt, .id, (.status.type // ""), (.cwd // ""), ((.name // .preview // "") | gsub("\n"; " ") | .[0:140])] | @tsv'
 ```
 
-For “project status” summaries, inspect the most relevant/recent threads per cwd, especially active or recently updated ones.
+For "project status" summaries, inspect the most relevant/recent threads per cwd, especially active or recently updated ones.
 
 ### 2. Check active status before summarizing or messaging
 
@@ -158,14 +176,14 @@ codex-threads messages <thread_id> --last 6 --max-turns 50
 
 ### 4. Summarize by project
 
-When reporting “last day” status, group by cwd/project and include minimal relevant columns:
+When reporting "last day" status, group by cwd/project and include minimal relevant columns:
 
 | Project/CWD | Thread | Status | Summary |
 |---|---|---|---|
 
 Mention if a thread is currently active, blocked, waiting for review, or has an active subprocess according to recent messages/status.
 
-## Paging, Cursors, and “Offsets”
+## Paging, Cursors, and "Offsets"
 
 The CLI is cursor-based, not numeric-offset-based. Do not invent offset numbers. Use returned cursors.
 
@@ -262,7 +280,8 @@ Optional flags:
 
 ```bash
 --model <model>
---effort low|medium|high|xhigh
+--effort none|minimal|low|medium|high|xhigh
+--service-tier <tier>
 --name "Readable name"
 --stream
 --no-wait
@@ -300,7 +319,8 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 - `search --json` returns `{ server, results, nextCursor, backwardsCursor }`; each result has `thread` and `snippet`.
 - `show --json` returns `{ server, thread, turns }`; turns are under `.turns.data`.
 - `messages --json` returns `{ server, threadId, messages, nextCursor, truncated }`.
-- `status --json` returns `thread`, `threadId`, `activeTurnId`, and `truncated`.
+- `status --json` returns `{ server, reachable, loadedThreadIds, nextCursor }`.
+- `status <thread_id> --json` returns `thread`, `threadId`, `activeTurnId`, and `truncated`.
 - `settings show <thread_id> --json` returns cwd/model/effort/service tier.
 - `goal get <thread_id> --json` may return `goal: null`.
 

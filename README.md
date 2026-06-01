@@ -3,6 +3,10 @@
 `codex-threads` is a Rust CLI for querying and controlling Codex app-server
 threads across one or more named local app-server instances.
 
+Codex app-server is the local control server exposed by the Codex agent
+runtime. A thread is one Codex session, and a turn is one request/response cycle
+inside that session.
+
 It connects to Codex app-server over WebSocket framing on Unix domain sockets
 and delegates thread state, history, active turns, settings, model listing, and
 control operations to Codex. It does not parse rollout files, keep a local
@@ -17,7 +21,7 @@ thread index, or merge paginated thread data across multiple servers.
 - Thread list, search, detail, status, and flattened message history commands.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
-  and support JSON final output or NDJSON streaming.
+  and support JSON final output or newline-delimited JSON (NDJSON) streaming.
 - Model, reasoning effort, and service-tier settings where Codex app-server
   supports them.
 - Thread naming, archive/unarchive, active-turn steer/interrupt, model listing,
@@ -35,10 +39,37 @@ Build the CLI:
 cargo build
 ```
 
-Use a direct socket when you do not want to create a config file:
+Install it on your `PATH` for the bare `codex-threads` examples:
+
+```bash
+cargo install --path .
+```
+
+`codex-threads` talks to a running Codex app-server. Start Codex app-server
+with a Unix domain socket (UDS) listener before using this CLI:
 
 ```bash
 CODEX_SOCK=unix:///var/run/user/1000/codex.sock
+codex app-server --listen "$CODEX_SOCK"
+```
+
+The target app-server must grant the experimental API capability requested by
+`codex-threads`. If it does not, commands fail with an app-server capability
+error.
+
+Interactive Codex CLI sessions that should be visible to `codex-threads` should
+connect to the same app-server with `--remote`:
+
+```bash
+codex --remote "$CODEX_SOCK" --cd "$PWD"
+```
+
+Without `--remote`, an interactive Codex CLI session may not be using the same
+app-server that `codex-threads` queries and controls.
+
+Use a direct socket when you do not want to create a config file:
+
+```bash
 cargo run -- --connect "$CODEX_SOCK" models --json
 ```
 
@@ -57,11 +88,25 @@ path = "/home/kevin/.codex-work/app-server-control/app-server-control.sock"
 Then run commands against a server:
 
 ```bash
+codex-threads --config ./config.toml servers ping --server main
 codex-threads --config ./config.toml list --server main
 codex-threads --config ./config.toml new --server main --cwd "$PWD" "Run the tests"
 ```
 
+Successful `servers ping` human output is tabular:
+
+```text
+main    ok
+```
+
+This project targets Unix-like systems with Unix domain socket support. Linux
+examples use `/var/run/user/...`; choose an appropriate socket path for other
+Unix-like systems.
+
 ## Common Workflows
+
+The examples below assume `codex-threads` is installed on `PATH` and a server is
+configured or selected with `--connect`.
 
 Find recent candidate threads, then inspect the selected thread:
 
@@ -94,7 +139,7 @@ Config path precedence:
 2. `CODEX_THREADS_CONFIG`
 3. `~/.config/codex-threads/config.toml`
 
-Server target precedence for thread-data commands:
+Server target precedence for commands that target one app-server:
 
 1. `--connect unix:///path/to.sock`
 2. `--server ALIAS`
@@ -106,8 +151,8 @@ Server target precedence for thread-data commands:
 `server` value in JSON output. It is mutually exclusive with `--server` and
 `CODEX_THREADS_SERVER`.
 
-When more than one server is configured, commands that operate on app-server
-data require an explicit target through `--server` or `CODEX_THREADS_SERVER`.
+When more than one server is configured, app-server commands require an explicit
+target through `--server` or `CODEX_THREADS_SERVER`.
 This avoids cursor merging and prevents accidentally sending work to the wrong
 server. `servers ping --all` is the only aggregate command.
 
@@ -124,7 +169,7 @@ server. `servers ping --all` is the only aggregate command.
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
 | `settings show THREAD_ID` | Read model, effort, service tier, and cwd. |
-| `settings set THREAD_ID` | Update `--model`, `--effort`, `--service-tier`, or `--clear-service-tier`. |
+| `settings set THREAD_ID` | Update `--model`, `--effort`, `--service-tier`, or `--clear-service-tier`; at least one setting flag is required. |
 | `status [THREAD_ID]` | Show server loaded-thread status or one thread with active turn discovery. |
 | `steer THREAD_ID TURN_ID PROMPT` | Send steering input to an active turn. |
 | `interrupt THREAD_ID TURN_ID` | Interrupt an active turn. |
@@ -132,12 +177,16 @@ server. `servers ping --all` is the only aggregate command.
 | `archive THREAD_ID` / `unarchive THREAD_ID` | Archive or restore a thread. |
 | `models` | List available models from the app-server. |
 | `goal get THREAD_ID` | Read the active goal. |
-| `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`. |
+| `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
 | `goal clear THREAD_ID` | Clear the active goal. |
 
 Every app-server command accepts `--server ALIAS` and `--json`. Global
 `--config PATH` and `--connect ENDPOINT` may be placed before or after the
 subcommand because they are global options.
+
+Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and
+`xhigh`. Accepted `goal set --status` values are `active`, `paused`, `blocked`,
+`usage-limited`, `budget-limited`, and `complete`.
 
 ## Output
 
@@ -168,6 +217,20 @@ reach a terminal status. They consume realtime notifications when available and
 poll recent turns as a fallback so callers still get a final JSON response if a
 notification is missed.
 
+`status --json` without a thread ID returns `{ server, reachable,
+loadedThreadIds, nextCursor }`. `status THREAD_ID --json` returns the selected
+thread, `threadId`, `activeTurnId`, and `truncated`.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Command succeeded, or a blocking turn completed. |
+| `1` | A blocking `new` or `send` turn reached `failed` or `interrupted`. |
+| `2` | Usage, argument, validation, or configuration error. |
+| `3` | App-server, connection, Unix socket, WebSocket, or capability error. |
+| `130` | Local Ctrl-C while waiting on a turn; the remote turn may still be running. |
+
 `list --since`, `search --since`, and `messages --since` accept either an epoch
 timestamp in seconds or a relative duration ending in `s`, `m`, `h`, or `d`,
 such as `5m`. List and search filtering is applied client-side to `updatedAt`.
@@ -189,7 +252,8 @@ Message selection order is:
 4. Apply `--role user|assistant`, if present.
 5. Apply `--last N`, if present, to the final filtered message list.
 
-`--max-turns` is the recent turn scan window, not a final display limit.
+`--max-turns` defaults to `200` and is the recent turn scan window, not a final
+display limit.
 `--last` is the final message limit after flattening and filtering; it is not
 an alias for `--max-turns`. Role filtering only sees messages inside the
 scanned recent turns, so increase `--max-turns` when looking for sparse or older
@@ -254,7 +318,7 @@ then commits a fresh `Unreleased` section for the next cycle.
 - `src/bin/` - binary entrypoints.
 - `src/lib.rs` - shared library entrypoint.
 - `src/config.rs` - TOML schema, validation, and target resolution.
-- `src/rpc.rs` - UDS WebSocket JSON-RPC transport and handshake.
+- `src/rpc.rs` - Unix domain socket WebSocket JSON-RPC transport and handshake.
 - `src/cli.rs` - command-line parser.
 - `src/app.rs` - command orchestration and rendering.
 - `tests/` - deterministic binary-level mock smoke coverage.
