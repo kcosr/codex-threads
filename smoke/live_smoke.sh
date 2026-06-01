@@ -53,6 +53,18 @@ extract_thread_id() {
 	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => console.log(JSON.parse(s).threadId));'
 }
 
+assert_goal_null() {
+	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); if (value.goal !== null) { console.error(`expected goal null, got ${JSON.stringify(value.goal)}`); process.exit(1); } });'
+}
+
+assert_goal_set() {
+	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); const goal = value.goal; if (!goal || goal.objective !== "codex-threads live smoke goal" || goal.status !== "active" || goal.tokenBudget !== 1234) { console.error(`unexpected goal response: ${JSON.stringify(value)}`); process.exit(1); } });'
+}
+
+assert_goal_cleared() {
+	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); if (value.cleared !== true) { console.error(`expected cleared true, got ${JSON.stringify(value)}`); process.exit(1); } });'
+}
+
 run "$BIN" --config "$CONFIG" servers ping --server live --json
 run "$BIN" --config "$CONFIG" models --server live --json
 
@@ -63,6 +75,26 @@ THREAD_ID="$(printf '%s\n' "$THREAD_JSON" | extract_thread_id)"
 run "$BIN" --config "$CONFIG" status --server live --json "$THREAD_ID"
 run "$BIN" --config "$CONFIG" settings show --server live --json "$THREAD_ID"
 run "$BIN" --config "$CONFIG" name --server live --json "$THREAD_ID" "codex-threads live smoke"
+
+GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal get --server live --json "$THREAD_ID")"
+echo "$GOAL_JSON"
+printf '%s\n' "$GOAL_JSON" | assert_goal_null
+
+GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal set --server live --json "$THREAD_ID" --objective "codex-threads live smoke goal" --status active --token-budget 1234)"
+echo "$GOAL_JSON"
+printf '%s\n' "$GOAL_JSON" | assert_goal_set
+
+GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal get --server live --json "$THREAD_ID")"
+echo "$GOAL_JSON"
+printf '%s\n' "$GOAL_JSON" | assert_goal_set
+
+GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal clear --server live --json "$THREAD_ID")"
+echo "$GOAL_JSON"
+printf '%s\n' "$GOAL_JSON" | assert_goal_cleared
+
+GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal get --server live --json "$THREAD_ID")"
+echo "$GOAL_JSON"
+printf '%s\n' "$GOAL_JSON" | assert_goal_null
 
 if [[ "${RUN_CODEX_TURN:-0}" == "1" ]]; then
 	run "$BIN" \
