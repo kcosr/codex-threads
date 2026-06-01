@@ -60,6 +60,12 @@ Install it on your `PATH` for the bare `codex-threads` examples:
 cargo install --path .
 ```
 
+When asking another agent to use this CLI, point it at the included skill:
+
+```text
+skills/codex-threads-cli
+```
+
 `codex-threads` talks to a running Codex app-server. Start Codex app-server
 with a Unix domain socket (UDS) listener before using this CLI:
 
