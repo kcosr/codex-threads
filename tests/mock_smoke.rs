@@ -482,6 +482,12 @@ fn assert_turn_yolo_params(params: &Value) {
     assert_eq!(params["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
 }
 
+fn assert_no_yolo_params(params: &Value) {
+    assert!(params.get("approvalPolicy").is_none());
+    assert!(params.get("sandbox").is_none());
+    assert!(params.get("sandboxPolicy").is_none());
+}
+
 #[test]
 fn connect_bypasses_config_and_lists_threads() {
     let server = MockServer::start();
@@ -837,6 +843,70 @@ fn new_send_and_settings_commands_return_follow_up_ids() {
 }
 
 #[test]
+fn no_yolo_uses_app_server_permission_defaults() {
+    let server = MockServer::start();
+    let cwd = server
+        .config
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let created = run_json(
+        &server,
+        &[
+            "--no-yolo",
+            "new",
+            "--server",
+            "work",
+            "--cwd",
+            &cwd,
+            "--json",
+        ],
+    );
+    assert_eq!(created["threadId"], "thread_new");
+
+    let accepted = run_json(
+        &server,
+        &[
+            "--no-yolo",
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ],
+    );
+    assert_eq!(accepted["threadId"], "thread_1");
+
+    let settings = run_json(
+        &server,
+        &[
+            "--no-yolo",
+            "settings",
+            "show",
+            "--server",
+            "work",
+            "--json",
+            "thread_1",
+        ],
+    );
+    assert_eq!(settings["model"], "gpt-5.1-codex");
+
+    for params in server.params_for("thread/start") {
+        assert_no_yolo_params(&params);
+    }
+    for params in server.params_for("turn/start") {
+        assert_no_yolo_params(&params);
+    }
+    for params in server.params_for("thread/resume") {
+        assert_no_yolo_params(&params);
+    }
+}
+
+#[test]
 fn send_streams_ndjson_when_requested() {
     let server = MockServer::start();
     let output = server
@@ -944,6 +1014,32 @@ fn send_resumes_not_loaded_thread_before_retrying_turn_start() {
     let thread_resume_params = server.params_for("thread/resume");
     assert_eq!(thread_resume_params.len(), 1);
     assert_thread_yolo_params(&thread_resume_params[0]);
+}
+
+#[test]
+fn no_yolo_resume_retry_uses_app_server_permission_defaults() {
+    let server = MockServer::start_requiring_resume_for_send();
+    let accepted = run_json(
+        &server,
+        &[
+            "--no-yolo",
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ],
+    );
+    assert_eq!(accepted["status"], "accepted");
+
+    for params in server.params_for("turn/start") {
+        assert_no_yolo_params(&params);
+    }
+    for params in server.params_for("thread/resume") {
+        assert_no_yolo_params(&params);
+    }
 }
 
 #[test]

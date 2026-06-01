@@ -70,9 +70,11 @@ Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors
 ## Permission Model
 
 Assume `codex-threads` is a headless automation tool for Codex sessions that are
-already isolated outside Codex itself. It forces app-server thread creation,
-thread resume, and turn start requests to run with `approvalPolicy = "never"`
-and full-access sandboxing. Do not use it as a safety boundary.
+already isolated outside Codex itself. Yolo mode is opt-out: by default, it
+forces app-server thread creation, thread resume, and turn start requests to run
+with `approvalPolicy = "never"` and full-access sandboxing. Pass global
+`--no-yolo` only when you explicitly want Codex app-server's configured approval
+and sandbox defaults. Do not use this CLI as a safety boundary.
 
 ## Recommended Investigation Workflow
 

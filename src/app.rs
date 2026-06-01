@@ -47,6 +47,7 @@ where
 
 async fn run(cli: Cli) -> Result<i32> {
     let config_path = resolve_config_path(cli.config.clone());
+    let yolo = !cli.no_yolo;
     if let Command::Servers(command) = &cli.command {
         return servers_command(&config_path, cli.connect.as_deref(), command).await;
     }
@@ -98,7 +99,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 &config,
                 cli.connect.as_deref(),
                 command.server.server.clone(),
-                |target, client| async move { new_command(target, client, command).await },
+                |target, client| async move { new_command(target, client, command, yolo).await },
             )
             .await
         }
@@ -107,36 +108,30 @@ async fn run(cli: Cli) -> Result<i32> {
                 &config,
                 cli.connect.as_deref(),
                 command.server.server.clone(),
-                |target, client| async move { send_command(target, client, command).await },
+                |target, client| async move { send_command(target, client, command, yolo).await },
             )
             .await
         }
-        Command::Settings(command) => {
-            match command.command {
-                SettingsSubcommand::Show(command) => {
-                    with_client(
-                        &config,
-                        cli.connect.as_deref(),
-                        command.server.server.clone(),
-                        |target, client| async move {
-                            settings_show_command(target, client, command).await
-                        },
-                    )
-                    .await
-                }
-                SettingsSubcommand::Set(command) => {
-                    with_client(
-                        &config,
-                        cli.connect.as_deref(),
-                        command.server.server.clone(),
-                        |target, client| async move {
-                            settings_set_command(target, client, command).await
-                        },
-                    )
-                    .await
-                }
+        Command::Settings(command) => match command.command {
+            SettingsSubcommand::Show(command) => {
+                with_client(
+                    &config,
+                    cli.connect.as_deref(),
+                    command.server.server.clone(),
+                    |target, client| async move {
+                        settings_show_command(target, client, command, yolo).await
+                    },
+                )
+                .await
             }
-        }
+            SettingsSubcommand::Set(command) => with_client(
+                &config,
+                cli.connect.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { settings_set_command(target, client, command).await },
+            )
+            .await,
+        },
         Command::Status(command) => {
             with_client(
                 &config,
@@ -151,7 +146,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 &config,
                 cli.connect.as_deref(),
                 command.server.server.clone(),
-                |target, client| async move { steer_command(target, client, command).await },
+                |target, client| async move { steer_command(target, client, command, yolo).await },
             )
             .await
         }
@@ -559,7 +554,12 @@ async fn messages_command(
     Ok(0)
 }
 
-async fn new_command(target: Target, mut client: RpcClient, command: NewCommand) -> Result<i32> {
+async fn new_command(
+    target: Target,
+    mut client: RpcClient,
+    command: NewCommand,
+    yolo: bool,
+) -> Result<i32> {
     if command.prompt.is_none() && (command.no_wait || command.stream) {
         return Err(usage_error(
             "new without PROMPT cannot use --no-wait or --stream",
@@ -567,7 +567,9 @@ async fn new_command(target: Target, mut client: RpcClient, command: NewCommand)
     }
     let mut params = Map::new();
     params.insert("cwd".to_string(), json!(command.cwd));
-    insert_thread_yolo_permissions(&mut params);
+    if yolo {
+        insert_thread_yolo_permissions(&mut params);
+    }
     insert_opt(&mut params, "model", command.model.clone());
     if let Some(tier) = &command.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
@@ -603,6 +605,7 @@ async fn new_command(target: Target, mut client: RpcClient, command: NewCommand)
             json: command.json,
             stream: command.stream,
             no_wait: command.no_wait,
+            yolo,
         };
         return start_turn(target, client, thread_id, prompt, turn).await;
     }
@@ -618,7 +621,12 @@ async fn new_command(target: Target, mut client: RpcClient, command: NewCommand)
     Ok(0)
 }
 
-async fn send_command(target: Target, client: RpcClient, command: SendCommand) -> Result<i32> {
+async fn send_command(
+    target: Target,
+    client: RpcClient,
+    command: SendCommand,
+    yolo: bool,
+) -> Result<i32> {
     start_turn(
         target,
         client,
@@ -631,6 +639,7 @@ async fn send_command(target: Target, client: RpcClient, command: SendCommand) -
             json: command.json,
             stream: command.stream,
             no_wait: command.no_wait,
+            yolo,
         },
     )
     .await
@@ -643,6 +652,7 @@ struct TurnOptions {
     json: bool,
     stream: bool,
     no_wait: bool,
+    yolo: bool,
 }
 
 async fn start_turn(
@@ -658,7 +668,9 @@ async fn start_turn(
         "input".to_string(),
         json!([{"type": "text", "text": prompt, "textElements": []}]),
     );
-    insert_turn_yolo_permissions(&mut params);
+    if options.yolo {
+        insert_turn_yolo_permissions(&mut params);
+    }
     insert_opt(&mut params, "model", options.model);
     if let Some(effort) = options.effort.as_deref() {
         validate_effort(effort)?;
@@ -677,7 +689,7 @@ async fn start_turn(
     {
         Ok(result) => result,
         Err(err) if is_thread_not_found_error(&err, "turn/start", &thread_id) => {
-            resume_thread_for_action(&mut client, &thread_id).await?;
+            resume_thread_for_action(&mut client, &thread_id, options.yolo).await?;
             early_notifications.clear();
             client
                 .request("turn/start", params, |notification| {
@@ -769,11 +781,17 @@ async fn start_turn(
     }
 }
 
-async fn resume_thread_for_action(client: &mut RpcClient, thread_id: &str) -> Result<()> {
+async fn resume_thread_for_action(
+    client: &mut RpcClient,
+    thread_id: &str,
+    yolo: bool,
+) -> Result<()> {
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
     params.insert("excludeTurns".to_string(), json!(true));
-    insert_thread_yolo_permissions(&mut params);
+    if yolo {
+        insert_thread_yolo_permissions(&mut params);
+    }
     client
         .request("thread/resume", Value::Object(params), |_| {})
         .await?;
@@ -926,11 +944,14 @@ async fn settings_show_command(
     target: Target,
     mut client: RpcClient,
     command: SettingsShowCommand,
+    yolo: bool,
 ) -> Result<i32> {
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(command.thread_id.clone()));
     params.insert("excludeTurns".to_string(), json!(true));
-    insert_thread_yolo_permissions(&mut params);
+    if yolo {
+        insert_thread_yolo_permissions(&mut params);
+    }
     let result = client
         .request("thread/resume", Value::Object(params), |_| {})
         .await?;
@@ -1072,12 +1093,13 @@ async fn steer_command(
     target: Target,
     mut client: RpcClient,
     command: SteerCommand,
+    yolo: bool,
 ) -> Result<i32> {
     let params = json!({"threadId": command.thread_id, "expectedTurnId": command.turn_id, "input": [{"type": "text", "text": command.prompt, "textElements": []}]});
     let result = match client.request("turn/steer", params.clone(), |_| {}).await {
         Ok(result) => result,
         Err(err) if is_thread_not_found_error(&err, "turn/steer", &command.thread_id) => {
-            resume_thread_for_action(&mut client, &command.thread_id).await?;
+            resume_thread_for_action(&mut client, &command.thread_id, yolo).await?;
             client.request("turn/steer", params, |_| {}).await?
         }
         Err(err) => return Err(err),

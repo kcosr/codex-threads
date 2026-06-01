@@ -23,11 +23,13 @@ user request/assistant response cycle.
 
 `codex-threads` is built for headless automation by users who already run Codex
 in yolo-style environments where sandboxing and approval policy are handled
-outside the Codex application. For thread creation, thread resume, and turn
-start requests, it forces Codex app-server to use `approvalPolicy = "never"` and
-full-access sandboxing (`sandbox = "danger-full-access"` or
-`sandboxPolicy.type = "dangerFullAccess"`). Do not use this CLI as a safety
-boundary.
+outside the Codex application. Yolo mode is opt-out: by default, thread
+creation, thread resume, and turn start requests force Codex app-server to use
+`approvalPolicy = "never"` and full-access sandboxing
+(`sandbox = "danger-full-access"` or
+`sandboxPolicy.type = "dangerFullAccess"`). Pass global `--no-yolo` to use the
+app-server's configured approval and sandbox defaults instead. Do not use this
+CLI as a safety boundary.
 
 ## Features
 
@@ -199,6 +201,8 @@ server. `servers ping --all` is the only aggregate command.
 Every app-server command accepts `--server ALIAS` and `--json`. Global
 `--config PATH` and `--connect ENDPOINT` may be placed before or after the
 subcommand because they are global options.
+Global `--no-yolo` disables the default permission override for action commands
+that create, resume, or start Codex work.
 
 Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and
 `xhigh`. Accepted `goal set --status` values are `active`, `paused`, `blocked`,

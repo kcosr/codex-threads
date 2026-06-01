@@ -13,6 +13,12 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     #[arg(long, global = true)]
     pub connect: Option<String>,
+    #[arg(
+        long = "no-yolo",
+        global = true,
+        help = "Use Codex app-server approval and sandbox defaults instead of forcing approvalPolicy=never and full-access sandboxing"
+    )]
+    pub no_yolo: bool,
     #[command(subcommand)]
     pub command: Command,
 }
