@@ -9,11 +9,13 @@ still running, and sending a follow-up to an existing session. The Codex desktop
 app may expose some of this interactively; `codex-threads` makes it available
 from a terminal or another agent.
 
-The primary use case is status recovery: list recent Codex sessions/threads,
-retrieve the relevant transcript slices, and let a user or assistant summarize
-where work left off. Search is available when you need it, but it is not
-optimized and can be very slow over large histories; prefer recent listing plus
-targeted transcript retrieval for status workflows when possible.
+The main use cases are coordinating Codex work from another shell or agent:
+list recent sessions/threads, retrieve relevant transcript slices, summarize
+status and where work left off, spawn new Codex threads for background work, and
+relay user requests or follow-ups across those threads. Search is available
+when you need it, but it is not optimized and can be very slow over large
+histories; prefer recent listing, targeted transcript retrieval, thread
+creation, and direct follow-ups when those fit the workflow.
 
 It talks to Codex app-server, the local control server exposed by the Codex
 agent runtime. In Codex terminology, a thread is one session and a turn is one
