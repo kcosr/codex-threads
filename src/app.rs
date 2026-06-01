@@ -13,8 +13,8 @@ const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
 const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
-const THREAD_LABEL_WIDTH: usize = 96;
-const SEARCH_SNIPPET_WIDTH: usize = 96;
+const THREAD_LABEL_WIDTH: usize = 56;
+const SEARCH_SNIPPET_WIDTH: usize = 48;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -1383,7 +1383,7 @@ fn emit_threads_result(
             .map(|item| {
                 let thread = item.get("thread").unwrap_or(item);
                 let mut row = vec![
-                    table_cell(thread["updatedAt"].as_i64().unwrap_or_default().to_string()),
+                    table_cell(format_timestamp(thread["updatedAt"].as_i64())),
                     table_cell(thread["status"]["type"].as_str().unwrap_or("")),
                     capped_cell(thread_label(thread), THREAD_LABEL_WIDTH),
                 ];

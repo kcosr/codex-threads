@@ -576,7 +576,9 @@ fn list_human_output_uses_compact_aligned_table() {
     assert!(lines[0].contains("STATUS"));
     assert!(lines[0].contains("TITLE/PREVIEW"));
     assert!(lines[0].contains("THREAD ID"));
-    assert!(lines[1].contains("First line of a very long preview second line with a tab"));
+    assert!(lines[1].contains("2023-"));
+    assert!(!lines[1].contains("1700000100"));
+    assert!(lines[1].contains("First line of a very long preview second line with a ..."));
     assert!(lines[1].contains("..."));
     assert!(lines[1].contains("thread_multiline"));
     assert!(!lines[1].contains('\t'));
