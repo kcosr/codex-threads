@@ -1,0 +1,4 @@
+/target
+/.pytest_cache
+/smoke/.venv
+/smoke/inventory.toml
