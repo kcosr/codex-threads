@@ -101,7 +101,7 @@ server. `servers ping --all` is the only aggregate command.
 | `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. |
-| `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, and `--max-turns`. |
+| `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
 | `settings show THREAD_ID` | Read model, effort, service tier, and cwd. |
@@ -159,6 +159,11 @@ cursors from the last scanned page.
 
 `messages --since` is applied client-side after retrieving up to `--max-turns`
 recent turns.
+
+In human output, `messages` prints readable timestamped blocks. When no role
+filter is set, each block header includes the role. With `--role user` or
+`--role assistant`, the role is omitted from the header because every message
+has the requested role. `--json` keeps the structured message array shape.
 
 ## Development
 

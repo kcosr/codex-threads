@@ -504,6 +504,10 @@ async fn messages_command(
                 >= cutoff
         });
     }
+    let filtered_role = command.role.map(message_role_name);
+    if let Some(role) = filtered_role {
+        messages.retain(|m| m["role"].as_str() == Some(role));
+    }
     if let Some(last) = command.last
         && messages.len() > last
     {
@@ -519,13 +523,10 @@ async fn messages_command(
     if command.json {
         print_json(&output)?;
     } else {
-        for message in output["messages"].as_array().unwrap_or(&Vec::new()) {
-            println!(
-                "{}\t{}",
-                message["role"].as_str().unwrap_or(""),
-                message["text"].as_str().unwrap_or("")
-            );
-        }
+        print_messages(
+            output["messages"].as_array().unwrap_or(&Vec::new()),
+            filtered_role,
+        );
         if output["truncated"].as_bool() == Some(true) {
             eprintln!("warning: message scan truncated; increase --max-turns for a wider scan");
         }
@@ -1230,6 +1231,48 @@ fn flatten_messages(turns: &Value) -> Vec<Value> {
         }
     }
     out
+}
+
+fn print_messages(messages: &[Value], filtered_role: Option<&str>) {
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        let timestamp = message["turnStartedAt"]
+            .as_i64()
+            .or_else(|| message["turnCompletedAt"].as_i64());
+        if filtered_role.is_some() {
+            println!("{}", format_timestamp(timestamp));
+        } else {
+            println!(
+                "{} {}",
+                format_timestamp(timestamp),
+                message["role"].as_str().unwrap_or("")
+            );
+        }
+        println!("{}", message["text"].as_str().unwrap_or(""));
+    }
+}
+
+fn format_timestamp(timestamp: Option<i64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "unknown-time".to_string();
+    };
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn message_role_name(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+    }
 }
 
 fn print_thread_detail(result: &Value) {

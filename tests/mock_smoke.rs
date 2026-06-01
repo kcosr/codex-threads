@@ -483,6 +483,14 @@ fn read_only_commands_return_scriptable_json() {
         )["messages"][1]["role"],
         "assistant"
     );
+    let user_messages = run_json(
+        &server,
+        &[
+            "messages", "--server", "work", "--json", "--role", "user", "thread_1",
+        ],
+    );
+    assert_eq!(user_messages["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(user_messages["messages"][0]["role"], "user");
     assert_eq!(
         run_json(&server, &["status", "--server", "work", "--json"])["loadedThreadIds"][0],
         "thread_1"
@@ -498,6 +506,41 @@ fn read_only_commands_return_scriptable_json() {
         run_json(&server, &["models", "--server", "work", "--json"])["models"][0]["id"],
         "gpt-5.5"
     );
+}
+
+#[test]
+fn messages_human_output_uses_readable_blocks() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["messages", "--server", "work", "thread_1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains(" user\nhello"));
+    assert!(text.contains("\n\n"));
+    assert!(text.contains(" assistant\ndone"));
+}
+
+#[test]
+fn messages_role_filter_omits_redundant_role_in_human_output() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["messages", "--server", "work", "--role", "user", "thread_1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains("\nhello\n"));
+    assert!(!text.contains(" user\n"));
+    assert!(!text.contains("assistant"));
+    assert!(!text.contains("done"));
 }
 
 #[test]

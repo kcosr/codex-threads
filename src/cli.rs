@@ -141,6 +141,8 @@ pub struct MessagesCommand {
     pub last: Option<usize>,
     #[arg(long)]
     pub since: Option<String>,
+    #[arg(long, value_enum)]
+    pub role: Option<MessageRole>,
     #[arg(long, default_value_t = 200)]
     pub max_turns: u32,
     #[arg(long)]
@@ -342,4 +344,10 @@ pub enum ItemsView {
     Summary,
     Full,
     None,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MessageRole {
+    User,
+    Assistant,
 }
