@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,6 +18,20 @@ pub struct RpcError {
     pub code: i64,
     pub message: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct RpcRequestError {
+    pub method: String,
+    pub error: RpcError,
+}
+
+impl fmt::Display for RpcRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", format_rpc_error(&self.method, &self.error))
+    }
+}
+
+impl std::error::Error for RpcRequestError {}
 
 #[derive(Debug, Clone)]
 pub struct Notification {
@@ -124,7 +139,10 @@ impl RpcClient {
             if value.get("id").and_then(Value::as_i64) == Some(id) {
                 if let Some(error) = value.get("error") {
                     let error = parse_rpc_error(error);
-                    return Err(anyhow!("{}", format_rpc_error(method, &error)));
+                    return Err(anyhow!(RpcRequestError {
+                        method: method.to_string(),
+                        error,
+                    }));
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }

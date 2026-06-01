@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{self, Write};
 
@@ -7,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::*;
 use crate::config::{AppConfig, Target, load_config, resolve_config_path, resolve_target};
-use crate::rpc::{Notification, RpcClient};
+use crate::rpc::{Notification, RpcClient, RpcRequestError};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
@@ -112,26 +113,32 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await
         }
-        Command::Settings(command) => match command.command {
-            SettingsSubcommand::Show(command) => {
-                with_client(
-                    &config,
-                    cli.connect.as_deref(),
-                    command.server.server.clone(),
-                    |target, client| async move {
-                        settings_show_command(target, client, command, yolo).await
-                    },
-                )
-                .await
+        Command::Settings(command) => {
+            match command.command {
+                SettingsSubcommand::Show(command) => {
+                    with_client(
+                        &config,
+                        cli.connect.as_deref(),
+                        command.server.server.clone(),
+                        |target, client| async move {
+                            settings_show_command(target, client, command).await
+                        },
+                    )
+                    .await
+                }
+                SettingsSubcommand::Set(command) => {
+                    with_client(
+                        &config,
+                        cli.connect.as_deref(),
+                        command.server.server.clone(),
+                        |target, client| async move {
+                            settings_set_command(target, client, command, yolo).await
+                        },
+                    )
+                    .await
+                }
             }
-            SettingsSubcommand::Set(command) => with_client(
-                &config,
-                cli.connect.as_deref(),
-                command.server.server.clone(),
-                |target, client| async move { settings_set_command(target, client, command).await },
-            )
-            .await,
-        },
+        }
         Command::Status(command) => {
             with_client(
                 &config,
@@ -679,26 +686,22 @@ async fn start_turn(
     if let Some(tier) = options.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
     }
-    let mut early_notifications = Vec::new();
+    let early_notifications = RefCell::new(Vec::new());
     let params = Value::Object(params);
-    let result = match client
-        .request("turn/start", params.clone(), |notification| {
-            early_notifications.push(notification);
-        })
-        .await
-    {
-        Ok(result) => result,
-        Err(err) if is_thread_not_found_error(&err, "turn/start", &thread_id) => {
-            resume_thread_for_action(&mut client, &thread_id, options.yolo).await?;
-            early_notifications.clear();
-            client
-                .request("turn/start", params, |notification| {
-                    early_notifications.push(notification);
-                })
-                .await?
-        }
-        Err(err) => return Err(err),
-    };
+    let result = request_with_resume_retry(
+        &mut client,
+        "turn/start",
+        params,
+        &thread_id,
+        options.yolo,
+        || {
+            early_notifications.borrow_mut().clear();
+        },
+        |notification| {
+            early_notifications.borrow_mut().push(notification);
+        },
+    )
+    .await?;
     let turn_id = result["turn"]["id"]
         .as_str()
         .ok_or_else(|| app_server_error("turn/start response missing turn.id"))?
@@ -729,7 +732,7 @@ async fn start_turn(
         json_out: options.json,
         stream: options.stream,
     };
-    for notification in early_notifications {
+    for notification in early_notifications.into_inner() {
         if let Some(code) =
             process_turn_notification(&wait, notification, &mut assistant_text, &mut events)?
         {
@@ -798,10 +801,51 @@ async fn resume_thread_for_action(
     Ok(())
 }
 
+async fn request_with_resume_retry<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
+    yolo: bool,
+    mut before_retry: impl FnMut(),
+    mut on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    // Only use this for operations whose app-server implementation requires a
+    // loaded CodexThread. Persisted metadata/history/goal commands can operate
+    // without this, and interrupting a non-loaded thread cannot become useful
+    // by loading an inactive session.
+    match client
+        .request(method, params.clone(), |notification| {
+            on_notification(notification);
+        })
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
+            before_retry();
+            resume_thread_for_action(client, thread_id, yolo).await?;
+            client
+                .request(method, params, |notification| {
+                    on_notification(notification);
+                })
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
-    let message = err.to_string();
-    message.contains(&format!("app-server `{method}` error"))
-        && message.contains(&format!("thread not found: {thread_id}"))
+    let Some(error) = err.downcast_ref::<RpcRequestError>() else {
+        return false;
+    };
+    // Codex app-server currently returns invalid_request(-32600) with this
+    // message from request_processors::{turn_processor,thread_processor}::load_thread.
+    error.method == method
+        && error.error.code == -32600
+        && error.error.message == format!("thread not found: {thread_id}")
 }
 
 struct TurnWaitContext<'a> {
@@ -944,14 +988,10 @@ async fn settings_show_command(
     target: Target,
     mut client: RpcClient,
     command: SettingsShowCommand,
-    yolo: bool,
 ) -> Result<i32> {
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(command.thread_id.clone()));
     params.insert("excludeTurns".to_string(), json!(true));
-    if yolo {
-        insert_thread_yolo_permissions(&mut params);
-    }
     let result = client
         .request("thread/resume", Value::Object(params), |_| {})
         .await?;
@@ -987,6 +1027,7 @@ async fn settings_set_command(
     target: Target,
     mut client: RpcClient,
     command: SettingsSetCommand,
+    yolo: bool,
 ) -> Result<i32> {
     if command.model.is_none()
         && command.effort.is_none()
@@ -998,7 +1039,7 @@ async fn settings_set_command(
         ));
     }
     let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(command.thread_id));
+    params.insert("threadId".to_string(), json!(command.thread_id.clone()));
     insert_opt(&mut params, "model", command.model.clone());
     if let Some(effort) = command.effort.as_deref() {
         validate_effort(effort)?;
@@ -1009,9 +1050,17 @@ async fn settings_set_command(
     } else if let Some(tier) = &command.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
     }
-    let _ = client
-        .request("thread/settings/update", Value::Object(params), |_| {})
-        .await?;
+    let thread_id = command.thread_id.clone();
+    let _ = request_with_resume_retry(
+        &mut client,
+        "thread/settings/update",
+        Value::Object(params),
+        &thread_id,
+        yolo,
+        || {},
+        |_| {},
+    )
+    .await?;
     let output = json!({"server": target.server, "threadId": command.thread_id, "status": "accepted", "requested": {"model": command.model, "effort": command.effort, "serviceTier": command.service_tier, "clearServiceTier": command.clear_service_tier}});
     emit_json_or_status(command.json, &output)
 }
@@ -1096,14 +1145,16 @@ async fn steer_command(
     yolo: bool,
 ) -> Result<i32> {
     let params = json!({"threadId": command.thread_id, "expectedTurnId": command.turn_id, "input": [{"type": "text", "text": command.prompt, "textElements": []}]});
-    let result = match client.request("turn/steer", params.clone(), |_| {}).await {
-        Ok(result) => result,
-        Err(err) if is_thread_not_found_error(&err, "turn/steer", &command.thread_id) => {
-            resume_thread_for_action(&mut client, &command.thread_id, yolo).await?;
-            client.request("turn/steer", params, |_| {}).await?
-        }
-        Err(err) => return Err(err),
-    };
+    let result = request_with_resume_retry(
+        &mut client,
+        "turn/steer",
+        params,
+        &command.thread_id,
+        yolo,
+        || {},
+        |_| {},
+    )
+    .await?;
     let output = json!({"server": target.server, "threadId": command.thread_id, "turnId": result["turnId"].as_str().unwrap_or(&command.turn_id), "status": "accepted"});
     emit_json_or_status(command.json, &output)
 }
@@ -1613,11 +1664,13 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
 }
 
 fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
+    // Thread start/resume use the legacy SandboxMode string shape.
     map.insert("approvalPolicy".to_string(), json!("never"));
     map.insert("sandbox".to_string(), json!("danger-full-access"));
 }
 
 fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
+    // Turn start uses the newer SandboxPolicy object shape.
     map.insert("approvalPolicy".to_string(), json!("never"));
     map.insert(
         "sandboxPolicy".to_string(),

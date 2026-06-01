@@ -1,31 +1,31 @@
 # codex-threads
 
-`codex-threads` is a scriptable companion CLI for Codex users who want agents
-or shell scripts to inspect and manage recent Codex sessions.
+`codex-threads` is a companion CLI for inspecting and controlling Codex
+app-server threads from a terminal or another agent.
 
 It exists for workflows the Codex CLI does not currently cover well: asking
 what threads were active recently, what happened in a repo, whether a thread is
 still running, and sending a follow-up to an existing session. The Codex desktop
 app may expose some of this interactively; `codex-threads` makes it available
-from a terminal or another agent.
+through a focused command-line interface.
 
-The main use cases are coordinating Codex work from another shell or agent:
-list recent sessions/threads, retrieve relevant transcript slices, summarize
-status and where work left off, spawn new Codex threads for background work, and
-relay user requests or follow-ups across those threads. Search is available
-when you need it, but it is not optimized and can be very slow over large
-histories; prefer recent listing, targeted transcript retrieval, thread
+The main use cases are coordinating Codex work as a user or through another
+agent: list recent sessions/threads, retrieve relevant transcript slices,
+summarize status and where work left off, spawn new Codex threads for background
+work, and relay user requests or follow-ups across those threads. Search is
+available when you need it, but it is not optimized and can be very slow over
+large histories; prefer recent listing, targeted transcript retrieval, thread
 creation, and direct follow-ups when those fit the workflow.
 
 It talks to Codex app-server, the local control server exposed by the Codex
 agent runtime. In Codex terminology, a thread is one session and a turn is one
 user request/assistant response cycle.
 
-`codex-threads` is built for headless automation by users who already run Codex
-in yolo-style environments where sandboxing and approval policy are handled
+`codex-threads` is built for headless Codex control by users who already run
+Codex in yolo-style environments where sandboxing and approval policy are handled
 outside the Codex application. Yolo mode is opt-out: by default, thread
-creation, thread resume, and turn start requests force Codex app-server to use
-`approvalPolicy = "never"` and full-access sandboxing
+creation, resume-before-action recovery, and turn start requests force Codex
+app-server to use `approvalPolicy = "never"` and full-access sandboxing
 (`sandbox = "danger-full-access"` or
 `sandboxPolicy.type = "dangerFullAccess"`). Pass global `--no-yolo` to use the
 app-server's configured approval and sandbox defaults instead. Do not use this
@@ -186,7 +186,7 @@ server. `servers ping --all` is the only aggregate command.
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
-| `settings show THREAD_ID` | Read model, effort, service tier, and cwd. |
+| `settings show THREAD_ID` | Read model, effort, service tier, and cwd. This resumes the thread for inspection but does not force yolo permissions. |
 | `settings set THREAD_ID` | Update `--model`, `--effort`, `--service-tier`, or `--clear-service-tier`; at least one setting flag is required. |
 | `status [THREAD_ID]` | Show server loaded-thread status or one thread with active turn discovery. |
 | `steer THREAD_ID TURN_ID PROMPT` | Send steering input to an active turn. |
@@ -202,7 +202,9 @@ Every app-server command accepts `--server ALIAS` and `--json`. Global
 `--config PATH` and `--connect ENDPOINT` may be placed before or after the
 subcommand because they are global options.
 Global `--no-yolo` disables the default permission override for action commands
-that create, resume, or start Codex work.
+that create, resume before action, or start Codex work. `settings show` is a
+read path and does not force yolo permissions even though it resumes the thread
+to inspect settings.
 
 Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and
 `xhigh`. Accepted `goal set --status` values are `active`, `paused`, `blocked`,

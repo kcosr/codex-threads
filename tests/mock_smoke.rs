@@ -33,30 +33,64 @@ enum RejectFirstMethod {
     None,
     TurnStart,
     TurnSteer,
+    SettingsUpdate,
+}
+
+#[derive(Clone, Copy)]
+struct RejectFirst {
+    method: RejectFirstMethod,
+    code: i64,
+    message: Option<&'static str>,
+}
+
+impl RejectFirst {
+    const fn none() -> Self {
+        Self {
+            method: RejectFirstMethod::None,
+            code: -32600,
+            message: None,
+        }
+    }
+
+    const fn method(method: RejectFirstMethod) -> Self {
+        Self {
+            method,
+            code: -32600,
+            message: None,
+        }
+    }
+
+    const fn method_with_error(
+        method: RejectFirstMethod,
+        code: i64,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            method,
+            code,
+            message: Some(message),
+        }
+    }
 }
 
 impl MockServer {
     fn start() -> Self {
-        Self::start_with_options(
-            TurnNotificationMode::Complete,
-            false,
-            RejectFirstMethod::None,
-        )
+        Self::start_with_options(TurnNotificationMode::Complete, false, RejectFirst::none())
     }
 
     fn start_without_turn_notifications() -> Self {
-        Self::start_with_options(TurnNotificationMode::None, false, RejectFirstMethod::None)
+        Self::start_with_options(TurnNotificationMode::None, false, RejectFirst::none())
     }
 
     fn start_with_malformed_turn_start() -> Self {
-        Self::start_with_options(TurnNotificationMode::None, true, RejectFirstMethod::None)
+        Self::start_with_options(TurnNotificationMode::None, true, RejectFirst::none())
     }
 
     fn start_requiring_resume_for_send() -> Self {
         Self::start_with_options(
             TurnNotificationMode::None,
             false,
-            RejectFirstMethod::TurnStart,
+            RejectFirst::method(RejectFirstMethod::TurnStart),
         )
     }
 
@@ -64,7 +98,23 @@ impl MockServer {
         Self::start_with_options(
             TurnNotificationMode::Complete,
             false,
-            RejectFirstMethod::TurnSteer,
+            RejectFirst::method(RejectFirstMethod::TurnSteer),
+        )
+    }
+
+    fn start_requiring_resume_for_settings_set() -> Self {
+        Self::start_with_options(
+            TurnNotificationMode::Complete,
+            false,
+            RejectFirst::method(RejectFirstMethod::SettingsUpdate),
+        )
+    }
+
+    fn start_rejecting_turn_start_with(code: i64, message: &'static str) -> Self {
+        Self::start_with_options(
+            TurnNotificationMode::None,
+            false,
+            RejectFirst::method_with_error(RejectFirstMethod::TurnStart, code, message),
         )
     }
 
@@ -72,26 +122,26 @@ impl MockServer {
         Self::start_with_options(
             TurnNotificationMode::WrongTurnCompleted,
             false,
-            RejectFirstMethod::None,
+            RejectFirst::none(),
         )
     }
 
     fn start_with_failed_turn() -> Self {
-        Self::start_with_options(TurnNotificationMode::Failed, false, RejectFirstMethod::None)
+        Self::start_with_options(TurnNotificationMode::Failed, false, RejectFirst::none())
     }
 
     fn start_with_unknown_turn_status() -> Self {
         Self::start_with_options(
             TurnNotificationMode::UnknownStatus,
             false,
-            RejectFirstMethod::None,
+            RejectFirst::none(),
         )
     }
 
     fn start_with_options(
         turn_notification_mode: TurnNotificationMode,
         malformed_turn_start: bool,
-        reject_first_method: RejectFirstMethod,
+        reject_first: RejectFirst,
     ) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
@@ -124,7 +174,7 @@ impl MockServer {
                             received,
                             turn_notification_mode,
                             malformed_turn_start,
-                            reject_first_method,
+                            reject_first,
                             rejected_first_method,
                         )
                         .await;
@@ -180,7 +230,7 @@ async fn handle_connection(
     received: Arc<Mutex<Vec<Value>>>,
     turn_notification_mode: TurnNotificationMode,
     malformed_turn_start: bool,
-    reject_first_method: RejectFirstMethod,
+    reject_first: RejectFirst,
     rejected_first_method: Arc<Mutex<bool>>,
 ) {
     let mut ws = accept_async(stream).await.expect("websocket accept");
@@ -192,12 +242,16 @@ async fn handle_connection(
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             received.lock().expect("received").push(value.clone());
             if let Some(id) = value.get("id").cloned() {
-                if should_reject_first_method(method, reject_first_method, &rejected_first_method) {
+                if should_reject_first_method(method, reject_first.method, &rejected_first_method) {
+                    let message = reject_first
+                        .message
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("thread not found: {}", thread_id(&value)));
                     let response = json!({
                         "id": id,
                         "error": {
-                            "code": -32600,
-                            "message": format!("thread not found: {}", thread_id(&value))
+                            "code": reject_first.code,
+                            "message": message
                         }
                     });
                     if ws
@@ -236,6 +290,7 @@ fn should_reject_first_method(
         RejectFirstMethod::None => return false,
         RejectFirstMethod::TurnStart => "turn/start",
         RejectFirstMethod::TurnSteer => "turn/steer",
+        RejectFirstMethod::SettingsUpdate => "thread/settings/update",
     };
     if method != expected {
         return false;
@@ -839,7 +894,7 @@ fn new_send_and_settings_commands_return_follow_up_ids() {
 
     let thread_resume_params = server.params_for("thread/resume");
     assert_eq!(thread_resume_params.len(), 1);
-    assert_thread_yolo_params(&thread_resume_params[0]);
+    assert_no_yolo_params(&thread_resume_params[0]);
 }
 
 #[test]
@@ -1040,6 +1095,117 @@ fn no_yolo_resume_retry_uses_app_server_permission_defaults() {
     for params in server.params_for("thread/resume") {
         assert_no_yolo_params(&params);
     }
+}
+
+#[test]
+fn settings_set_resumes_not_loaded_thread_before_retrying_update() {
+    let server = MockServer::start_requiring_resume_for_settings_set();
+    let updated = run_json(
+        &server,
+        &[
+            "settings", "set", "--server", "work", "--json", "thread_1", "--effort", "high",
+        ],
+    );
+    assert_eq!(updated["status"], "accepted");
+
+    let methods = server.methods();
+    let retry_methods = methods
+        .iter()
+        .filter(|method| matches!(method.as_str(), "thread/settings/update" | "thread/resume"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retry_methods,
+        [
+            "thread/settings/update",
+            "thread/resume",
+            "thread/settings/update"
+        ]
+    );
+
+    let thread_resume_params = server.params_for("thread/resume");
+    assert_eq!(thread_resume_params.len(), 1);
+    assert_thread_yolo_params(&thread_resume_params[0]);
+}
+
+#[test]
+fn no_yolo_settings_set_resume_uses_app_server_permission_defaults() {
+    let server = MockServer::start_requiring_resume_for_settings_set();
+    let updated = run_json(
+        &server,
+        &[
+            "--no-yolo",
+            "settings",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_1",
+            "--effort",
+            "high",
+        ],
+    );
+    assert_eq!(updated["status"], "accepted");
+
+    let thread_resume_params = server.params_for("thread/resume");
+    assert_eq!(thread_resume_params.len(), 1);
+    assert_no_yolo_params(&thread_resume_params[0]);
+}
+
+#[test]
+fn resume_retry_requires_exact_thread_not_found_error_contract() {
+    let server = MockServer::start_rejecting_turn_start_with(-32600, "missing thread: thread_1");
+    server
+        .command()
+        .args([
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ])
+        .assert()
+        .code(3);
+
+    let methods = server.methods();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| matches!(method.as_str(), "turn/start" | "thread/resume"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["turn/start"]
+    );
+}
+
+#[test]
+fn resume_retry_requires_invalid_request_error_code() {
+    let server = MockServer::start_rejecting_turn_start_with(-32603, "thread not found: thread_1");
+    server
+        .command()
+        .args([
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ])
+        .assert()
+        .code(3);
+
+    let methods = server.methods();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| matches!(method.as_str(), "turn/start" | "thread/resume"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["turn/start"]
+    );
 }
 
 #[test]
