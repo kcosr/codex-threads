@@ -49,7 +49,9 @@ index.
   - `cli` for command-line parsing.
   - `app` for command orchestration, event normalization, and rendering.
   - `tests` for deterministic integration coverage.
-- `smoke/` contains the opt-in mock/live smoke harness.
+- `smoke/` contains the opt-in live smoke harness.
+- `skills/` contains packaged assistant guidance for using the CLI from other
+  Codex sessions.
 
 ## Changelog
 

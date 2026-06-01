@@ -23,6 +23,10 @@ pub enum Command {
     List(ListCommand),
     Search(SearchCommand),
     Show(ShowCommand),
+    #[command(
+        about = "Show flattened messages from a bounded recent turn scan",
+        after_help = "Message selection order: fetch recent turns with --max-turns, flatten user/assistant messages, apply --since, apply --role, then apply --last.\n\n--max-turns is the recent turn scan window, not the final message display limit. Use --last for the final number of messages to print. Role filters only see messages inside the scanned turns, so widen --max-turns when searching for sparse or older roles.\n\nThere is no messages --first. For beginning-of-thread or older exact paging, use show --asc and/or show --cursor with the needed --items view."
+    )]
     Messages(MessagesCommand),
     New(NewCommand),
     Send(SendCommand),
@@ -137,13 +141,27 @@ pub struct MessagesCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub thread_id: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Return the last N messages after flattening and filtering"
+    )]
     pub last: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Keep messages whose turn timestamp is within this epoch-second or relative window, such as 5m or 1d"
+    )]
     pub since: Option<String>,
-    #[arg(long, value_enum)]
+    #[arg(
+        long,
+        value_enum,
+        help = "Keep only messages from this role after the recent turn scan"
+    )]
     pub role: Option<MessageRole>,
-    #[arg(long, default_value_t = 200)]
+    #[arg(
+        long,
+        default_value_t = 200,
+        help = "Number of recent turns to scan before flattening and filtering messages"
+    )]
     pub max_turns: u32,
     #[arg(long)]
     pub json: bool,

@@ -544,6 +544,24 @@ fn messages_role_filter_omits_redundant_role_in_human_output() {
 }
 
 #[test]
+fn messages_help_explains_scan_and_filter_order() {
+    let output = Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["messages", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains("Message selection order"));
+    assert!(text.contains("--max-turns is the recent turn scan window"));
+    assert!(text.contains("Use --last for the final number of messages"));
+    assert!(text.contains("Role filters only see messages inside the scanned turns"));
+    assert!(text.contains("There is no messages --first"));
+}
+
+#[test]
 fn list_since_filters_locally_across_server_pages() {
     let server = MockServer::start();
     let output = run_json(

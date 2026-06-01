@@ -61,6 +61,25 @@ codex-threads --config ./config.toml list --server main
 codex-threads --config ./config.toml new --server main --cwd "$PWD" "Run the tests"
 ```
 
+## Common Workflows
+
+Find recent candidate threads, then inspect the selected thread:
+
+```bash
+codex-threads list --since 24h --limit 20 --json
+codex-threads search "release process" --limit 10 --json
+codex-threads messages THREAD_ID --role user --last 10 --max-turns 100
+codex-threads messages THREAD_ID --last 8 --max-turns 50
+```
+
+Use `messages` for readable recent context. Use `show --items summary|full`
+when you need turn IDs, exact turn structure, or cursor-based paging:
+
+```bash
+codex-threads show THREAD_ID --last 10 --items summary --json
+codex-threads show THREAD_ID --asc --items full --json
+```
+
 ## Configuration
 
 Default config path:
@@ -157,8 +176,24 @@ page, the CLI keeps scanning server pages until the filtered limit is filled or
 the server cursor is exhausted. Returned cursors are still raw Codex server
 cursors from the last scanned page.
 
-`messages --since` is applied client-side after retrieving up to `--max-turns`
-recent turns.
+`messages` is a convenience projection over recent turn history. It does not
+page exact whole-thread message history and it does not have `--first`. For the
+beginning of a thread or older exact review, use `show --asc` and/or
+`show --cursor` with the appropriate `--items` view.
+
+Message selection order is:
+
+1. Fetch up to `--max-turns` recent turns from Codex with full items.
+2. Flatten those turns into user/assistant messages.
+3. Apply `--since`, if present, using the turn timestamp.
+4. Apply `--role user|assistant`, if present.
+5. Apply `--last N`, if present, to the final filtered message list.
+
+`--max-turns` is the recent turn scan window, not a final display limit.
+`--last` is the final message limit after flattening and filtering; it is not
+an alias for `--max-turns`. Role filtering only sees messages inside the
+scanned recent turns, so increase `--max-turns` when looking for sparse or older
+messages such as `--role assistant --last 3`.
 
 In human output, `messages` prints readable timestamped blocks. When no role
 filter is set, each block header includes the role. With `--role user` or
@@ -225,3 +260,5 @@ then commits a fresh `Unreleased` section for the next cycle.
 - `tests/` - deterministic binary-level mock smoke coverage.
 - `scripts/` - release automation.
 - `smoke/` - opt-in live smoke harness.
+- `skills/` - Codex skill guidance for using this CLI from other assistant
+  sessions.
