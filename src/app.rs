@@ -309,12 +309,11 @@ async fn servers_command(
 }
 
 async fn list_command(target: Target, mut client: RpcClient, command: ListCommand) -> Result<i32> {
+    let since = command.since.as_deref().map(parse_since).transpose()?;
     let mut params = Map::new();
-    insert_opt(&mut params, "cursor", command.cursor);
-    params.insert(
-        "limit".to_string(),
-        json!(command.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
-    );
+    insert_opt(&mut params, "cursor", command.cursor.clone());
+    let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    params.insert("limit".to_string(), json!(limit));
     if let Some(sort) = command.sort {
         params.insert("sortKey".to_string(), json!(sort_key(sort)));
     }
@@ -328,9 +327,22 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
     if let Some(cwd) = command.cwd {
         params.insert("cwd".to_string(), json!(cwd));
     }
-    let result = client
-        .request("thread/list", Value::Object(params), |_| {})
-        .await?;
+    let result = if let Some(since) = since {
+        scan_since_filtered(
+            &mut client,
+            "thread/list",
+            params,
+            command.cursor,
+            limit,
+            since,
+            ThreadProjection::Direct,
+        )
+        .await?
+    } else {
+        client
+            .request("thread/list", Value::Object(params), |_| {})
+            .await?
+    };
     emit_result(&target, command.json, result, "threads")
 }
 
@@ -339,20 +351,98 @@ async fn search_command(
     mut client: RpcClient,
     command: SearchCommand,
 ) -> Result<i32> {
+    let since = command.since.as_deref().map(parse_since).transpose()?;
     let mut params = Map::new();
-    insert_opt(&mut params, "cursor", command.cursor);
-    params.insert(
-        "limit".to_string(),
-        json!(command.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
-    );
+    insert_opt(&mut params, "cursor", command.cursor.clone());
+    let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    params.insert("limit".to_string(), json!(limit));
     params.insert("searchTerm".to_string(), json!(command.query));
     if command.archived {
         params.insert("archived".to_string(), json!(true));
     }
-    let result = client
-        .request("thread/search", Value::Object(params), |_| {})
-        .await?;
+    let result = if let Some(since) = since {
+        scan_since_filtered(
+            &mut client,
+            "thread/search",
+            params,
+            command.cursor,
+            limit,
+            since,
+            ThreadProjection::SearchResult,
+        )
+        .await?
+    } else {
+        client
+            .request("thread/search", Value::Object(params), |_| {})
+            .await?
+    };
     emit_result(&target, command.json, result, "results")
+}
+
+#[derive(Clone, Copy)]
+enum ThreadProjection {
+    Direct,
+    SearchResult,
+}
+
+async fn scan_since_filtered(
+    client: &mut RpcClient,
+    method: &str,
+    mut base_params: Map<String, Value>,
+    mut cursor: Option<String>,
+    limit: u32,
+    since: i64,
+    projection: ThreadProjection,
+) -> Result<Value> {
+    let mut data = Vec::new();
+    let mut next_cursor = Value::Null;
+    let mut backwards_cursor = Value::Null;
+    let mut remaining = limit;
+
+    base_params.remove("cursor");
+    base_params.remove("limit");
+
+    while remaining > 0 {
+        let mut params = base_params.clone();
+        insert_opt(&mut params, "cursor", cursor.clone());
+        params.insert("limit".to_string(), json!(remaining));
+        let page = client
+            .request(method, Value::Object(params), |_| {})
+            .await?;
+        next_cursor = page["nextCursor"].clone();
+        backwards_cursor = page["backwardsCursor"].clone();
+
+        for item in page["data"].as_array().cloned().unwrap_or_default() {
+            if thread_updated_at(&item, projection).unwrap_or(0) >= since {
+                data.push(item);
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        let Some(next) = next_cursor.as_str().filter(|value| !value.is_empty()) else {
+            break;
+        };
+        if cursor.as_deref() == Some(next) {
+            break;
+        }
+        cursor = Some(next.to_string());
+    }
+
+    Ok(json!({
+        "data": data,
+        "nextCursor": next_cursor,
+        "backwardsCursor": backwards_cursor
+    }))
+}
+
+fn thread_updated_at(item: &Value, projection: ThreadProjection) -> Option<i64> {
+    match projection {
+        ThreadProjection::Direct => item["updatedAt"].as_i64(),
+        ThreadProjection::SearchResult => item["thread"]["updatedAt"].as_i64(),
+    }
 }
 
 async fn show_command(target: Target, mut client: RpcClient, command: ShowCommand) -> Result<i32> {

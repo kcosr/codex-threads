@@ -81,6 +81,8 @@ pub struct ListCommand {
     #[arg(long)]
     pub cursor: Option<String>,
     #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
     pub cwd: Option<String>,
     #[arg(long)]
     pub archived: bool,
@@ -103,6 +105,8 @@ pub struct SearchCommand {
     pub limit: Option<u32>,
     #[arg(long)]
     pub cursor: Option<String>,
+    #[arg(long)]
+    pub since: Option<String>,
     #[arg(long)]
     pub archived: bool,
     #[arg(long)]

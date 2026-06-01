@@ -220,7 +220,13 @@ fn mock_result(method: &str, request: &Value, malformed_turn_start: bool) -> Val
             "platformFamily": "unix",
             "platformOs": "linux"
         }),
+        "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/paged") => {
+            paged_threads(request)
+        }
         "thread/list" => page(json!([sample_thread("thread_1")])),
+        "thread/search" if request["params"]["searchTerm"].as_str() == Some("paged") => {
+            paged_search_results(request)
+        }
         "thread/search" => page(json!([{ "thread": sample_thread("thread_1"), "score": 1.0 }])),
         "thread/read" => json!({ "thread": sample_thread(thread_id(request)) }),
         "thread/turns/list" => page(json!([sample_turn()])),
@@ -268,11 +274,49 @@ fn page(data: Value) -> Value {
     json!({ "data": data, "nextCursor": Value::Null, "backwardsCursor": Value::Null })
 }
 
+fn paged_threads(request: &Value) -> Value {
+    match request["params"]["cursor"].as_str() {
+        None => json!({
+            "data": [sample_thread_with_updated("thread_old", 1_600_000_000)],
+            "nextCursor": "page2",
+            "backwardsCursor": Value::Null
+        }),
+        Some("page2") => json!({
+            "data": [
+                sample_thread_with_updated("thread_new_1", 1_700_000_100),
+                sample_thread_with_updated("thread_new_2", 1_700_000_200)
+            ],
+            "nextCursor": "page3",
+            "backwardsCursor": Value::Null
+        }),
+        _ => page(json!([])),
+    }
+}
+
+fn paged_search_results(request: &Value) -> Value {
+    let page = paged_threads(request);
+    let data = page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|thread| json!({ "thread": thread, "score": 1.0 }))
+        .collect::<Vec<_>>();
+    json!({
+        "data": data,
+        "nextCursor": page["nextCursor"].clone(),
+        "backwardsCursor": page["backwardsCursor"].clone()
+    })
+}
+
 fn thread_id(request: &Value) -> &str {
     request["params"]["threadId"].as_str().unwrap_or("thread_1")
 }
 
 fn sample_thread(id: &str) -> Value {
+    sample_thread_with_updated(id, 1_700_000_100)
+}
+
+fn sample_thread_with_updated(id: &str, updated_at: i64) -> Value {
     json!({
         "id": id,
         "name": "Mock Thread",
@@ -280,7 +324,7 @@ fn sample_thread(id: &str) -> Value {
         "cwd": "/tmp/mock-work",
         "status": { "type": "idle" },
         "createdAt": 1_700_000_000_i64,
-        "updatedAt": 1_700_000_100_i64
+        "updatedAt": updated_at
     })
 }
 
@@ -454,6 +498,53 @@ fn read_only_commands_return_scriptable_json() {
         run_json(&server, &["models", "--server", "work", "--json"])["models"][0]["id"],
         "gpt-5.5"
     );
+}
+
+#[test]
+fn list_since_filters_locally_across_server_pages() {
+    let server = MockServer::start();
+    let output = run_json(
+        &server,
+        &[
+            "list",
+            "--server",
+            "work",
+            "--json",
+            "--cwd",
+            "/tmp/paged",
+            "--limit",
+            "2",
+            "--since",
+            "1700000000",
+        ],
+    );
+    assert_eq!(output["threads"].as_array().unwrap().len(), 2);
+    assert_eq!(output["threads"][0]["id"], "thread_new_1");
+    assert_eq!(output["threads"][1]["id"], "thread_new_2");
+    assert_eq!(output["nextCursor"], "page3");
+}
+
+#[test]
+fn search_since_filters_locally_across_server_pages() {
+    let server = MockServer::start();
+    let output = run_json(
+        &server,
+        &[
+            "search",
+            "--server",
+            "work",
+            "--json",
+            "--limit",
+            "2",
+            "--since",
+            "1700000000",
+            "paged",
+        ],
+    );
+    assert_eq!(output["results"].as_array().unwrap().len(), 2);
+    assert_eq!(output["results"][0]["thread"]["id"], "thread_new_1");
+    assert_eq!(output["results"][1]["thread"]["id"], "thread_new_2");
+    assert_eq!(output["nextCursor"], "page3");
 }
 
 #[test]

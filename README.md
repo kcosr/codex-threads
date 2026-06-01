@@ -98,8 +98,8 @@ server. `servers ping --all` is the only aggregate command.
 | --- | --- |
 | `servers [--json]` | List configured server aliases without connecting. |
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. |
-| `search QUERY` | Search one server with `--limit`, `--cursor`, and `--archived`. |
+| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. |
+| `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
@@ -149,9 +149,16 @@ reach a terminal status. They consume realtime notifications when available and
 poll recent turns as a fallback so callers still get a final JSON response if a
 notification is missed.
 
-`messages --since` accepts either an epoch timestamp in seconds or a relative
-duration ending in `s`, `m`, `h`, or `d`, such as `5m`. The filter is applied
-client-side after retrieving up to `--max-turns` recent turns.
+`list --since`, `search --since`, and `messages --since` accept either an epoch
+timestamp in seconds or a relative duration ending in `s`, `m`, `h`, or `d`,
+such as `5m`. List and search filtering is applied client-side to `updatedAt`.
+When a filtered list or search does not fill `--limit` from the first server
+page, the CLI keeps scanning server pages until the filtered limit is filled or
+the server cursor is exhausted. Returned cursors are still raw Codex server
+cursors from the last scanned page.
+
+`messages --since` is applied client-side after retrieving up to `--max-turns`
+recent turns.
 
 ## Development
 
