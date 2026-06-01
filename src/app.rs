@@ -271,6 +271,11 @@ async fn servers_command(
             Ok(0)
         }
         Some(ServersSubcommand::Ping(ping)) => {
+            if connect.is_some() && ping.all {
+                return Err(usage_error(
+                    "--connect cannot be combined with servers ping --all",
+                ));
+            }
             let targets = if ping.all {
                 config
                     .servers

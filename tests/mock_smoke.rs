@@ -360,6 +360,23 @@ fn connect_bypasses_config_for_servers_ping() {
 }
 
 #[test]
+fn connect_rejects_servers_ping_all() {
+    let server = MockServer::start();
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--connect")
+        .arg(server.endpoint())
+        .args(["servers", "ping", "--all"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "--connect cannot be combined with servers ping --all",
+        ));
+}
+
+#[test]
 fn missing_server_is_an_error_when_multiple_servers_are_configured() {
     let temp = TempDir::new().expect("tempdir");
     let config = temp.path().join("config.toml");
