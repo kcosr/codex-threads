@@ -19,20 +19,44 @@ struct MockServer {
     received: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Clone, Copy)]
+enum TurnNotificationMode {
+    Complete,
+    None,
+    WrongTurnCompleted,
+    Failed,
+    UnknownStatus,
+}
+
 impl MockServer {
     fn start() -> Self {
-        Self::start_with_options(true, false)
+        Self::start_with_options(TurnNotificationMode::Complete, false)
     }
 
     fn start_without_turn_notifications() -> Self {
-        Self::start_with_options(false, false)
+        Self::start_with_options(TurnNotificationMode::None, false)
     }
 
     fn start_with_malformed_turn_start() -> Self {
-        Self::start_with_options(false, true)
+        Self::start_with_options(TurnNotificationMode::None, true)
     }
 
-    fn start_with_options(send_turn_notifications: bool, malformed_turn_start: bool) -> Self {
+    fn start_with_wrong_turn_completion() -> Self {
+        Self::start_with_options(TurnNotificationMode::WrongTurnCompleted, false)
+    }
+
+    fn start_with_failed_turn() -> Self {
+        Self::start_with_options(TurnNotificationMode::Failed, false)
+    }
+
+    fn start_with_unknown_turn_status() -> Self {
+        Self::start_with_options(TurnNotificationMode::UnknownStatus, false)
+    }
+
+    fn start_with_options(
+        turn_notification_mode: TurnNotificationMode,
+        malformed_turn_start: bool,
+    ) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
         let config = temp.path().join("config.toml");
@@ -59,7 +83,7 @@ impl MockServer {
                         handle_connection(
                             stream,
                             received,
-                            send_turn_notifications,
+                            turn_notification_mode,
                             malformed_turn_start,
                         )
                         .await;
@@ -98,7 +122,7 @@ impl MockServer {
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     received: Arc<Mutex<Vec<String>>>,
-    send_turns: bool,
+    turn_notification_mode: TurnNotificationMode,
     malformed_turn_start: bool,
 ) {
     let mut ws = accept_async(stream).await.expect("websocket accept");
@@ -111,9 +135,9 @@ async fn handle_connection(
             received.lock().expect("received").push(method.to_string());
             if let Some(id) = value.get("id").cloned() {
                 let result = mock_result(method, &value, malformed_turn_start);
-                if method == "turn/start" && send_turns {
+                if method == "turn/start" {
                     let thread_id = value["params"]["threadId"].as_str().unwrap_or("thread_1");
-                    send_turn_notifications(&mut ws, thread_id).await;
+                    send_turn_notifications(&mut ws, thread_id, turn_notification_mode).await;
                 }
                 let response = json!({ "id": id, "result": result });
                 if ws
@@ -131,7 +155,15 @@ async fn handle_connection(
 async fn send_turn_notifications(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     thread_id: &str,
+    mode: TurnNotificationMode,
 ) {
+    let (turn_id, terminal_status, text) = match mode {
+        TurnNotificationMode::Complete => ("turn_1", "completed", "done"),
+        TurnNotificationMode::WrongTurnCompleted => ("turn_other", "failed", "done"),
+        TurnNotificationMode::Failed => ("turn_1", "failed", "failed"),
+        TurnNotificationMode::UnknownStatus => ("turn_1", "mystery", "mystery"),
+        TurnNotificationMode::None => return,
+    };
     let _ = ws
         .send(Message::Text(
             json!({
@@ -140,7 +172,7 @@ async fn send_turn_notifications(
                     "threadId": thread_id,
                     "turnId": "turn_1",
                     "itemId": "item_agent",
-                    "delta": "done"
+                    "delta": text
                 }
             })
             .to_string()
@@ -157,7 +189,7 @@ async fn send_turn_notifications(
                     "item": {
                         "id": "item_agent",
                         "type": "agentMessage",
-                        "text": "done"
+                        "text": text
                     }
                 }
             })
@@ -171,7 +203,7 @@ async fn send_turn_notifications(
                 "method": "turn/completed",
                 "params": {
                     "threadId": thread_id,
-                    "turn": { "id": "turn_1", "status": "completed", "items": [] }
+                    "turn": { "id": turn_id, "status": terminal_status, "items": [] }
                 }
             })
             .to_string()
@@ -522,6 +554,52 @@ fn send_falls_back_to_polling_when_turn_notifications_are_absent() {
         completed["progress"].as_array().unwrap().last().unwrap()["source"],
         "poll"
     );
+}
+
+#[test]
+fn send_ignores_completion_for_a_different_turn_on_the_same_thread() {
+    let server = MockServer::start_with_wrong_turn_completion();
+    let completed = run_json(
+        &server,
+        &["send", "--server", "work", "--json", "thread_1", "continue"],
+    );
+    assert_eq!(completed["turnId"], "turn_1");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["finalAssistantText"], "done");
+    assert_eq!(
+        completed["progress"].as_array().unwrap().last().unwrap()["source"],
+        "poll"
+    );
+}
+
+#[test]
+fn failed_turn_exits_one_and_returns_terminal_json() {
+    let server = MockServer::start_with_failed_turn();
+    let output = server
+        .command()
+        .args(["send", "--server", "work", "--json", "thread_1", "continue"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let failed: Value = serde_json::from_slice(&output).expect("json output");
+    assert_eq!(failed["turnId"], "turn_1");
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["finalAssistantText"], "failed");
+}
+
+#[test]
+fn unknown_turn_status_notification_is_app_server_error() {
+    let server = MockServer::start_with_unknown_turn_status();
+    server
+        .command()
+        .args(["send", "--server", "work", "--json", "thread_1", "continue"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "app-server returned unrecognized turn status `mystery`",
+        ));
 }
 
 #[test]

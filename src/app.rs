@@ -654,8 +654,8 @@ async fn poll_turn_completion(
     let Some(turn) = turn else {
         return Ok(None);
     };
-    let status = turn_status(turn);
     reject_unknown_turn_status(turn)?;
+    let status = turn_status(turn);
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
@@ -685,7 +685,8 @@ fn process_turn_notification(
         wait.turn_id,
         notification,
         assistant_text,
-    ) else {
+    )?
+    else {
         return Ok(None);
     };
     if wait.json_out && wait.stream {
@@ -1051,7 +1052,7 @@ fn turn_event(
     turn_id: &str,
     notification: Notification,
     assistant_text: &mut String,
-) -> Option<Value> {
+) -> Result<Option<Value>> {
     match notification.method.as_str() {
         "item/agentMessage/delta"
             if notification.params["threadId"] == thread_id
@@ -1059,9 +1060,9 @@ fn turn_event(
         {
             let delta = notification.params["delta"].as_str().unwrap_or("");
             assistant_text.push_str(delta);
-            Some(
+            Ok(Some(
                 json!({"type": "progress", "server": server, "threadId": thread_id, "turnId": turn_id, "delta": delta}),
-            )
+            ))
         }
         "item/completed"
             if notification.params["threadId"] == thread_id
@@ -1072,19 +1073,23 @@ fn turn_event(
                 && assistant_text.is_empty()
             {
                 assistant_text.push_str(text);
-                return Some(
+                return Ok(Some(
                     json!({"type": "assistantMessage", "server": server, "threadId": thread_id, "turnId": turn_id, "text": text}),
-                );
+                ));
             }
-            None
+            Ok(None)
         }
-        "turn/completed" if notification.params["threadId"] == thread_id => {
+        "turn/completed"
+            if notification.params["threadId"] == thread_id
+                && notification.params["turn"]["id"] == turn_id =>
+        {
+            reject_unknown_turn_status(&notification.params["turn"])?;
             let status = turn_status(&notification.params["turn"]);
-            Some(
+            Ok(Some(
                 json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status}),
-            )
+            ))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
