@@ -1,9 +1,9 @@
 ---
-name: codex-threads-cli
-description: Use the `codex-threads` CLI to search, inspect, summarize, message, and control Codex app-server threads. Use this when the user asks about recent Codex work, project status over a time window, what was discussed in another Codex thread, or wants to send/follow up with a Codex thread.
+name: codex-threads
+description: Use `codex-threads` to search, inspect, summarize, message, and control Codex app-server threads. Use this when the user asks about recent Codex work, project status over a time window, what was discussed in another Codex thread, or wants to send/follow up with a Codex thread.
 ---
 
-# Codex Threads CLI
+# codex-threads
 
 Use `codex-threads` to query and control Codex app-server threads.
 

@@ -63,7 +63,7 @@ cargo install --path .
 When asking another agent to use this CLI, point it at the included skill:
 
 ```text
-skills/codex-threads-cli
+skills/codex-threads
 ```
 
 `codex-threads` talks to a running Codex app-server. Start Codex app-server

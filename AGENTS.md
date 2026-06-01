@@ -6,7 +6,7 @@ targets.
 
 ## What This Repo Is
 
-`codex-threads` is a scriptable control surface over Codex app-server. It should
+`codex-threads` is a focused control surface over Codex app-server. It should
 delegate thread state, history, settings, and control operations to Codex
 app-server instead of parsing local rollout files or maintaining its own thread
 index.
