@@ -340,6 +340,26 @@ fn connect_bypasses_config_and_lists_threads() {
 }
 
 #[test]
+fn connect_bypasses_config_for_servers_ping() {
+    let server = MockServer::start();
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--config")
+        .arg(server.config.parent().unwrap().join("missing.toml"))
+        .arg("--connect")
+        .arg(server.endpoint())
+        .args(["servers", "ping"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(format!(
+            "{}\tok",
+            server.endpoint()
+        )));
+}
+
+#[test]
 fn missing_server_is_an_error_when_multiple_servers_are_configured() {
     let temp = TempDir::new().expect("tempdir");
     let config = temp.path().join("config.toml");

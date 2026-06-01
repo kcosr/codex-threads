@@ -46,7 +46,7 @@ where
 async fn run(cli: Cli) -> Result<i32> {
     let config_path = resolve_config_path(cli.config.clone());
     if let Command::Servers(command) = &cli.command {
-        return servers_command(&config_path, command).await;
+        return servers_command(&config_path, cli.connect.as_deref(), command).await;
     }
     let config = if cli.connect.is_some() {
         AppConfig::default()
@@ -239,8 +239,16 @@ where
     f(target, client).await
 }
 
-async fn servers_command(config_path: &std::path::Path, command: &ServersCommand) -> Result<i32> {
-    let config = load_config(config_path)?;
+async fn servers_command(
+    config_path: &std::path::Path,
+    connect: Option<&str>,
+    command: &ServersCommand,
+) -> Result<i32> {
+    let config = if connect.is_some() {
+        AppConfig::default()
+    } else {
+        load_config(config_path)?
+    };
     match &command.command {
         None => {
             let rows: Vec<_> = config
@@ -273,7 +281,7 @@ async fn servers_command(config_path: &std::path::Path, command: &ServersCommand
                     })
                     .collect::<Vec<_>>()
             } else {
-                vec![resolve_target(&config, None, ping.server.as_deref())?]
+                vec![resolve_target(&config, connect, ping.server.as_deref())?]
             };
             let mut results = Vec::new();
             for target in targets {
