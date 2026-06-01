@@ -666,11 +666,25 @@ async fn start_turn(
         params.insert("serviceTier".to_string(), json!(tier));
     }
     let mut early_notifications = Vec::new();
-    let result = client
-        .request("turn/start", Value::Object(params), |notification| {
+    let params = Value::Object(params);
+    let result = match client
+        .request("turn/start", params.clone(), |notification| {
             early_notifications.push(notification);
         })
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(err) if is_thread_not_found_error(&err, "turn/start", &thread_id) => {
+            resume_thread_for_action(&mut client, &thread_id).await?;
+            early_notifications.clear();
+            client
+                .request("turn/start", params, |notification| {
+                    early_notifications.push(notification);
+                })
+                .await?
+        }
+        Err(err) => return Err(err),
+    };
     let turn_id = result["turn"]["id"]
         .as_str()
         .ok_or_else(|| app_server_error("turn/start response missing turn.id"))?
@@ -751,6 +765,23 @@ async fn start_turn(
             }
         }
     }
+}
+
+async fn resume_thread_for_action(client: &mut RpcClient, thread_id: &str) -> Result<()> {
+    client
+        .request(
+            "thread/resume",
+            json!({"threadId": thread_id, "excludeTurns": true}),
+            |_| {},
+        )
+        .await?;
+    Ok(())
+}
+
+fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
+    let message = err.to_string();
+    message.contains(&format!("app-server `{method}` error"))
+        && message.contains(&format!("thread not found: {thread_id}"))
 }
 
 struct TurnWaitContext<'a> {
@@ -1040,13 +1071,15 @@ async fn steer_command(
     mut client: RpcClient,
     command: SteerCommand,
 ) -> Result<i32> {
-    let result = client
-        .request(
-            "turn/steer",
-            json!({"threadId": command.thread_id, "expectedTurnId": command.turn_id, "input": [{"type": "text", "text": command.prompt, "textElements": []}]}),
-            |_| {},
-        )
-        .await?;
+    let params = json!({"threadId": command.thread_id, "expectedTurnId": command.turn_id, "input": [{"type": "text", "text": command.prompt, "textElements": []}]});
+    let result = match client.request("turn/steer", params.clone(), |_| {}).await {
+        Ok(result) => result,
+        Err(err) if is_thread_not_found_error(&err, "turn/steer", &command.thread_id) => {
+            resume_thread_for_action(&mut client, &command.thread_id).await?;
+            client.request("turn/steer", params, |_| {}).await?
+        }
+        Err(err) => return Err(err),
+    };
     let output = json!({"server": target.server, "threadId": command.thread_id, "turnId": result["turnId"].as_str().unwrap_or(&command.turn_id), "status": "accepted"});
     emit_json_or_status(command.json, &output)
 }

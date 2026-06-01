@@ -28,34 +28,70 @@ enum TurnNotificationMode {
     UnknownStatus,
 }
 
+#[derive(Clone, Copy)]
+enum RejectFirstMethod {
+    None,
+    TurnStart,
+    TurnSteer,
+}
+
 impl MockServer {
     fn start() -> Self {
-        Self::start_with_options(TurnNotificationMode::Complete, false)
+        Self::start_with_options(
+            TurnNotificationMode::Complete,
+            false,
+            RejectFirstMethod::None,
+        )
     }
 
     fn start_without_turn_notifications() -> Self {
-        Self::start_with_options(TurnNotificationMode::None, false)
+        Self::start_with_options(TurnNotificationMode::None, false, RejectFirstMethod::None)
     }
 
     fn start_with_malformed_turn_start() -> Self {
-        Self::start_with_options(TurnNotificationMode::None, true)
+        Self::start_with_options(TurnNotificationMode::None, true, RejectFirstMethod::None)
+    }
+
+    fn start_requiring_resume_for_send() -> Self {
+        Self::start_with_options(
+            TurnNotificationMode::None,
+            false,
+            RejectFirstMethod::TurnStart,
+        )
+    }
+
+    fn start_requiring_resume_for_steer() -> Self {
+        Self::start_with_options(
+            TurnNotificationMode::Complete,
+            false,
+            RejectFirstMethod::TurnSteer,
+        )
     }
 
     fn start_with_wrong_turn_completion() -> Self {
-        Self::start_with_options(TurnNotificationMode::WrongTurnCompleted, false)
+        Self::start_with_options(
+            TurnNotificationMode::WrongTurnCompleted,
+            false,
+            RejectFirstMethod::None,
+        )
     }
 
     fn start_with_failed_turn() -> Self {
-        Self::start_with_options(TurnNotificationMode::Failed, false)
+        Self::start_with_options(TurnNotificationMode::Failed, false, RejectFirstMethod::None)
     }
 
     fn start_with_unknown_turn_status() -> Self {
-        Self::start_with_options(TurnNotificationMode::UnknownStatus, false)
+        Self::start_with_options(
+            TurnNotificationMode::UnknownStatus,
+            false,
+            RejectFirstMethod::None,
+        )
     }
 
     fn start_with_options(
         turn_notification_mode: TurnNotificationMode,
         malformed_turn_start: bool,
+        reject_first_method: RejectFirstMethod,
     ) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
@@ -72,6 +108,8 @@ impl MockServer {
         std_listener.set_nonblocking(true).expect("nonblocking");
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_for_thread = Arc::clone(&received);
+        let rejected_first_method = Arc::new(Mutex::new(false));
+        let rejected_first_method_for_thread = Arc::clone(&rejected_first_method);
         thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("runtime");
             runtime.block_on(async move {
@@ -79,12 +117,15 @@ impl MockServer {
                 loop {
                     let (stream, _) = listener.accept().await.expect("accept");
                     let received = Arc::clone(&received_for_thread);
+                    let rejected_first_method = Arc::clone(&rejected_first_method_for_thread);
                     tokio::spawn(async move {
                         handle_connection(
                             stream,
                             received,
                             turn_notification_mode,
                             malformed_turn_start,
+                            reject_first_method,
+                            rejected_first_method,
                         )
                         .await;
                     });
@@ -124,6 +165,8 @@ async fn handle_connection(
     received: Arc<Mutex<Vec<String>>>,
     turn_notification_mode: TurnNotificationMode,
     malformed_turn_start: bool,
+    reject_first_method: RejectFirstMethod,
+    rejected_first_method: Arc<Mutex<bool>>,
 ) {
     let mut ws = accept_async(stream).await.expect("websocket accept");
     while let Some(message) = ws.next().await {
@@ -134,6 +177,23 @@ async fn handle_connection(
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             received.lock().expect("received").push(method.to_string());
             if let Some(id) = value.get("id").cloned() {
+                if should_reject_first_method(method, reject_first_method, &rejected_first_method) {
+                    let response = json!({
+                        "id": id,
+                        "error": {
+                            "code": -32600,
+                            "message": format!("thread not found: {}", thread_id(&value))
+                        }
+                    });
+                    if ws
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 let result = mock_result(method, &value, malformed_turn_start);
                 if method == "turn/start" {
                     let thread_id = value["params"]["threadId"].as_str().unwrap_or("thread_1");
@@ -150,6 +210,27 @@ async fn handle_connection(
             }
         }
     }
+}
+
+fn should_reject_first_method(
+    method: &str,
+    reject_first_method: RejectFirstMethod,
+    rejected_first_method: &Arc<Mutex<bool>>,
+) -> bool {
+    let expected = match reject_first_method {
+        RejectFirstMethod::None => return false,
+        RejectFirstMethod::TurnStart => "turn/start",
+        RejectFirstMethod::TurnSteer => "turn/steer",
+    };
+    if method != expected {
+        return false;
+    }
+    let mut rejected = rejected_first_method.lock().expect("rejected first method");
+    if *rejected {
+        return false;
+    }
+    *rejected = true;
+    true
 }
 
 async fn send_turn_notifications(
@@ -791,6 +872,33 @@ fn send_falls_back_to_polling_when_turn_notifications_are_absent() {
 }
 
 #[test]
+fn send_resumes_not_loaded_thread_before_retrying_turn_start() {
+    let server = MockServer::start_requiring_resume_for_send();
+    let accepted = run_json(
+        &server,
+        &[
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ],
+    );
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(accepted["threadId"], "thread_1");
+
+    let methods = server.methods();
+    let retry_methods = methods
+        .iter()
+        .filter(|method| matches!(method.as_str(), "turn/start" | "thread/resume"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(retry_methods, ["turn/start", "thread/resume", "turn/start"]);
+}
+
+#[test]
 fn send_ignores_completion_for_a_different_turn_on_the_same_thread() {
     let server = MockServer::start_with_wrong_turn_completion();
     let completed = run_json(
@@ -942,6 +1050,28 @@ fn control_and_goal_commands_return_acknowledgements() {
     let methods = server.methods();
     assert!(methods.iter().any(|method| method == "turn/steer"));
     assert!(methods.iter().any(|method| method == "thread/goal/clear"));
+}
+
+#[test]
+fn steer_resumes_not_loaded_thread_before_retrying_turn_steer() {
+    let server = MockServer::start_requiring_resume_for_steer();
+    let accepted = run_json(
+        &server,
+        &[
+            "steer", "--server", "work", "--json", "thread_1", "turn_1", "adjust",
+        ],
+    );
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(accepted["threadId"], "thread_1");
+    assert_eq!(accepted["turnId"], "turn_1");
+
+    let methods = server.methods();
+    let retry_methods = methods
+        .iter()
+        .filter(|method| matches!(method.as_str(), "turn/steer" | "thread/resume"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(retry_methods, ["turn/steer", "thread/resume", "turn/steer"]);
 }
 
 #[test]
