@@ -1,16 +1,17 @@
 # codex-threads
 
-`codex-threads` is a Rust CLI for querying and controlling Codex app-server
-threads across one or more named local app-server instances.
+`codex-threads` is a scriptable companion CLI for Codex users who want agents
+or shell scripts to inspect and manage recent Codex sessions.
 
-Codex app-server is the local control server exposed by the Codex agent
-runtime. A thread is one Codex session, and a turn is one request/response cycle
-inside that session.
+It exists for workflows the Codex CLI does not currently cover well: asking
+what threads were active recently, what happened in a repo, whether a thread is
+still running, and sending a follow-up to an existing session. The Codex desktop
+app may expose some of this interactively; `codex-threads` makes it available
+from a terminal or another agent.
 
-It connects to Codex app-server over WebSocket framing on Unix domain sockets
-and delegates thread state, history, active turns, settings, model listing, and
-control operations to Codex. It does not parse rollout files, keep a local
-thread index, or merge paginated thread data across multiple servers.
+It talks to Codex app-server, the local control server exposed by the Codex
+agent runtime. In Codex terminology, a thread is one session and a turn is one
+user request/assistant response cycle.
 
 ## Features
 
@@ -26,10 +27,6 @@ thread index, or merge paginated thread data across multiple servers.
   supports them.
 - Thread naming, archive/unarchive, active-turn steer/interrupt, model listing,
   and goal get/set/clear.
-
-Out of scope: HTTP API, TUI, permissions, audit logging, repository/workspace
-preparation, non-Codex backends, aggregate multi-server data commands, raw
-JSON-RPC passthrough, shell command execution, and thread forking.
 
 ## Quickstart
 
@@ -53,9 +50,11 @@ CODEX_SOCK=unix:///var/run/user/1000/codex.sock
 codex app-server --listen "$CODEX_SOCK"
 ```
 
-The target app-server must grant the experimental API capability requested by
-`codex-threads`. If it does not, commands fail with an app-server capability
-error.
+`codex-threads` opts into Codex app-server experimental APIs during its
+JSON-RPC `initialize` request by sending `capabilities.experimentalApi = true`.
+No separate Codex feature flag is required in `codex-threads`. If the running
+Codex app-server is too old or rejects that capability, commands that depend on
+experimental methods fail with an app-server capability error.
 
 Interactive Codex CLI sessions that should be visible to `codex-threads` should
 connect to the same app-server with `--remote`:

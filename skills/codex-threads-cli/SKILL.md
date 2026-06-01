@@ -30,7 +30,7 @@ codex --remote "$CODEX_SOCK" --cd "$PWD"
 
 If an interactive Codex session was not started with `--remote`, do not assume `codex-threads` can find or control that session.
 
-The target app-server must grant Codex's experimental API capability. If a command fails with an `experimentalApi` capability error, the app-server is not compatible with this CLI session.
+`codex-threads` opts into Codex app-server experimental APIs during initialize by sending `capabilities.experimentalApi = true`; no separate Codex feature flag is required. If a command fails with an `experimentalApi` capability error, the running app-server is too old or rejected that capability.
 
 ## First Checks
 
