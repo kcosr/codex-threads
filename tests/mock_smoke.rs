@@ -21,14 +21,18 @@ struct MockServer {
 
 impl MockServer {
     fn start() -> Self {
-        Self::start_with_turn_notifications(true)
+        Self::start_with_options(true, false)
     }
 
     fn start_without_turn_notifications() -> Self {
-        Self::start_with_turn_notifications(false)
+        Self::start_with_options(false, false)
     }
 
-    fn start_with_turn_notifications(send_turn_notifications: bool) -> Self {
+    fn start_with_malformed_turn_start() -> Self {
+        Self::start_with_options(false, true)
+    }
+
+    fn start_with_options(send_turn_notifications: bool, malformed_turn_start: bool) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
         let config = temp.path().join("config.toml");
@@ -52,7 +56,13 @@ impl MockServer {
                     let (stream, _) = listener.accept().await.expect("accept");
                     let received = Arc::clone(&received_for_thread);
                     tokio::spawn(async move {
-                        handle_connection(stream, received, send_turn_notifications).await;
+                        handle_connection(
+                            stream,
+                            received,
+                            send_turn_notifications,
+                            malformed_turn_start,
+                        )
+                        .await;
                     });
                 }
             });
@@ -89,6 +99,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     received: Arc<Mutex<Vec<String>>>,
     send_turns: bool,
+    malformed_turn_start: bool,
 ) {
     let mut ws = accept_async(stream).await.expect("websocket accept");
     while let Some(message) = ws.next().await {
@@ -99,7 +110,7 @@ async fn handle_connection(
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             received.lock().expect("received").push(method.to_string());
             if let Some(id) = value.get("id").cloned() {
-                let result = mock_result(method, &value);
+                let result = mock_result(method, &value, malformed_turn_start);
                 if method == "turn/start" && send_turns {
                     let thread_id = value["params"]["threadId"].as_str().unwrap_or("thread_1");
                     send_turn_notifications(&mut ws, thread_id).await;
@@ -139,6 +150,24 @@ async fn send_turn_notifications(
     let _ = ws
         .send(Message::Text(
             json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": "turn_1",
+                    "item": {
+                        "id": "item_agent",
+                        "type": "agentMessage",
+                        "text": "done"
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
+    let _ = ws
+        .send(Message::Text(
+            json!({
                 "method": "turn/completed",
                 "params": {
                     "threadId": thread_id,
@@ -151,7 +180,7 @@ async fn send_turn_notifications(
         .await;
 }
 
-fn mock_result(method: &str, request: &Value) -> Value {
+fn mock_result(method: &str, request: &Value, malformed_turn_start: bool) -> Value {
     match method {
         "initialize" => json!({
             "userAgent": "mock-codex",
@@ -170,6 +199,9 @@ fn mock_result(method: &str, request: &Value) -> Value {
             "serviceTier": request["params"].get("serviceTier").cloned().unwrap_or(Value::Null)
         }),
         "thread/name/set" => json!({}),
+        "turn/start" if malformed_turn_start => {
+            json!({ "turn": { "status": "inProgress", "items": [] } })
+        }
         "turn/start" => json!({ "turn": { "id": "turn_1", "status": "inProgress", "items": [] } }),
         "thread/resume" => json!({
             "threadId": thread_id(request),
@@ -446,6 +478,38 @@ fn send_streams_ndjson_when_requested() {
 }
 
 #[test]
+fn send_human_stream_does_not_duplicate_completed_agent_message() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["send", "--server", "work", "thread_1", "continue"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert_eq!(text.matches("done").count(), 1);
+    assert!(text.contains("done\nstatus\tcompleted"));
+}
+
+#[test]
+fn models_human_output_uses_model_fields() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["models", "--server", "work"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains("gpt-5.5\tGPT-5.5"));
+    assert!(!text.starts_with("0\t\t\t"));
+}
+
+#[test]
 fn send_falls_back_to_polling_when_turn_notifications_are_absent() {
     let server = MockServer::start_without_turn_notifications();
     let completed = run_json(
@@ -458,6 +522,27 @@ fn send_falls_back_to_polling_when_turn_notifications_are_absent() {
         completed["progress"].as_array().unwrap().last().unwrap()["source"],
         "poll"
     );
+}
+
+#[test]
+fn malformed_app_server_turn_start_is_exit_code_three() {
+    let server = MockServer::start_with_malformed_turn_start();
+    server
+        .command()
+        .args([
+            "send",
+            "--server",
+            "work",
+            "--json",
+            "--no-wait",
+            "thread_1",
+            "continue",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "turn/start response missing turn.id",
+        ));
 }
 
 #[test]

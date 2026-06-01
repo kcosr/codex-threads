@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Map, Value, json};
 
@@ -11,6 +11,15 @@ use crate::rpc::{Notification, RpcClient};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
+const TURN_SCAN_LIMIT: u32 = 200;
+const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ExitError {
+    code: i32,
+    message: String,
+}
 
 pub async fn run_cli<I, T>(args: I) -> i32
 where
@@ -423,8 +432,8 @@ async fn messages_command(
 
 async fn new_command(target: Target, mut client: RpcClient, command: NewCommand) -> Result<i32> {
     if command.prompt.is_none() && (command.no_wait || command.stream) {
-        return Err(anyhow!(
-            "new without PROMPT cannot use --no-wait or --stream"
+        return Err(usage_error(
+            "new without PROMPT cannot use --no-wait or --stream",
         ));
     }
     let mut params = Map::new();
@@ -445,7 +454,7 @@ async fn new_command(target: Target, mut client: RpcClient, command: NewCommand)
         .await?;
     let thread_id = start["thread"]["id"]
         .as_str()
-        .ok_or_else(|| anyhow!("thread/start response missing thread.id"))?
+        .ok_or_else(|| app_server_error("thread/start response missing thread.id"))?
         .to_string();
     if let Some(name) = &command.name {
         client
@@ -533,7 +542,7 @@ async fn start_turn(
         .await?;
     let turn_id = result["turn"]["id"]
         .as_str()
-        .ok_or_else(|| anyhow!("turn/start response missing turn.id"))?
+        .ok_or_else(|| app_server_error("turn/start response missing turn.id"))?
         .to_string();
     let acceptance = json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": turn_id, "status": "accepted"});
     if options.json && options.stream {
@@ -568,8 +577,15 @@ async fn start_turn(
     }
     let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let turn_timeout = tokio::time::sleep(std::time::Duration::from_secs(TURN_WAIT_TIMEOUT_SECS));
+    tokio::pin!(turn_timeout);
     loop {
         tokio::select! {
+            _ = &mut turn_timeout => {
+                return Err(app_server_error(format!(
+                    "timed out waiting for turn `{turn_id}` to complete"
+                )));
+            }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("interrupted locally; turn is still running");
                 eprintln!("server\t{}", target.server);
@@ -620,7 +636,7 @@ async fn poll_turn_completion(
     let result = client
         .request(
             "thread/turns/list",
-            json!({"threadId": wait.thread_id, "limit": DEFAULT_SHOW_LAST, "itemsView": "full"}),
+            json!({"threadId": wait.thread_id, "limit": TURN_SCAN_LIMIT, "sortDirection": "desc", "itemsView": "full"}),
             |notification| notifications.push(notification),
         )
         .await?;
@@ -639,6 +655,7 @@ async fn poll_turn_completion(
         return Ok(None);
     };
     let status = turn_status(turn);
+    reject_unknown_turn_status(turn)?;
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
@@ -708,6 +725,9 @@ fn emit_turn_terminal(
     if wait.json_out && !wait.stream {
         print_json(&output)?;
     } else if !wait.json_out {
+        if events.iter().any(|event| event.get("delta").is_some()) {
+            println!();
+        }
         println!("status\t{}", output["status"].as_str().unwrap_or(""));
         println!("server\t{}", wait.target.server);
         println!("threadId\t{}", wait.thread_id);
@@ -782,7 +802,9 @@ async fn settings_set_command(
         && command.service_tier.is_none()
         && !command.clear_service_tier
     {
-        return Err(anyhow!("settings set requires at least one setting flag"));
+        return Err(usage_error(
+            "settings set requires at least one setting flag",
+        ));
     }
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(command.thread_id));
@@ -817,7 +839,11 @@ async fn status_command(
             )
             .await?;
         let turns = client
-            .request("thread/turns/list", json!({"threadId": thread_id, "limit": DEFAULT_SHOW_LAST, "itemsView": "notLoaded"}), |_| {})
+            .request(
+                "thread/turns/list",
+                json!({"threadId": thread_id, "limit": TURN_SCAN_LIMIT, "sortDirection": "desc", "itemsView": "notLoaded"}),
+                |_| {},
+            )
             .await?;
         let active_turn_id = turns["data"]
             .as_array()
@@ -935,7 +961,23 @@ async fn models_command(
     command: ModelsCommand,
 ) -> Result<i32> {
     let result = client.request("model/list", json!({}), |_| {}).await?;
-    emit_result(&target, command.json, result, "models")
+    let output = json!({"server": target.server, "models": result["data"], "nextCursor": result["nextCursor"], "backwardsCursor": result["backwardsCursor"]});
+    if command.json {
+        print_json(&output)?;
+    } else {
+        for model in output["models"].as_array().unwrap_or(&Vec::new()) {
+            println!(
+                "{}\t{}",
+                model["id"].as_str().unwrap_or(""),
+                model["displayName"]
+                    .as_str()
+                    .or_else(|| model["name"].as_str())
+                    .or_else(|| model["model"].as_str())
+                    .unwrap_or("")
+            );
+        }
+    }
+    Ok(0)
 }
 
 async fn goal_get_command(
@@ -967,8 +1009,8 @@ async fn goal_set_command(
     command: GoalSetCommand,
 ) -> Result<i32> {
     if command.objective.is_none() && command.status.is_none() && command.token_budget.is_none() {
-        return Err(anyhow!(
-            "goal set requires --objective, --status, or --token-budget"
+        return Err(usage_error(
+            "goal set requires --objective, --status, or --token-budget",
         ));
     }
     let mut params = Map::new();
@@ -1027,10 +1069,9 @@ fn turn_event(
         {
             if notification.params["item"]["type"].as_str() == Some("agentMessage")
                 && let Some(text) = notification.params["item"]["text"].as_str()
+                && assistant_text.is_empty()
             {
-                if assistant_text.is_empty() {
-                    assistant_text.push_str(text);
-                }
+                assistant_text.push_str(text);
                 return Some(
                     json!({"type": "assistantMessage", "server": server, "threadId": thread_id, "turnId": turn_id, "text": text}),
                 );
@@ -1108,18 +1149,17 @@ fn emit_result(target: &Target, json_out: bool, result: Value, label: &str) -> R
         print_json(&output)?;
     } else {
         for item in output[label].as_array().unwrap_or(&Vec::new()) {
-            if let Some(thread) = item.get("thread").or(Some(item)) {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    thread["updatedAt"].as_i64().unwrap_or_default(),
-                    thread["status"]["type"].as_str().unwrap_or(""),
-                    thread["name"]
-                        .as_str()
-                        .or_else(|| thread["preview"].as_str())
-                        .unwrap_or(""),
-                    thread["id"].as_str().unwrap_or("")
-                );
-            }
+            let thread = item.get("thread").unwrap_or(item);
+            println!(
+                "{}\t{}\t{}\t{}",
+                thread["updatedAt"].as_i64().unwrap_or_default(),
+                thread["status"]["type"].as_str().unwrap_or(""),
+                thread["name"]
+                    .as_str()
+                    .or_else(|| thread["preview"].as_str())
+                    .unwrap_or(""),
+                thread["id"].as_str().unwrap_or("")
+            );
         }
     }
     Ok(0)
@@ -1164,8 +1204,13 @@ fn sort_key(sort: SortKey) -> &'static str {
     }
 }
 
-fn direction(asc: bool, _desc: bool) -> &'static str {
-    if asc { "asc" } else { "desc" }
+fn direction(asc: bool, desc: bool) -> &'static str {
+    if asc {
+        "asc"
+    } else {
+        let _desc_requested = desc;
+        "desc"
+    }
 }
 
 fn items_view(view: ItemsView) -> &'static str {
@@ -1185,10 +1230,22 @@ fn turn_status(turn: &Value) -> &'static str {
     }
 }
 
+fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
+    let Some(status) = turn["status"].as_str() else {
+        return Ok(());
+    };
+    match status {
+        "completed" | "interrupted" | "failed" | "inProgress" | "running" | "pending" => Ok(()),
+        _ => Err(app_server_error(format!(
+            "app-server returned unrecognized turn status `{status}`"
+        ))),
+    }
+}
+
 fn validate_effort(effort: &str) -> Result<()> {
     match effort {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
-        _ => Err(anyhow!("invalid effort `{effort}`")),
+        _ => Err(usage_error(format!("invalid effort `{effort}`"))),
     }
 }
 
@@ -1200,7 +1257,7 @@ fn goal_status(status: &str) -> Result<&'static str> {
         "usage-limited" => Ok("usageLimited"),
         "budget-limited" => Ok("budgetLimited"),
         "complete" => Ok("complete"),
-        _ => Err(anyhow!("invalid goal status `{status}`")),
+        _ => Err(usage_error(format!("invalid goal status `{status}`"))),
     }
 }
 
@@ -1217,7 +1274,7 @@ fn parse_since(since: &str) -> Result<i64> {
     } else if let Some(value) = since.strip_suffix('d') {
         (value, 60 * 60 * 24)
     } else {
-        return Err(anyhow!("invalid --since value `{since}`"));
+        return Err(usage_error(format!("invalid --since value `{since}`")));
     };
     let seconds: i64 = number
         .parse()
@@ -1230,6 +1287,9 @@ fn parse_since(since: &str) -> Result<i64> {
 }
 
 fn classify_error(err: &anyhow::Error) -> i32 {
+    if let Some(error) = err.downcast_ref::<ExitError>() {
+        return error.code;
+    }
     let text = err.to_string();
     if text.contains("requires experimentalApi")
         || text.contains("app-server")
@@ -1240,4 +1300,20 @@ fn classify_error(err: &anyhow::Error) -> i32 {
     } else {
         2
     }
+}
+
+fn usage_error(message: impl Into<String>) -> anyhow::Error {
+    ExitError {
+        code: 2,
+        message: message.into(),
+    }
+    .into()
+}
+
+fn app_server_error(message: impl Into<String>) -> anyhow::Error {
+    ExitError {
+        code: 3,
+        message: message.into(),
+    }
+    .into()
 }

@@ -10,7 +10,7 @@
  *   node scripts/release.mjs 0.2.3
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,6 +49,24 @@ function run(cmd, options = {}) {
 	} catch (error) {
 		if (!options.ignoreError) {
 			console.error(`Command failed: ${cmd}`);
+			process.exit(1);
+		}
+		return null;
+	}
+}
+
+function runFile(command, args, options = {}) {
+	console.log(`$ ${[command, ...args.map((arg) => JSON.stringify(arg))].join(" ")}`);
+	try {
+		return execFileSync(command, args, {
+			encoding: "utf-8",
+			stdio: options.silent ? "pipe" : "inherit",
+			cwd: ROOT,
+			...options,
+		});
+	} catch (error) {
+		if (!options.ignoreError) {
+			console.error(`Command failed: ${command} ${args.join(" ")}`);
 			process.exit(1);
 		}
 		return null;
@@ -228,7 +246,18 @@ run("git push origin main");
 run(`git push origin v${version}`);
 
 const notes = extractReleaseNotes(version);
-run(`gh release create v${version} --repo ${REPO} --prerelease --title "v${version}" --notes ${JSON.stringify(notes)}`);
+runFile("gh", [
+	"release",
+	"create",
+	`v${version}`,
+	"--repo",
+	REPO,
+	"--prerelease",
+	"--title",
+	`v${version}`,
+	"--notes",
+	notes,
+]);
 
 addUnreleasedSection();
 run("git add CHANGELOG.md");

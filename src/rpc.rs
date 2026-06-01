@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct RpcError {
@@ -106,7 +107,10 @@ impl RpcClient {
             .with_context(|| format!("failed to send `{method}` request"))?;
 
         loop {
-            let Some(message) = self.stream.next().await else {
+            let next = tokio::time::timeout(REQUEST_READ_TIMEOUT, self.stream.next())
+                .await
+                .with_context(|| format!("timed out waiting for app-server `{method}` response"))?;
+            let Some(message) = next else {
                 return Err(anyhow!(
                     "app-server connection closed while waiting for `{method}`"
                 ));
