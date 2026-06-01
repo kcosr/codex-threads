@@ -67,6 +67,13 @@ codex-threads new --cwd /abs/path "initial prompt"
 
 Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, or reliable parsing.
 
+## Permission Model
+
+Assume `codex-threads` is a headless automation tool for Codex sessions that are
+already isolated outside Codex itself. It forces app-server thread creation,
+thread resume, and turn start requests to run with `approvalPolicy = "never"`
+and full-access sandboxing. Do not use it as a safety boundary.
+
 ## Recommended Investigation Workflow
 
 For an agent, prefer this split:

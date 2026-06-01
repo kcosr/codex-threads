@@ -567,6 +567,7 @@ async fn new_command(target: Target, mut client: RpcClient, command: NewCommand)
     }
     let mut params = Map::new();
     params.insert("cwd".to_string(), json!(command.cwd));
+    insert_thread_yolo_permissions(&mut params);
     insert_opt(&mut params, "model", command.model.clone());
     if let Some(tier) = &command.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
@@ -657,6 +658,7 @@ async fn start_turn(
         "input".to_string(),
         json!([{"type": "text", "text": prompt, "textElements": []}]),
     );
+    insert_turn_yolo_permissions(&mut params);
     insert_opt(&mut params, "model", options.model);
     if let Some(effort) = options.effort.as_deref() {
         validate_effort(effort)?;
@@ -768,12 +770,12 @@ async fn start_turn(
 }
 
 async fn resume_thread_for_action(client: &mut RpcClient, thread_id: &str) -> Result<()> {
+    let mut params = Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    params.insert("excludeTurns".to_string(), json!(true));
+    insert_thread_yolo_permissions(&mut params);
     client
-        .request(
-            "thread/resume",
-            json!({"threadId": thread_id, "excludeTurns": true}),
-            |_| {},
-        )
+        .request("thread/resume", Value::Object(params), |_| {})
         .await?;
     Ok(())
 }
@@ -925,12 +927,12 @@ async fn settings_show_command(
     mut client: RpcClient,
     command: SettingsShowCommand,
 ) -> Result<i32> {
+    let mut params = Map::new();
+    params.insert("threadId".to_string(), json!(command.thread_id.clone()));
+    params.insert("excludeTurns".to_string(), json!(true));
+    insert_thread_yolo_permissions(&mut params);
     let result = client
-        .request(
-            "thread/resume",
-            json!({"threadId": command.thread_id, "excludeTurns": true}),
-            |_| {},
-        )
+        .request("thread/resume", Value::Object(params), |_| {})
         .await?;
     let _ = client
         .request(
@@ -1586,6 +1588,19 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         map.insert(key.to_string(), json!(value));
     }
+}
+
+fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
+    map.insert("approvalPolicy".to_string(), json!("never"));
+    map.insert("sandbox".to_string(), json!("danger-full-access"));
+}
+
+fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
+    map.insert("approvalPolicy".to_string(), json!("never"));
+    map.insert(
+        "sandboxPolicy".to_string(),
+        json!({"type": "dangerFullAccess"}),
+    );
 }
 
 fn sort_key(sort: SortKey) -> &'static str {

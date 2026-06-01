@@ -21,6 +21,14 @@ It talks to Codex app-server, the local control server exposed by the Codex
 agent runtime. In Codex terminology, a thread is one session and a turn is one
 user request/assistant response cycle.
 
+`codex-threads` is built for headless automation by users who already run Codex
+in yolo-style environments where sandboxing and approval policy are handled
+outside the Codex application. For thread creation, thread resume, and turn
+start requests, it forces Codex app-server to use `approvalPolicy = "never"` and
+full-access sandboxing (`sandbox = "danger-full-access"` or
+`sandboxPolicy.type = "dangerFullAccess"`). Do not use this CLI as a safety
+boundary.
+
 ## Features
 
 - TOML configuration for named local Unix domain socket targets.

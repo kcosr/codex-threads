@@ -16,7 +16,7 @@ struct MockServer {
     _temp: TempDir,
     socket: PathBuf,
     config: PathBuf,
-    received: Arc<Mutex<Vec<String>>>,
+    received: Arc<Mutex<Vec<Value>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -156,13 +156,28 @@ impl MockServer {
     }
 
     fn methods(&self) -> Vec<String> {
-        self.received.lock().expect("received").clone()
+        self.received
+            .lock()
+            .expect("received")
+            .iter()
+            .filter_map(|request| request["method"].as_str().map(ToString::to_string))
+            .collect()
+    }
+
+    fn params_for(&self, method: &str) -> Vec<Value> {
+        self.received
+            .lock()
+            .expect("received")
+            .iter()
+            .filter(|request| request["method"].as_str() == Some(method))
+            .map(|request| request["params"].clone())
+            .collect()
     }
 }
 
 async fn handle_connection(
     stream: tokio::net::UnixStream,
-    received: Arc<Mutex<Vec<String>>>,
+    received: Arc<Mutex<Vec<Value>>>,
     turn_notification_mode: TurnNotificationMode,
     malformed_turn_start: bool,
     reject_first_method: RejectFirstMethod,
@@ -175,7 +190,7 @@ async fn handle_connection(
         };
         let value: Value = serde_json::from_str(&text).expect("json request");
         if let Some(method) = value.get("method").and_then(Value::as_str) {
-            received.lock().expect("received").push(method.to_string());
+            received.lock().expect("received").push(value.clone());
             if let Some(id) = value.get("id").cloned() {
                 if should_reject_first_method(method, reject_first_method, &rejected_first_method) {
                     let response = json!({
@@ -455,6 +470,16 @@ fn run_json(server: &MockServer, args: &[&str]) -> Value {
         .stdout
         .clone();
     serde_json::from_slice(&output).expect("json output")
+}
+
+fn assert_thread_yolo_params(params: &Value) {
+    assert_eq!(params["approvalPolicy"], "never");
+    assert_eq!(params["sandbox"], "danger-full-access");
+}
+
+fn assert_turn_yolo_params(params: &Value) {
+    assert_eq!(params["approvalPolicy"], "never");
+    assert_eq!(params["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
 }
 
 #[test]
@@ -795,6 +820,20 @@ fn new_send_and_settings_commands_return_follow_up_ids() {
         ],
     );
     assert_eq!(updated["status"], "accepted");
+
+    let thread_start_params = server.params_for("thread/start");
+    assert_eq!(thread_start_params.len(), 2);
+    assert_thread_yolo_params(&thread_start_params[0]);
+    assert_thread_yolo_params(&thread_start_params[1]);
+
+    let turn_start_params = server.params_for("turn/start");
+    assert_eq!(turn_start_params.len(), 2);
+    assert_turn_yolo_params(&turn_start_params[0]);
+    assert_turn_yolo_params(&turn_start_params[1]);
+
+    let thread_resume_params = server.params_for("thread/resume");
+    assert_eq!(thread_resume_params.len(), 1);
+    assert_thread_yolo_params(&thread_resume_params[0]);
 }
 
 #[test]
@@ -896,6 +935,15 @@ fn send_resumes_not_loaded_thread_before_retrying_turn_start() {
         .map(String::as_str)
         .collect::<Vec<_>>();
     assert_eq!(retry_methods, ["turn/start", "thread/resume", "turn/start"]);
+
+    let turn_start_params = server.params_for("turn/start");
+    assert_eq!(turn_start_params.len(), 2);
+    assert_turn_yolo_params(&turn_start_params[0]);
+    assert_turn_yolo_params(&turn_start_params[1]);
+
+    let thread_resume_params = server.params_for("thread/resume");
+    assert_eq!(thread_resume_params.len(), 1);
+    assert_thread_yolo_params(&thread_resume_params[0]);
 }
 
 #[test]
@@ -1072,6 +1120,10 @@ fn steer_resumes_not_loaded_thread_before_retrying_turn_steer() {
         .map(String::as_str)
         .collect::<Vec<_>>();
     assert_eq!(retry_methods, ["turn/steer", "thread/resume", "turn/steer"]);
+
+    let thread_resume_params = server.params_for("thread/resume");
+    assert_eq!(thread_resume_params.len(), 1);
+    assert_thread_yolo_params(&thread_resume_params[0]);
 }
 
 #[test]
