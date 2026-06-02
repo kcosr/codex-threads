@@ -34,6 +34,20 @@ pub struct Target {
     pub model_reasoning_effort: Option<String>,
 }
 
+impl Target {
+    pub fn configured(alias: &str, server: &ServerConfig, config: &AppConfig) -> Self {
+        Self {
+            server: alias.to_string(),
+            path: server.path.clone(),
+            model: server.model.clone().or_else(|| config.model.clone()),
+            model_reasoning_effort: server
+                .model_reasoning_effort
+                .clone()
+                .or_else(|| config.model_reasoning_effort.clone()),
+        }
+    }
+}
+
 pub fn load_config(path: &Path) -> Result<AppConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config `{}`", path.display()))?;
@@ -162,28 +176,12 @@ pub fn resolve_target_from(
             .servers
             .get(alias)
             .ok_or_else(|| anyhow!("unknown server alias `{alias}`"))?;
-        return Ok(Target {
-            server: alias.to_string(),
-            path: server.path.clone(),
-            model: server.model.clone().or_else(|| config.model.clone()),
-            model_reasoning_effort: server
-                .model_reasoning_effort
-                .clone()
-                .or_else(|| config.model_reasoning_effort.clone()),
-        });
+        return Ok(Target::configured(alias, server, config));
     }
 
     if config.servers.len() == 1 {
         let (alias, server) = config.servers.iter().next().expect("len checked");
-        return Ok(Target {
-            server: alias.clone(),
-            path: server.path.clone(),
-            model: server.model.clone().or_else(|| config.model.clone()),
-            model_reasoning_effort: server
-                .model_reasoning_effort
-                .clone()
-                .or_else(|| config.model_reasoning_effort.clone()),
-        });
+        return Ok(Target::configured(alias, server, config));
     }
 
     if config.servers.is_empty() {

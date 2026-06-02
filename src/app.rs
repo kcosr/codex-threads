@@ -290,15 +290,7 @@ async fn servers_command(
                 config
                     .servers
                     .iter()
-                    .map(|(server, cfg)| Target {
-                        server: server.clone(),
-                        path: cfg.path.clone(),
-                        model: cfg.model.clone().or_else(|| config.model.clone()),
-                        model_reasoning_effort: cfg
-                            .model_reasoning_effort
-                            .clone()
-                            .or_else(|| config.model_reasoning_effort.clone()),
-                    })
+                    .map(|(server, cfg)| Target::configured(server, cfg, &config))
                     .collect::<Vec<_>>()
             } else {
                 vec![resolve_target(&config, connect, ping.server.as_deref())?]

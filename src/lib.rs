@@ -107,6 +107,30 @@ mod tests {
     }
 
     #[test]
+    fn singleton_target_resolution_uses_model_defaults() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "main".to_string(),
+            ServerConfig {
+                kind: "uds".to_string(),
+                path: PathBuf::from("/tmp/main.sock"),
+                model: Some("gpt-5.5".to_string()),
+                model_reasoning_effort: None,
+            },
+        );
+        let config = AppConfig {
+            model: Some("gpt-global".to_string()),
+            model_reasoning_effort: Some("high".to_string()),
+            servers,
+        };
+
+        let target = resolve_target_from(&config, None, None, None).unwrap();
+        assert_eq!(target.server, "main");
+        assert_eq!(target.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(target.model_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn config_validation_rejects_invalid_model_defaults() {
         let config = AppConfig {
             model: Some("   ".to_string()),
