@@ -109,6 +109,8 @@ type = "uds"
 path = "/var/run/user/1000/codex.sock"
 ```
 
+See `config.example.toml` for a complete starting point.
+
 Then omit `--server`:
 
 ```bash
@@ -374,6 +376,50 @@ node scripts/release.mjs 0.2.3
 The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
 matching git tag, creates a GitHub prerelease with notes from the changelog,
 then commits a fresh `Unreleased` section for the next cycle.
+
+Release binaries are packaged separately after the platform binaries have been
+provided or built by the release operator. The previous `0.1.0` release attached
+Linux x86_64 and macOS arm64 archives named:
+
+```text
+codex-threads-0.1.0-linux-x86_64.tar.gz
+codex-threads-0.1.0-macos-arm64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`codex-threads-VERSION-PLATFORM` with:
+
+- `codex-threads` - executable binary for that platform
+- `README.md`
+- `LICENSE`
+- `config.example.toml`
+
+Example packaging flow for one platform:
+
+```bash
+VERSION=0.2.0
+PLATFORM=linux-x86_64
+BINARY=/path/to/codex-threads
+
+STAGE="$(mktemp -d)"
+ROOT="codex-threads-${VERSION}-${PLATFORM}"
+mkdir -p "$STAGE/$ROOT"
+install -m 755 "$BINARY" "$STAGE/$ROOT/codex-threads"
+cp README.md LICENSE config.example.toml "$STAGE/$ROOT/"
+tar -C "$STAGE" -czf "${ROOT}.tar.gz" "$ROOT"
+rm -rf "$STAGE"
+```
+
+Repeat that staging step for each platform, for example `linux-x86_64` and
+`macos-arm64`, using the correct binary for each target. After the GitHub
+Release exists, upload the archives:
+
+```bash
+RELEASE_TAG="$VERSION" # Use the actual GitHub Release tag, e.g. 0.2.0.
+gh release upload "$RELEASE_TAG" \
+  "codex-threads-${VERSION}-linux-x86_64.tar.gz" \
+  "codex-threads-${VERSION}-macos-arm64.tar.gz"
+```
 
 ## Project Structure
 
