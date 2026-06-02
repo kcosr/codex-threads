@@ -128,9 +128,9 @@ path = "/var/run/user/1000/codex.sock"
 
 [servers.work]
 type = "uds"
-path = "/home/kevin/.codex-work/app-server-control/app-server-control.sock"
+path = "/path/to/work/app-server-control.sock"
 model = "gpt-5.5"
-model_reasoning_effort = "high"
+model_reasoning_effort = "low"
 ```
 
 Then run commands against a server:
