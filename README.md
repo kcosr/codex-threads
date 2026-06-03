@@ -433,7 +433,9 @@ Each archive should contain one top-level directory named
 - `codex-threads` - executable binary for that platform
 - `README.md`
 - `LICENSE`
+- `CHANGELOG.md`
 - `config.example.toml`
+- `skills/`
 
 Example packaging flow for one platform:
 
@@ -446,7 +448,8 @@ STAGE="$(mktemp -d)"
 ROOT="codex-threads-${VERSION}-${PLATFORM}"
 mkdir -p "$STAGE/$ROOT"
 install -m 755 "$BINARY" "$STAGE/$ROOT/codex-threads"
-cp README.md LICENSE config.example.toml "$STAGE/$ROOT/"
+cp README.md LICENSE CHANGELOG.md config.example.toml "$STAGE/$ROOT/"
+cp -R skills "$STAGE/$ROOT/"
 tar -C "$STAGE" -czf "${ROOT}.tar.gz" "$ROOT"
 rm -rf "$STAGE"
 ```
@@ -456,7 +459,7 @@ Repeat that staging step for each platform, for example `linux-x86_64` and
 Release exists, upload the archives:
 
 ```bash
-RELEASE_TAG="$VERSION" # Use the actual GitHub Release tag, e.g. 0.2.0.
+RELEASE_TAG="v${VERSION}"
 gh release upload "$RELEASE_TAG" \
   "codex-threads-${VERSION}-linux-x86_64.tar.gz" \
   "codex-threads-${VERSION}-macos-arm64.tar.gz"

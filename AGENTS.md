@@ -28,6 +28,7 @@ index.
 - Run `cargo build --release` before release-oriented or packaging changes.
 - Update `README.md` for user-facing behavior, config, command, output, or
   workflow changes.
+- Update `CHANGELOG.md` under `## [Unreleased]` for changes intended to ship.
 - Keep CLI entrypoints thin; put behavior behind focused library modules.
 - Prefer deterministic offline tests for config, target resolution, protocol
   parsing, rendering, and error mapping.

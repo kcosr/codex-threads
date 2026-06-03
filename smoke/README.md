@@ -20,8 +20,8 @@ The script:
 - builds the CLI if needed;
 - writes a temporary config with one `live` server plus model defaults;
 - runs `servers ping`, `models`, promptless `new`, `status`, `settings show`,
-  and `name`, verifying `settings show` reports the configured model and
-  effort;
+  `name`, and `goal get/set/clear`, verifying `settings show` reports the
+  configured model and effort and goal state round-trips correctly;
 - uses a disposable working directory;
 - avoids model work by default.
 

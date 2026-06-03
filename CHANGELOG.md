@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Include `CHANGELOG.md` and `skills/` in documented release archive contents.
+
+### Fixed
+
+- Correct documented release upload tag to use the `vX.Y.Z` tag created by the
+  release script.
+- Document live smoke goal checks in `smoke/README.md`.
+
 ### Added
 
 - Add `status THREAD_ID --load` to explicitly resume/load a thread before
