@@ -46,20 +46,32 @@ CLI as a safety boundary.
 - Thread naming, archive/unarchive, active-turn steer/interrupt, model listing,
   and goal get/set/clear.
 
+## Install
+
+Download the latest archive for your platform from GitHub Releases:
+
+```text
+https://github.com/kcosr/codex-threads/releases
+```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+- `macos-arm64`
+
+Install the extracted `codex-threads` binary somewhere on your `PATH`, for
+example `~/.local/bin`:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 codex-threads ~/.local/bin/codex-threads
+codex-threads help
+```
+
+For unsupported platforms or local development, build from source in the
+Development section near the end of this document.
+
 ## Quickstart
-
-Build the CLI:
-
-```bash
-cargo build
-```
-
-Install it on your `PATH` for the bare `codex-threads` examples. If you use
-`~/.local/bin`:
-
-```bash
-cargo install --path . --root ~/.local
-```
 
 When asking another agent to use this CLI, point it at the included skill:
 
@@ -329,6 +341,32 @@ filter is set, each block header includes the role. With `--role user` or
 has the requested role. `--json` keeps the structured message array shape.
 
 ## Development
+
+Build the CLI during development:
+
+```bash
+cargo build
+```
+
+Build the optimized binary:
+
+```bash
+cargo build --release
+```
+
+To use the local build like a release binary, install it somewhere on your
+`PATH`, for example:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 target/release/codex-threads ~/.local/bin/codex-threads
+```
+
+You can also install directly from the checkout:
+
+```bash
+cargo install --path . --root ~/.local
+```
 
 Required checks:
 
