@@ -8,6 +8,10 @@
   app-server
   ([#2](https://github.com/kcosr/codex-threads/pull/2)).
 
+### Fixed
+
+- Improved release-script preflight checks, diagnostics, and changelog validation edge cases.
+
 ## [0.1.1] - 2026-06-03
 
 ### Added
