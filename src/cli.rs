@@ -259,6 +259,12 @@ pub struct StatusCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub thread_id: Option<String>,
+    #[arg(
+        long,
+        requires = "thread_id",
+        help = "Resume/load the thread before reporting status"
+    )]
+    pub load: bool,
     #[arg(long)]
     pub json: bool,
 }

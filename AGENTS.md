@@ -28,6 +28,7 @@ index.
 - Run `cargo build --release` before release-oriented or packaging changes.
 - Update `README.md` for user-facing behavior, config, command, output, or
   workflow changes.
+- Update `CHANGELOG.md` under `## [Unreleased]` for changes intended to ship.
 - Keep CLI entrypoints thin; put behavior behind focused library modules.
 - Prefer deterministic offline tests for config, target resolution, protocol
   parsing, rendering, and error mapping.
@@ -77,14 +78,8 @@ Use these sections under `## [Unreleased]`:
 
 ## Releasing
 
-The first release version is `0.1.0`, matching `Cargo.toml`. Since the crate is
-already set to that version, release it with:
-
-```bash
-node scripts/release.mjs current
-```
-
-For later releases:
+`0.1.0` was published as the bootstrap release on 2026-06-01. For subsequent
+releases:
 
 ```bash
 node scripts/release.mjs patch    # Bug fixes, e.g. 0.1.0 -> 0.1.1
@@ -97,3 +92,6 @@ The release script verifies a clean `main` branch, optionally bumps
 `Cargo.toml` and `Cargo.lock`, stamps `CHANGELOG.md`, commits and tags the
 release, pushes to origin, creates a GitHub prerelease from changelog notes,
 then opens a new `## [Unreleased]` section for the next cycle.
+
+The `0.1.0` release used the historical `0.1.0` tag. Future script-driven
+releases use `vX.Y.Z` tags.

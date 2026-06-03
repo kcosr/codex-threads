@@ -7,7 +7,9 @@ use clap::Parser;
 use serde_json::{Map, Value, json};
 
 use crate::cli::*;
-use crate::config::{AppConfig, Target, load_config, resolve_config_path, resolve_target};
+use crate::config::{
+    AppConfig, Target, is_valid_reasoning_effort, load_config, resolve_config_path, resolve_target,
+};
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
@@ -288,10 +290,7 @@ async fn servers_command(
                 config
                     .servers
                     .iter()
-                    .map(|(server, cfg)| Target {
-                        server: server.clone(),
-                        path: cfg.path.clone(),
-                    })
+                    .map(|(server, cfg)| Target::configured(server, cfg, &config))
                     .collect::<Vec<_>>()
             } else {
                 vec![resolve_target(&config, connect, ping.server.as_deref())?]
@@ -577,11 +576,16 @@ async fn new_command(
     if yolo {
         insert_thread_yolo_permissions(&mut params);
     }
-    insert_opt(&mut params, "model", command.model.clone());
+    let thread_model = command.model.clone().or_else(|| target.model.clone());
+    let thread_effort = command
+        .effort
+        .clone()
+        .or_else(|| target.model_reasoning_effort.clone());
+    insert_opt(&mut params, "model", thread_model);
     if let Some(tier) = &command.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
     }
-    if let Some(effort) = command.effort.as_deref() {
+    if let Some(effort) = thread_effort.as_deref() {
         validate_effort(effort)?;
         params.insert(
             "config".to_string(),
@@ -801,6 +805,20 @@ async fn resume_thread_for_action(
     Ok(())
 }
 
+async fn resume_thread_for_inspection(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
+    let result = client
+        .request(
+            "thread/resume",
+            json!({"threadId": thread_id, "excludeTurns": true}),
+            |_| {},
+        )
+        .await?;
+    let _ = client
+        .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
+        .await;
+    Ok(result)
+}
+
 async fn request_with_resume_retry<F>(
     client: &mut RpcClient,
     method: &str,
@@ -989,19 +1007,7 @@ async fn settings_show_command(
     mut client: RpcClient,
     command: SettingsShowCommand,
 ) -> Result<i32> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(command.thread_id.clone()));
-    params.insert("excludeTurns".to_string(), json!(true));
-    let result = client
-        .request("thread/resume", Value::Object(params), |_| {})
-        .await?;
-    let _ = client
-        .request(
-            "thread/unsubscribe",
-            json!({"threadId": command.thread_id}),
-            |_| {},
-        )
-        .await;
+    let result = resume_thread_for_inspection(&mut client, &command.thread_id).await?;
     let output = json!({
         "server": target.server,
         "threadId": command.thread_id,
@@ -1071,6 +1077,9 @@ async fn status_command(
     command: StatusCommand,
 ) -> Result<i32> {
     if let Some(thread_id) = command.thread_id {
+        if command.load {
+            let _ = resume_thread_for_inspection(&mut client, &thread_id).await?;
+        }
         let thread = client
             .request(
                 "thread/read",
@@ -1724,9 +1733,10 @@ fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
 }
 
 fn validate_effort(effort: &str) -> Result<()> {
-    match effort {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
-        _ => Err(usage_error(format!("invalid effort `{effort}`"))),
+    if is_valid_reasoning_effort(effort) {
+        Ok(())
+    } else {
+        Err(usage_error(format!("invalid effort `{effort}`")))
     }
 }
 

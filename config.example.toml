@@ -1,0 +1,15 @@
+# Global defaults for new threads. Follow-up `send` commands keep the
+# thread's existing app-server settings unless --model or --effort is passed.
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+
+[servers.main]
+type = "uds"
+path = "/path/to/codex.sock"
+
+# Optional per-server overrides.
+# [servers.work]
+# type = "uds"
+# path = "/path/to/work/app-server-control.sock"
+# model = "gpt-5.5"
+# model_reasoning_effort = "low"

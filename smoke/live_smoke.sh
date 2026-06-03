@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/debug/codex-threads}"
 CODEX_SOCK="${CODEX_SOCK:-unix:///var/run/user/1000/codex.sock}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
-CODEX_EFFORT="${CODEX_EFFORT:-medium}"
+CODEX_EFFORT="${CODEX_EFFORT:-high}"
 WORKDIR="${WORKDIR:-}"
 
 if [[ "$CODEX_SOCK" != unix://* ]]; then
@@ -39,6 +39,9 @@ cleanup() {
 trap cleanup EXIT
 
 cat >"$CONFIG" <<EOF
+model = "$CODEX_MODEL"
+model_reasoning_effort = "$CODEX_EFFORT"
+
 [servers.live]
 type = "uds"
 path = "$SOCK_PATH"
@@ -65,6 +68,10 @@ assert_goal_cleared() {
 	node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); if (value.cleared !== true) { console.error(`expected cleared true, got ${JSON.stringify(value)}`); process.exit(1); } });'
 }
 
+assert_settings() {
+	node -e 'const expectedModel = process.argv[1]; const expectedEffort = process.argv[2]; let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const value = JSON.parse(s); if (value.model !== expectedModel || value.effort !== expectedEffort) { console.error(`unexpected settings response: ${JSON.stringify(value)}`); process.exit(1); } });' "$1" "$2"
+}
+
 run "$BIN" --config "$CONFIG" servers ping --server live --json
 run "$BIN" --config "$CONFIG" models --server live --json
 
@@ -73,7 +80,9 @@ echo "$THREAD_JSON"
 THREAD_ID="$(printf '%s\n' "$THREAD_JSON" | extract_thread_id)"
 
 run "$BIN" --config "$CONFIG" status --server live --json "$THREAD_ID"
-run "$BIN" --config "$CONFIG" settings show --server live --json "$THREAD_ID"
+SETTINGS_JSON="$(run "$BIN" --config "$CONFIG" settings show --server live --json "$THREAD_ID")"
+echo "$SETTINGS_JSON"
+printf '%s\n' "$SETTINGS_JSON" | assert_settings "$CODEX_MODEL" "$CODEX_EFFORT"
 run "$BIN" --config "$CONFIG" name --server live --json "$THREAD_ID" "codex-threads live smoke"
 
 GOAL_JSON="$(run "$BIN" --config "$CONFIG" goal get --server live --json "$THREAD_ID")"

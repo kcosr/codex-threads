@@ -18,9 +18,10 @@ CODEX_SOCK=unix:///var/run/user/1000/codex.sock smoke/live_smoke.sh
 The script:
 
 - builds the CLI if needed;
-- writes a temporary config with one `live` server;
+- writes a temporary config with one `live` server plus model defaults;
 - runs `servers ping`, `models`, promptless `new`, `status`, `settings show`,
-  and `name`;
+  `name`, and `goal get/set/clear`, verifying `settings show` reports the
+  configured model and effort and goal state round-trips correctly;
 - uses a disposable working directory;
 - avoids model work by default.
 
@@ -29,7 +30,7 @@ To include a real turn:
 ```bash
 RUN_CODEX_TURN=1 \
 CODEX_MODEL=gpt-5.5 \
-CODEX_EFFORT=medium \
+CODEX_EFFORT=high \
 CODEX_SOCK=unix:///var/run/user/1000/codex.sock \
 smoke/live_smoke.sh
 ```
