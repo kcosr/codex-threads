@@ -440,6 +440,7 @@ fn mock_result(
         "thread/archive" => json!({}),
         "thread/unarchive" => json!({ "thread": sample_thread(thread_id(request)) }),
         "model/list" => page(json!([{ "id": "gpt-5.5", "name": "GPT-5.5" }])),
+        "account/rateLimits/read" => sample_usage(),
         "thread/goal/get" => {
             json!({ "goal": goal_to_value(&goal_for_thread(request, goal_state)) })
         }
@@ -532,6 +533,68 @@ fn paged_search_results(request: &Value) -> Value {
 
 fn thread_id(request: &Value) -> &str {
     request["params"]["threadId"].as_str().unwrap_or("thread_1")
+}
+
+fn sample_usage() -> Value {
+    json!({
+        "rateLimits": {
+            "limitId": "codex",
+            "limitName": "Codex",
+            "primary": {
+                "usedPercent": 37,
+                "windowDurationMins": 300,
+                "resetsAt": 1700000000
+            },
+            "secondary": {
+                "usedPercent": 12,
+                "windowDurationMins": 10080,
+                "resetsAt": 1700600000
+            },
+            "credits": {
+                "hasCredits": true,
+                "unlimited": false,
+                "balance": "42.50"
+            },
+            "planType": "pro",
+            "rateLimitReachedType": null
+        },
+        "rateLimitsByLimitId": {
+            "codex": {
+                "limitId": "codex",
+                "limitName": "Codex",
+                "primary": {
+                    "usedPercent": 37,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1700000000
+                },
+                "secondary": {
+                    "usedPercent": 12,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1700600000
+                },
+                "credits": {
+                    "hasCredits": true,
+                    "unlimited": false,
+                    "balance": "42.50"
+                },
+                "planType": "pro",
+                "rateLimitReachedType": null
+            },
+            "priority": {
+                "limitId": "priority",
+                "limitName": "Priority",
+                "primary": {
+                    "usedPercent": 65,
+                    "windowDurationMins": 1440,
+                    "resetsAt": 1700100000
+                },
+                "secondary": null,
+                "credits": null,
+                "planType": "pro",
+                "rateLimitReachedType": "rate_limit_reached"
+            }
+        }
+    })
 }
 
 fn sample_thread(id: &str) -> Value {
@@ -767,6 +830,13 @@ fn read_only_commands_return_scriptable_json() {
         run_json(&server, &["models", "--server", "work", "--json"])["models"][0]["id"],
         "gpt-5.5"
     );
+    let usage = run_json(&server, &["usage", "--server", "work", "--json"]);
+    assert_eq!(usage["server"], "work");
+    assert_eq!(usage["rateLimits"]["credits"]["balance"], "42.50");
+    assert_eq!(
+        usage["rateLimitsByLimitId"]["priority"]["rateLimitReachedType"],
+        "rate_limit_reached"
+    );
 }
 
 #[test]
@@ -853,6 +923,36 @@ fn messages_role_filter_omits_redundant_role_in_human_output() {
     assert!(!text.contains(" user\n"));
     assert!(!text.contains("assistant"));
     assert!(!text.contains("done"));
+}
+
+#[test]
+fn usage_human_output_shows_credits_and_limit_windows() {
+    let server = MockServer::start();
+    let output = server
+        .command()
+        .args(["usage", "--server", "work"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains("server        work"));
+    assert!(text.contains("plan          pro"));
+    assert!(
+        text.lines()
+            .any(|line| { line.split_whitespace().collect::<Vec<_>>() == ["credits", "42.50"] })
+    );
+    assert!(text.contains("LIMIT"));
+    assert!(text.contains("WINDOW"));
+    assert!(text.contains("REACHED"));
+    assert!(text.contains("Codex"));
+    assert!(text.contains("primary"));
+    assert!(text.contains("37%"));
+    assert!(text.contains("300 mins"));
+    assert!(text.contains("Priority"));
+    assert!(text.contains("65%"));
+    assert!(text.contains("rate_limit_reached"));
 }
 
 #[test]

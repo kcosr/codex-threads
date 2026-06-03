@@ -200,6 +200,15 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await
         }
+        Command::Usage(command) => {
+            with_client(
+                &config,
+                cli.connect.as_deref(),
+                command.server.server.clone(),
+                |target, client| async move { usage_command(target, client, command).await },
+            )
+            .await
+        }
         Command::Goal(command) => match command.command {
             GoalSubcommand::Get(command) => {
                 with_client(
@@ -1254,6 +1263,27 @@ async fn models_command(
     Ok(0)
 }
 
+async fn usage_command(
+    target: Target,
+    mut client: RpcClient,
+    command: UsageCommand,
+) -> Result<i32> {
+    let result = client
+        .request("account/rateLimits/read", json!({}), |_| {})
+        .await?;
+    let output = json!({
+        "server": target.server,
+        "rateLimits": result["rateLimits"],
+        "rateLimitsByLimitId": result["rateLimitsByLimitId"],
+    });
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_usage(&output);
+    }
+    Ok(0)
+}
+
 async fn goal_get_command(
     target: Target,
     mut client: RpcClient,
@@ -1470,6 +1500,144 @@ fn print_thread_detail(result: &Value) {
                 })
                 .collect(),
         );
+    }
+}
+
+fn print_usage(result: &Value) {
+    let snapshots = usage_snapshots(result);
+    let summary = usage_summary_snapshot(result, &snapshots);
+    let plan = summary
+        .and_then(|snapshot| snapshot["planType"].as_str())
+        .unwrap_or("unknown");
+    let reached = summary
+        .and_then(|snapshot| snapshot["rateLimitReachedType"].as_str())
+        .unwrap_or("none");
+    let credits = summary
+        .and_then(|snapshot| snapshot.get("credits"))
+        .map(format_credits)
+        .unwrap_or_else(|| "unknown".to_string());
+    let key_values = [
+        ("server", result["server"].as_str().unwrap_or("")),
+        ("plan", plan),
+        ("credits", credits.as_str()),
+        ("limitReached", reached),
+    ];
+    print_key_values(&key_values);
+
+    if snapshots.is_empty() {
+        return;
+    }
+
+    println!();
+    print_table(
+        &["LIMIT", "WINDOW", "USED", "REACHED", "RESETS", "DURATION"],
+        snapshots
+            .iter()
+            .flat_map(|(limit_key, snapshot)| usage_window_rows(limit_key, snapshot))
+            .collect(),
+    );
+}
+
+fn usage_summary_snapshot<'a>(
+    result: &'a Value,
+    snapshots: &'a [(String, &'a Value)],
+) -> Option<&'a Value> {
+    if !result["rateLimits"].is_null() {
+        Some(&result["rateLimits"])
+    } else {
+        snapshots.first().map(|(_, snapshot)| *snapshot)
+    }
+}
+
+fn usage_snapshots(result: &Value) -> Vec<(String, &Value)> {
+    let mut snapshots = result["rateLimitsByLimitId"]
+        .as_object()
+        .map(|by_id| {
+            by_id
+                .iter()
+                .map(|(limit_id, snapshot)| (limit_id.clone(), snapshot))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    snapshots.sort_by(|left, right| left.0.cmp(&right.0));
+    if snapshots.is_empty() && !result["rateLimits"].is_null() {
+        let fallback_id = result["rateLimits"]["limitId"]
+            .as_str()
+            .unwrap_or("codex")
+            .to_string();
+        snapshots.push((fallback_id, &result["rateLimits"]));
+    }
+    snapshots
+}
+
+fn usage_window_rows(limit_key: &str, snapshot: &Value) -> Vec<Vec<TableCell>> {
+    let limit = usage_limit_label(limit_key, snapshot);
+    let reached = snapshot["rateLimitReachedType"]
+        .as_str()
+        .unwrap_or("none")
+        .to_string();
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|window_name| {
+            let window = snapshot.get(window_name)?;
+            if window.is_null() {
+                return None;
+            }
+            Some(vec![
+                table_cell(limit.clone()),
+                table_cell(window_name),
+                table_cell(format_used_percent(&window["usedPercent"])),
+                table_cell(reached.clone()),
+                table_cell(format_timestamp(window["resetsAt"].as_i64())),
+                table_cell(format_duration_mins(window["windowDurationMins"].as_i64())),
+            ])
+        })
+        .collect()
+}
+
+fn usage_limit_label(limit_key: &str, snapshot: &Value) -> String {
+    let limit_id = snapshot["limitId"].as_str().unwrap_or(limit_key);
+    match snapshot["limitName"].as_str() {
+        Some(name) if name != limit_id => format!("{name} ({limit_id})"),
+        Some(name) => name.to_string(),
+        None => limit_id.to_string(),
+    }
+}
+
+fn format_credits(credits: &Value) -> String {
+    if credits["unlimited"].as_bool().unwrap_or(false) {
+        return "unlimited".to_string();
+    }
+    match (
+        credits["hasCredits"].as_bool(),
+        credits["balance"]
+            .as_str()
+            .filter(|balance| !balance.is_empty()),
+    ) {
+        (Some(true), Some(balance)) => balance.to_string(),
+        (Some(true), None) => "available".to_string(),
+        (Some(false), Some(balance)) => format!("depleted ({balance})"),
+        (Some(false), None) => "depleted".to_string(),
+        (None, Some(balance)) => balance.to_string(),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+fn format_used_percent(value: &Value) -> String {
+    if let Some(percent) = value.as_i64() {
+        return format!("{percent}%");
+    }
+    if let Some(percent) = value.as_f64() {
+        return format!("{percent:.0}%");
+    }
+    "unknown".to_string()
+}
+
+fn format_duration_mins(minutes: Option<i64>) -> String {
+    match minutes {
+        Some(1) => "1 min".to_string(),
+        Some(minutes) => format!("{minutes} mins"),
+        None => "unknown".to_string(),
     }
 }
 

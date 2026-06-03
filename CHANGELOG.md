@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add `usage` to show account plan, credits, and rate-limit windows from Codex
+  app-server
+  ([#2](https://github.com/kcosr/codex-threads/pull/2)).
+
 ### Fixed
 
 - Improved release-script preflight checks, diagnostics, and changelog validation edge cases.
