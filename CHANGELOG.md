@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Fixed
+
+- Improved release-script preflight checks, diagnostics, and changelog validation edge cases.
 
 ## [0.1.1] - 2026-06-03
 
