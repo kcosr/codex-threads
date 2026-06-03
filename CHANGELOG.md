@@ -5,7 +5,8 @@
 ### Added
 
 - Add `usage` to show account plan, credits, and rate-limit windows from Codex
-  app-server.
+  app-server
+  ([#2](https://github.com/kcosr/codex-threads/pull/2)).
 
 ## [0.1.1] - 2026-06-03
 
