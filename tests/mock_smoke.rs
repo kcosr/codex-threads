@@ -763,6 +763,44 @@ fn read_only_commands_return_scriptable_json() {
 }
 
 #[test]
+fn status_load_resumes_then_reports_thread_status() {
+    let server = MockServer::start();
+    let status = run_json(
+        &server,
+        &["status", "--server", "work", "--json", "--load", "thread_1"],
+    );
+
+    assert_eq!(status["threadId"], "thread_1");
+
+    let methods = server.methods();
+    let status_methods = methods
+        .iter()
+        .filter(|method| {
+            matches!(
+                method.as_str(),
+                "thread/resume" | "thread/unsubscribe" | "thread/read" | "thread/turns/list"
+            )
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        status_methods,
+        [
+            "thread/resume",
+            "thread/unsubscribe",
+            "thread/read",
+            "thread/turns/list"
+        ]
+    );
+
+    let resume_params = server.params_for("thread/resume");
+    assert_eq!(resume_params.len(), 1);
+    assert_eq!(resume_params[0]["threadId"], "thread_1");
+    assert_eq!(resume_params[0]["excludeTurns"], true);
+    assert_no_yolo_params(&resume_params[0]);
+}
+
+#[test]
 fn messages_human_output_uses_readable_blocks() {
     let server = MockServer::start();
     let output = server

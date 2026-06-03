@@ -1075,6 +1075,18 @@ async fn status_command(
     command: StatusCommand,
 ) -> Result<i32> {
     if let Some(thread_id) = command.thread_id {
+        if command.load {
+            client
+                .request(
+                    "thread/resume",
+                    json!({"threadId": thread_id, "excludeTurns": true}),
+                    |_| {},
+                )
+                .await?;
+            let _ = client
+                .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
+                .await;
+        }
         let thread = client
             .request(
                 "thread/read",

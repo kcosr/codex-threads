@@ -148,10 +148,11 @@ For "project status" summaries, inspect the most relevant/recent threads per cwd
 ### 2. Check active status before summarizing or messaging
 
 ```bash
-codex-threads status <thread_id> --json \
+codex-threads status <thread_id> --load --json \
   | jq '{threadId, activeTurnId, status:.thread.status, cwd:.thread.cwd, preview:.thread.preview}'
 ```
 
+Use `--load` when liveness matters; plain `status <thread_id>` does not resume unloaded threads.
 If `activeTurnId` is non-null, the thread is running. Do not send disruptive follow-ups unless the user asked you to.
 
 ### 3. Review user intent first
@@ -322,6 +323,7 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 - `messages --json` returns `{ server, threadId, messages, nextCursor, truncated }`.
 - `status --json` returns `{ server, reachable, loadedThreadIds, nextCursor }`.
 - `status <thread_id> --json` returns `thread`, `threadId`, `activeTurnId`, and `truncated`.
+- `status <thread_id> --load --json` resumes/loads first, unsubscribes the probing connection, then returns the same shape.
 - `settings show <thread_id> --json` returns cwd/model/effort/service tier.
 - `goal get <thread_id> --json` may return `goal: null`.
 

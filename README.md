@@ -242,7 +242,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
 | `settings show THREAD_ID` | Read model, effort, service tier, and cwd. This resumes the thread for inspection but does not force yolo permissions. |
 | `settings set THREAD_ID` | Update `--model`, `--effort`, `--service-tier`, or `--clear-service-tier`; at least one setting flag is required. |
-| `status [THREAD_ID]` | Show server loaded-thread status or one thread with active turn discovery. |
+| `status [THREAD_ID]` | Show server loaded-thread status or one thread with active turn discovery. Use `--load` with a thread ID to resume/load before reporting. |
 | `steer THREAD_ID TURN_ID PROMPT` | Send steering input to an active turn. |
 | `interrupt THREAD_ID TURN_ID` | Interrupt an active turn. |
 | `name THREAD_ID NAME` | Set a thread name. |
@@ -295,7 +295,10 @@ notification is missed.
 
 `status --json` without a thread ID returns `{ server, reachable,
 loadedThreadIds, nextCursor }`. `status THREAD_ID --json` returns the selected
-thread, `threadId`, `activeTurnId`, and `truncated`.
+thread, `threadId`, `activeTurnId`, and `truncated`. Plain `status THREAD_ID`
+does not resume unloaded threads; `status THREAD_ID --load` explicitly calls
+`thread/resume` with `excludeTurns: true`, unsubscribes the probing connection,
+then reports status from the loaded app-server view.
 
 Exit codes:
 
