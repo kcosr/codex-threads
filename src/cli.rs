@@ -44,6 +44,7 @@ pub enum Command {
     Archive(ThreadOnlyCommand),
     Unarchive(ThreadOnlyCommand),
     Models(ModelsCommand),
+    Usage(UsageCommand),
     Goal(GoalCommand),
 }
 
@@ -311,6 +312,14 @@ pub struct ThreadOnlyCommand {
 
 #[derive(Debug, Args)]
 pub struct ModelsCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UsageCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     #[arg(long)]

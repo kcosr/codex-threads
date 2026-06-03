@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add `usage` to show account plan, credits, and rate-limit windows from Codex
+  app-server.
 
 ## [0.1.1] - 2026-06-03
 

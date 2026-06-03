@@ -256,6 +256,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `name THREAD_ID NAME` | Set a thread name. |
 | `archive THREAD_ID` / `unarchive THREAD_ID` | Archive or restore a thread. |
 | `models` | List available models from the app-server. |
+| `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. |
 | `goal get THREAD_ID` | Read the active goal. |
 | `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
 | `goal clear THREAD_ID` | Clear the active goal. |
@@ -314,6 +315,11 @@ thread, `threadId`, `activeTurnId`, and `truncated`. Plain `status THREAD_ID`
 does not resume unloaded threads; `status THREAD_ID --load` explicitly calls
 `thread/resume` with `excludeTurns: true`, unsubscribes the probing connection,
 then reports status from the loaded app-server view.
+
+`usage --json` returns `{ server, rateLimits, rateLimitsByLimitId }` from
+Codex app-server's `account/rateLimits/read` response. Human output summarizes
+the server, plan, credits, rate-limit reached state, and primary/secondary
+windows for each limit ID.
 
 Exit codes:
 
