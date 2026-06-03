@@ -252,7 +252,6 @@ runFile("gh", [
 	`v${version}`,
 	"--repo",
 	REPO,
-	"--prerelease",
 	"--title",
 	`v${version}`,
 	"--notes",
