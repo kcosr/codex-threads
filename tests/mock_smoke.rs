@@ -945,12 +945,14 @@ fn usage_human_output_shows_credits_and_limit_windows() {
     );
     assert!(text.contains("LIMIT"));
     assert!(text.contains("WINDOW"));
+    assert!(text.contains("REACHED"));
     assert!(text.contains("Codex"));
     assert!(text.contains("primary"));
     assert!(text.contains("37%"));
     assert!(text.contains("300 mins"));
     assert!(text.contains("Priority"));
     assert!(text.contains("65%"));
+    assert!(text.contains("rate_limit_reached"));
 }
 
 #[test]

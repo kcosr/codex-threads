@@ -1530,7 +1530,7 @@ fn print_usage(result: &Value) {
 
     println!();
     print_table(
-        &["LIMIT", "WINDOW", "USED", "RESETS", "DURATION"],
+        &["LIMIT", "WINDOW", "USED", "REACHED", "RESETS", "DURATION"],
         snapshots
             .iter()
             .flat_map(|(limit_key, snapshot)| usage_window_rows(limit_key, snapshot))
@@ -1572,6 +1572,10 @@ fn usage_snapshots(result: &Value) -> Vec<(String, &Value)> {
 
 fn usage_window_rows(limit_key: &str, snapshot: &Value) -> Vec<Vec<TableCell>> {
     let limit = usage_limit_label(limit_key, snapshot);
+    let reached = snapshot["rateLimitReachedType"]
+        .as_str()
+        .unwrap_or("none")
+        .to_string();
     ["primary", "secondary"]
         .into_iter()
         .filter_map(|window_name| {
@@ -1583,6 +1587,7 @@ fn usage_window_rows(limit_key: &str, snapshot: &Value) -> Vec<Vec<TableCell>> {
                 table_cell(limit.clone()),
                 table_cell(window_name),
                 table_cell(format_used_percent(&window["usedPercent"])),
+                table_cell(reached.clone()),
                 table_cell(format_timestamp(window["resetsAt"].as_i64())),
                 table_cell(format_duration_mins(window["windowDurationMins"].as_i64())),
             ])
