@@ -90,7 +90,7 @@ node scripts/release.mjs 0.2.3    # Explicit version
 
 The release script verifies a clean `main` branch, optionally bumps
 `Cargo.toml` and `Cargo.lock`, stamps `CHANGELOG.md`, commits and tags the
-release, pushes to origin, creates a GitHub prerelease from changelog notes,
+release, pushes to origin, creates a GitHub release from changelog notes,
 then opens a new `## [Unreleased]` section for the next cycle.
 
 The `0.1.0` release used the historical `0.1.0` tag. Future script-driven

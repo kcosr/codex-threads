@@ -424,7 +424,7 @@ node scripts/release.mjs 0.2.3
 ```
 
 The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
-matching git tag, creates a GitHub prerelease with notes from the changelog,
+matching git tag, creates a GitHub release with notes from the changelog,
 then commits a fresh `Unreleased` section for the next cycle.
 
 Release binaries are packaged separately after the platform binaries have been
