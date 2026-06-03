@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::config::REASONING_EFFORTS;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "codex-threads",
@@ -46,6 +48,9 @@ pub enum Command {
     Models(ModelsCommand),
     Usage(UsageCommand),
     Goal(GoalCommand),
+    Completion(CompletionCommand),
+    #[command(name = "__complete", hide = true)]
+    Complete(CompleteCommand),
 }
 
 #[derive(Debug, Args)]
@@ -182,7 +187,7 @@ pub struct NewCommand {
     pub cwd: PathBuf,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(REASONING_EFFORTS))]
     pub effort: Option<String>,
     #[arg(long = "service-tier")]
     pub service_tier: Option<String>,
@@ -204,7 +209,7 @@ pub struct SendCommand {
     pub thread_id: String,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(REASONING_EFFORTS))]
     pub effort: Option<String>,
     #[arg(long = "service-tier")]
     pub service_tier: Option<String>,
@@ -245,7 +250,7 @@ pub struct SettingsSetCommand {
     pub thread_id: String,
     #[arg(long)]
     pub model: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(REASONING_EFFORTS))]
     pub effort: Option<String>,
     #[arg(long = "service-tier", conflicts_with = "clear_service_tier")]
     pub service_tier: Option<String>,
@@ -357,7 +362,14 @@ pub struct GoalSetCommand {
     pub objective: Option<String>,
     #[arg(long = "token-budget")]
     pub token_budget: Option<i64>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new([
+        "active",
+        "paused",
+        "blocked",
+        "usage-limited",
+        "budget-limited",
+        "complete",
+    ]))]
     pub status: Option<String>,
     #[arg(long)]
     pub json: bool,
@@ -389,4 +401,36 @@ pub enum ItemsView {
 pub enum MessageRole {
     User,
     Assistant,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionCommand {
+    #[command(subcommand)]
+    pub command: Option<CompletionSubcommand>,
+    #[arg(value_enum)]
+    pub shell: Option<CompletionShell>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CompletionSubcommand {
+    Script(CompletionScriptCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionScriptCommand {
+    #[arg(value_enum)]
+    pub shell: CompletionShell,
+}
+
+#[derive(Debug, Args)]
+pub struct CompleteCommand {
+    pub prefix: String,
+    pub words: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }

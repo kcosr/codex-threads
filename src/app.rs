@@ -7,6 +7,9 @@ use clap::Parser;
 use serde_json::{Map, Value, json};
 
 use crate::cli::*;
+use crate::completion::{
+    completion_candidates, completion_instructions, completion_script, normalize_shell,
+};
 use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, load_config, resolve_config_path, resolve_target,
 };
@@ -49,6 +52,29 @@ where
 }
 
 async fn run(cli: Cli) -> Result<i32> {
+    match &cli.command {
+        Command::Completion(command) => {
+            match &command.command {
+                Some(CompletionSubcommand::Script(script)) => {
+                    io::stdout().write_all(completion_script(script.shell).as_bytes())?;
+                }
+                None => {
+                    let shell = normalize_shell(command.shell)?;
+                    io::stdout().write_all(completion_instructions(shell).as_bytes())?;
+                }
+            }
+            io::stdout().flush()?;
+            return Ok(0);
+        }
+        Command::Complete(command) => {
+            io::stdout()
+                .write_all(completion_candidates(&command.prefix, &command.words).as_bytes())?;
+            io::stdout().flush()?;
+            return Ok(0);
+        }
+        _ => {}
+    }
+
     let config_path = resolve_config_path(cli.config.clone());
     let yolo = !cli.no_yolo;
     if let Command::Servers(command) = &cli.command {
@@ -236,6 +262,7 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await,
         },
+        Command::Completion(_) | Command::Complete(_) => unreachable!(),
     }
 }
 

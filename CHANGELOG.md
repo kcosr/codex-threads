@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add shell completion setup and generated bash, zsh, and fish completion
+  scripts for commands, options, static values, and configured server aliases
+  ([#3](https://github.com/kcosr/codex-threads/pull/3)).
 
 ## [0.1.2] - 2026-06-03
 

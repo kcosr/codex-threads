@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+pub const REASONING_EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
 #[derive(Debug, Default, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -100,10 +102,7 @@ fn validate_defaults(scope: &str, model: Option<&str>, effort: Option<&str>) -> 
 }
 
 pub fn is_valid_reasoning_effort(effort: &str) -> bool {
-    matches!(
-        effort,
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-    )
+    REASONING_EFFORTS.contains(&effort)
 }
 
 pub fn home_dir() -> PathBuf {
