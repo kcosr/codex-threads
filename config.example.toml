@@ -5,7 +5,7 @@ model_reasoning_effort = "high"
 
 [servers.main]
 type = "uds"
-path = "/var/run/user/1000/codex.sock"
+path = "/path/to/codex.sock"
 
 # Optional per-server overrides.
 # [servers.work]

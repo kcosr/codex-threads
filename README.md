@@ -73,17 +73,23 @@ Development section near the end of this document.
 
 ## Quickstart
 
+Prerequisites:
+
+- Install the Codex CLI/runtime separately and ensure the `codex` executable is
+  on `PATH`.
+- Start Codex app-server with a Unix domain socket (UDS) listener before using
+  this CLI.
+
 When asking another agent to use this CLI, point it at the included skill:
 
 ```text
 skills/codex-threads
 ```
 
-`codex-threads` talks to a running Codex app-server. Start Codex app-server
-with a Unix domain socket (UDS) listener before using this CLI:
+`codex-threads` talks to a running Codex app-server:
 
 ```bash
-CODEX_SOCK=unix:///var/run/user/1000/codex.sock
+CODEX_SOCK=unix:///path/to/codex.sock
 codex app-server --listen "$CODEX_SOCK"
 ```
 
@@ -118,7 +124,7 @@ model_reasoning_effort = "high"
 
 [servers.main]
 type = "uds"
-path = "/var/run/user/1000/codex.sock"
+path = "/path/to/codex.sock"
 ```
 
 See `config.example.toml` for a complete starting point.
@@ -136,7 +142,7 @@ Or configure named servers when you have multiple app-server sockets:
 ```toml
 [servers.main]
 type = "uds"
-path = "/var/run/user/1000/codex.sock"
+path = "/path/to/main/codex.sock"
 
 [servers.work]
 type = "uds"
@@ -160,14 +166,16 @@ SERVER  STATUS
 main    ok
 ```
 
-This project targets Unix-like systems with Unix domain socket support. Linux
-examples use `/var/run/user/...`; choose an appropriate socket path for other
-Unix-like systems.
+This project targets Unix-like systems with Unix domain socket support. Replace
+`/path/to/codex.sock` examples with the socket path you choose for your system.
 
 ## Common Workflows
 
 The examples below assume `codex-threads` is installed on `PATH` and a server is
 configured or selected with `--connect`.
+
+Examples that pipe JSON use `jq`; install it separately or replace those
+pipelines with your preferred JSON tooling.
 
 Find recent candidate threads, then inspect the selected thread:
 
@@ -234,9 +242,9 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | --- | --- |
 | `servers [--json]` | List configured server aliases without connecting. |
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. |
+| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
-| `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. |
+| `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
@@ -259,6 +267,11 @@ Global `--no-yolo` disables the default permission override for action commands
 that create, resume before action, or start Codex work. `settings show` is a
 read path and does not force yolo permissions even though it resumes the thread
 to inspect settings.
+
+If `send`, `steer`, or `settings set` receives Codex app-server's unloaded
+thread error, `codex-threads` resumes the target thread and retries the action
+once. That resume uses the same permission mode as the action: yolo permissions
+by default, or app-server defaults when global `--no-yolo` is passed.
 
 Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and
 `xhigh`. Accepted `goal set --status` values are `active`, `paused`, `blocked`,
@@ -292,6 +305,8 @@ Blocking `new PROMPT` and `send` commands wait up to one hour for the turn to
 reach a terminal status. They consume realtime notifications when available and
 poll recent turns as a fallback so callers still get a final JSON response if a
 notification is missed.
+If the local one-hour wait times out, the command exits with code `3`; the
+remote Codex turn may still be running.
 
 `status --json` without a thread ID returns `{ server, reachable,
 loadedThreadIds, nextCursor }`. `status THREAD_ID --json` returns the selected
@@ -342,6 +357,10 @@ In human output, `messages` prints readable timestamped blocks. When no role
 filter is set, each block header includes the role. With `--role user` or
 `--role assistant`, the role is omitted from the header because every message
 has the requested role. `--json` keeps the structured message array shape.
+When the recent turn scan is truncated, human output prints a warning; increase
+`--max-turns` or use `show --cursor` for older exact paging.
+Long table cells and message previews may be shortened in human output to keep
+terminal output readable; use `--json` when exact text is required.
 
 ## Development
 
@@ -386,7 +405,7 @@ WebSocket app-server and exercise the compiled CLI binary end to end.
 Live smoke checks are opt-in:
 
 ```bash
-CODEX_SOCK=unix:///var/run/user/1000/codex.sock smoke/live_smoke.sh
+CODEX_SOCK=unix:///path/to/codex.sock smoke/live_smoke.sh
 ```
 
 Set `RUN_CODEX_TURN=1` to run a real model turn through the live app-server.
@@ -395,17 +414,7 @@ Set `RUN_ARCHIVE=1` to include live archive/unarchive checks.
 ## Release
 
 Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
-`0.1.0` is the first release version for this repository.
-
-For the first release, after the `Unreleased` changelog section is complete and
-`main` is clean:
-
-```bash
-node scripts/release.mjs current
-```
-
-For later releases, use `patch`, `minor`, `major`, or an explicit semantic
-version:
+Use `patch`, `minor`, `major`, or an explicit semantic version:
 
 ```bash
 node scripts/release.mjs patch
@@ -419,12 +428,12 @@ matching git tag, creates a GitHub prerelease with notes from the changelog,
 then commits a fresh `Unreleased` section for the next cycle.
 
 Release binaries are packaged separately after the platform binaries have been
-provided or built by the release operator. The previous `0.1.0` release attached
-Linux x86_64 and macOS arm64 archives named:
+provided or built by the release operator. Supported release platforms currently
+use archive names like:
 
 ```text
-codex-threads-0.1.0-linux-x86_64.tar.gz
-codex-threads-0.1.0-macos-arm64.tar.gz
+codex-threads-VERSION-linux-x86_64.tar.gz
+codex-threads-VERSION-macos-arm64.tar.gz
 ```
 
 Each archive should contain one top-level directory named

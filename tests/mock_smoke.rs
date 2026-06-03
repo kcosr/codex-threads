@@ -756,10 +756,30 @@ fn read_only_commands_return_scriptable_json() {
         )["threadId"],
         "thread_1"
     );
+    assert!(
+        !server
+            .methods()
+            .iter()
+            .any(|method| method == "thread/resume"),
+        "plain status should not resume/load threads"
+    );
     assert_eq!(
         run_json(&server, &["models", "--server", "work", "--json"])["models"][0]["id"],
         "gpt-5.5"
     );
+}
+
+#[test]
+fn status_load_requires_thread_id() {
+    let server = MockServer::start();
+    server
+        .command()
+        .args(["status", "--load"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("<THREAD_ID>"));
+
+    assert!(server.methods().is_empty());
 }
 
 #[test]

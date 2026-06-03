@@ -805,6 +805,20 @@ async fn resume_thread_for_action(
     Ok(())
 }
 
+async fn resume_thread_for_inspection(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
+    let result = client
+        .request(
+            "thread/resume",
+            json!({"threadId": thread_id, "excludeTurns": true}),
+            |_| {},
+        )
+        .await?;
+    let _ = client
+        .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
+        .await;
+    Ok(result)
+}
+
 async fn request_with_resume_retry<F>(
     client: &mut RpcClient,
     method: &str,
@@ -993,19 +1007,7 @@ async fn settings_show_command(
     mut client: RpcClient,
     command: SettingsShowCommand,
 ) -> Result<i32> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(command.thread_id.clone()));
-    params.insert("excludeTurns".to_string(), json!(true));
-    let result = client
-        .request("thread/resume", Value::Object(params), |_| {})
-        .await?;
-    let _ = client
-        .request(
-            "thread/unsubscribe",
-            json!({"threadId": command.thread_id}),
-            |_| {},
-        )
-        .await;
+    let result = resume_thread_for_inspection(&mut client, &command.thread_id).await?;
     let output = json!({
         "server": target.server,
         "threadId": command.thread_id,
@@ -1076,16 +1078,7 @@ async fn status_command(
 ) -> Result<i32> {
     if let Some(thread_id) = command.thread_id {
         if command.load {
-            client
-                .request(
-                    "thread/resume",
-                    json!({"threadId": thread_id, "excludeTurns": true}),
-                    |_| {},
-                )
-                .await?;
-            let _ = client
-                .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
-                .await;
+            let _ = resume_thread_for_inspection(&mut client, &thread_id).await?;
         }
         let thread = client
             .request(

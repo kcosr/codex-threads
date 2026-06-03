@@ -15,10 +15,10 @@ codex-threads
 
 The user normally has config at `~/.config/codex-threads/config.toml` pointing at the main Unix socket, so do **not** pass `--connect` unless debugging or explicitly targeting another server.
 
-`codex-threads` only sees threads served by a running Codex app-server. The app-server must be started with a listener such as:
+`codex-threads` requires a separate Codex CLI/runtime installation and only sees threads served by a running Codex app-server. The app-server must be started with a listener such as:
 
 ```bash
-CODEX_SOCK=unix:///var/run/user/1000/codex.sock
+CODEX_SOCK=unix:///path/to/codex.sock
 codex app-server --listen "$CODEX_SOCK"
 ```
 
@@ -67,6 +67,10 @@ codex-threads new --cwd /abs/path "initial prompt"
 
 Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, or reliable parsing.
 
+Default limits: `list` uses `--limit 50`, `show` uses `--last 20`, and `messages` uses `--max-turns 200` unless overridden.
+
+Examples in this skill use `jq` for compact JSON projection; use another JSON tool if `jq` is not installed.
+
 ## Recommended Investigation Workflow
 
 For an agent, prefer this split:
@@ -100,14 +104,14 @@ There is no `messages --first`. For the start of a thread or older exact paging,
 
 When role-filtering, increase `--max-turns` if the role is sparse or the messages may be older; otherwise `--role assistant --last 3` can miss older assistant messages outside the scanned recent turn window.
 
-If `messages --role user|assistant` is available, use it to reduce output when looking for intent:
+Use `messages --role user|assistant` to reduce output when looking for intent:
 
 ```bash
 codex-threads messages <thread_id> --role user --last 10 --max-turns 100
 codex-threads messages <thread_id> --role assistant --last 3 --max-turns 50
 ```
 
-If role filtering is not available in the installed version, fall back to JSON + `jq`:
+For custom filtering beyond the built-in role filter, use JSON + `jq`:
 
 ```bash
 codex-threads messages <thread_id> --last 10 --max-turns 100 --json \
@@ -230,7 +234,7 @@ cursor=$(echo "$page1" | jq -r '.turns.nextCursor')
 codex-threads show <thread_id> --cursor "$cursor" --items summary --json
 ```
 
-`messages --json` may report `truncated` and a `nextCursor`, but if the installed `messages` command does not accept `--cursor`, switch to `show --cursor` for paging older thread history.
+`messages --json` may report `truncated` and a `nextCursor`; use `show --cursor` for paging older thread history.
 
 ## Sending Follow-ups
 
@@ -251,6 +255,10 @@ Fire-and-forget:
 ```bash
 codex-threads send <thread_id> "message" --no-wait --json
 ```
+
+Blocking sends wait up to one hour. If the local wait times out, the command exits with code `3` and the remote turn may still be running.
+
+If `send`, `steer`, or `settings set` sees Codex app-server's unloaded-thread error, it resumes/loads the thread and retries once. The resume uses yolo permissions by default unless global `--no-yolo` is passed.
 
 Before sending, check status if there is any chance the thread is active:
 
@@ -292,7 +300,7 @@ Optional flags:
 
 ## Compact JSON Patterns
 
-Until all desired human filtering is available, keep `jq` output short.
+For custom JSON filtering, keep `jq` output short.
 
 Recent thread list:
 
