@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::TcpListener as StdTcpListener;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,8 +10,11 @@ use assert_cmd::Command;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 struct MockServer {
@@ -20,11 +24,94 @@ struct MockServer {
     received: Arc<Mutex<Vec<Value>>>,
 }
 
+struct TcpMockServer {
+    _temp: TempDir,
+    endpoint: String,
+    config: PathBuf,
+}
+
 #[derive(Clone)]
 struct GoalState {
     objective: String,
     status: String,
     token_budget: i64,
+}
+
+impl TcpMockServer {
+    fn start(auth_token: Option<&'static str>) -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let config = temp.path().join("config.toml");
+        let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind mock tcp socket");
+        let addr = std_listener.local_addr().expect("local addr");
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let endpoint = format!("ws://{addr}");
+        fs::write(
+            &config,
+            match auth_token {
+                Some(token) => format!(
+                    "[servers.work]\nendpoint = \"{}\"\nauth_token = \"{}\"\n",
+                    endpoint, token
+                ),
+                None => format!("[servers.work]\nendpoint = \"{}\"\n", endpoint),
+            },
+        )
+        .expect("config");
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_for_thread = Arc::clone(&received);
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let received = Arc::clone(&received_for_thread);
+                    tokio::spawn(async move {
+                        let expected_auth = auth_token.map(|token| format!("Bearer {token}"));
+                        let websocket = accept_hdr_async(
+                            stream,
+                            move |request: &Request, response: Response| {
+                                let actual = request
+                                    .headers()
+                                    .get("authorization")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(ToString::to_string);
+                                assert_eq!(actual, expected_auth);
+                                Ok(response)
+                            },
+                        )
+                        .await
+                        .expect("websocket accept");
+                        handle_websocket(
+                            websocket,
+                            received,
+                            TurnNotificationMode::Complete,
+                            false,
+                            RejectFirst::none(),
+                            Arc::new(Mutex::new(false)),
+                            Arc::new(Mutex::new(HashMap::new())),
+                        )
+                        .await;
+                    });
+                }
+            });
+        });
+
+        Self {
+            _temp: temp,
+            endpoint,
+            config,
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::cargo_bin("codex-threads").expect("binary");
+        command
+            .env_remove("CODEX_THREADS_CONFIG")
+            .env_remove("CODEX_THREADS_SERVER")
+            .arg("--config")
+            .arg(&self.config);
+        command
+    }
 }
 
 impl Default for GoalState {
@@ -256,7 +343,30 @@ async fn handle_connection(
     rejected_first_method: Arc<Mutex<bool>>,
     goal_state: Arc<Mutex<HashMap<String, GoalState>>>,
 ) {
-    let mut ws = accept_async(stream).await.expect("websocket accept");
+    let ws = accept_async(stream).await.expect("websocket accept");
+    handle_websocket(
+        ws,
+        received,
+        turn_notification_mode,
+        malformed_turn_start,
+        reject_first,
+        rejected_first_method,
+        goal_state,
+    )
+    .await;
+}
+
+async fn handle_websocket<S>(
+    mut ws: tokio_tungstenite::WebSocketStream<S>,
+    received: Arc<Mutex<Vec<Value>>>,
+    turn_notification_mode: TurnNotificationMode,
+    malformed_turn_start: bool,
+    reject_first: RejectFirst,
+    rejected_first_method: Arc<Mutex<bool>>,
+    goal_state: Arc<Mutex<HashMap<String, GoalState>>>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     while let Some(message) = ws.next().await {
         let Ok(Message::Text(text)) = message else {
             continue;
@@ -327,7 +437,9 @@ fn should_reject_first_method(
 }
 
 async fn send_turn_notifications(
-    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    >,
     thread_id: &str,
     mode: TurnNotificationMode,
 ) {
@@ -729,6 +841,87 @@ fn connect_bypasses_config_for_servers_ping() {
 }
 
 #[test]
+fn connect_ws_bypasses_config_and_lists_threads() {
+    let server = TcpMockServer::start(None);
+    let output = Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--config")
+        .arg(server.config.parent().unwrap().join("missing.toml"))
+        .arg("--connect")
+        .arg(&server.endpoint)
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("json output");
+    assert_eq!(value["server"], server.endpoint);
+    assert_eq!(value["threads"][0]["id"], "thread_1");
+}
+
+#[test]
+fn configured_ws_server_lists_threads() {
+    let server = TcpMockServer::start(None);
+    let value = server
+        .command()
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&value).expect("json output");
+    assert_eq!(value["server"], "work");
+    assert_eq!(value["threads"][0]["id"], "thread_1");
+}
+
+#[test]
+fn configured_ws_server_sends_literal_auth_token() {
+    let server = TcpMockServer::start(Some("secret-token"));
+    server
+        .command()
+        .args(["models", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn connect_ws_sends_literal_auth_token() {
+    let server = TcpMockServer::start(Some("direct-token"));
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--connect")
+        .arg(&server.endpoint)
+        .arg("--connect-auth-token")
+        .arg("direct-token")
+        .args(["models", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn connect_ws_sends_env_auth_token() {
+    let server = TcpMockServer::start(Some("env-token"));
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .env("CODEX_THREADS_TEST_TOKEN", "env-token")
+        .arg("--connect")
+        .arg(&server.endpoint)
+        .arg("--connect-auth-token-env")
+        .arg("CODEX_THREADS_TEST_TOKEN")
+        .args(["models", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn connect_rejects_servers_ping_all() {
     let server = MockServer::start();
     Command::cargo_bin("codex-threads")
@@ -743,6 +936,58 @@ fn connect_rejects_servers_ping_all() {
         .stderr(predicates::str::contains(
             "--connect cannot be combined with servers ping --all",
         ));
+}
+
+#[test]
+fn connect_auth_flags_require_websocket_endpoint() {
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--connect")
+        .arg("unix:///tmp/missing.sock")
+        .arg("--connect-auth-token")
+        .arg("secret")
+        .args(["models"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "auth token requires a websocket endpoint",
+        ));
+}
+
+#[test]
+fn connect_auth_flags_reject_non_loopback_plain_ws() {
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--connect")
+        .arg("ws://example.com:8765")
+        .arg("--connect-auth-token")
+        .arg("secret")
+        .args(["models"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("wss:// or loopback ws://"));
+}
+
+#[test]
+fn connect_auth_flags_are_mutually_exclusive() {
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env_remove("CODEX_THREADS_CONFIG")
+        .env_remove("CODEX_THREADS_SERVER")
+        .arg("--connect")
+        .arg("ws://127.0.0.1:8765")
+        .arg("--connect-auth-token")
+        .arg("secret")
+        .arg("--connect-auth-token-env")
+        .arg("CODEX_THREADS_TEST_TOKEN")
+        .args(["models"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -1014,6 +1259,10 @@ fn read_only_commands_return_scriptable_json() {
     assert_eq!(
         run_json(&server, &["servers", "--json"])["servers"][0]["alias"],
         "work"
+    );
+    assert_eq!(
+        run_json(&server, &["servers", "--json"])["servers"][0]["endpoint"],
+        server.endpoint()
     );
     assert_eq!(
         run_json(&server, &["servers", "ping", "--server", "work", "--json"])["servers"][0]["ok"],

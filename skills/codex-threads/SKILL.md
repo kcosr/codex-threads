@@ -13,13 +13,15 @@ The executable is on `PATH`:
 codex-threads
 ```
 
-The user normally has config at `~/.config/codex-threads/config.toml` pointing at the main Unix socket, so do **not** pass `--connect` unless debugging or explicitly targeting another server.
+The user normally has config at `~/.config/codex-threads/config.toml` pointing at the main app-server endpoint, so do **not** pass `--connect` unless debugging or explicitly targeting another server.
 
 `codex-threads` requires a separate Codex CLI/runtime installation and only sees threads served by a running Codex app-server. The app-server must be started with a listener such as:
 
 ```bash
 CODEX_SOCK=unix:///path/to/codex.sock
 codex app-server --listen "$CODEX_SOCK"
+# or
+codex app-server --listen ws://127.0.0.1:8765
 ```
 
 Interactive Codex CLI sessions that should be visible here should connect to the same app-server:
@@ -340,5 +342,5 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 - Do not dump large raw JSON blobs to the user; summarize in tables.
 - Do not rely on stale candidate IDs without checking cwd/preview/status.
 - Do not send to an active thread without considering whether it will interrupt/confuse current work.
-- Do not use `--connect` by default; config normally handles the main socket.
+- Do not use `--connect` by default; config normally handles the main endpoint.
 - Do not treat cursor strings as timestamps or offsets; pass them back exactly, quoted.

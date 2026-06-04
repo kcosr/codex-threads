@@ -33,8 +33,9 @@ CLI as a safety boundary.
 
 ## Features
 
-- TOML configuration for named local Unix domain socket targets.
-- Direct `--connect unix:///path/to.sock` debug targeting.
+- TOML configuration for named app-server endpoints.
+- Direct `--connect unix:///path/to.sock` and `--connect ws://host:port`
+  debug targeting.
 - Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
   single configured server.
 - Thread list, search, detail, status, and flattened message history commands.
@@ -77,8 +78,8 @@ Prerequisites:
 
 - Install the Codex CLI/runtime separately and ensure the `codex` executable is
   on `PATH`.
-- Start Codex app-server with a Unix domain socket (UDS) listener before using
-  this CLI.
+- Start Codex app-server with a Unix domain socket (UDS) or WebSocket listener
+  before using this CLI.
 
 When asking another agent to use this CLI, point it at the included skill:
 
@@ -123,8 +124,7 @@ model = "gpt-5.5"
 model_reasoning_effort = "high"
 
 [servers.main]
-type = "uds"
-path = "/path/to/codex.sock"
+endpoint = "unix:///path/to/codex.sock"
 ```
 
 See `config.example.toml` for a complete starting point.
@@ -141,12 +141,10 @@ Or configure named servers when you have multiple app-server sockets:
 
 ```toml
 [servers.main]
-type = "uds"
-path = "/path/to/main/codex.sock"
+endpoint = "unix:///path/to/main/codex.sock"
 
 [servers.work]
-type = "uds"
-path = "/path/to/work/app-server-control.sock"
+endpoint = "ws://127.0.0.1:8765"
 model = "gpt-5.5"
 model_reasoning_effort = "low"
 ```
@@ -166,8 +164,8 @@ SERVER  STATUS
 main    ok
 ```
 
-This project targets Unix-like systems with Unix domain socket support. Replace
-`/path/to/codex.sock` examples with the socket path you choose for your system.
+This project targets Unix-like systems. Replace `/path/to/codex.sock` and
+`127.0.0.1:8765` examples with the endpoint you choose for your app-server.
 
 ## Common Workflows
 
@@ -210,7 +208,8 @@ Config path precedence:
 
 Server target precedence for commands that target one app-server:
 
-1. `--connect unix:///path/to.sock`
+1. `--connect unix:///path/to.sock`, `--connect ws://host:port`, or
+   `--connect wss://host:port`
 2. `--server ALIAS`
 3. `CODEX_THREADS_SERVER`
 4. The single configured server, only when exactly one server exists
@@ -219,6 +218,53 @@ Server target precedence for commands that target one app-server:
 `--connect` bypasses configured servers and reports the endpoint URI as the
 `server` value in JSON output. It is mutually exclusive with `--server` and
 `CODEX_THREADS_SERVER`.
+
+Configured servers use a single endpoint string:
+
+```toml
+[servers.main]
+endpoint = "unix:///path/to/codex.sock"
+
+[servers.local_ws]
+endpoint = "ws://127.0.0.1:8765"
+```
+
+Legacy UDS config still works, but prints a deprecation warning:
+
+```toml
+[servers.main]
+type = "uds"
+path = "/path/to/codex.sock"
+```
+
+Replace it with:
+
+```toml
+[servers.main]
+endpoint = "unix:///path/to/codex.sock"
+```
+
+WebSocket endpoints may use bearer-token auth. Prefer env-var indirection:
+
+```toml
+[servers.remote]
+endpoint = "wss://example.com:443"
+auth_token_env = "CODEX_APP_SERVER_TOKEN"
+```
+
+Literal tokens are also supported for private configs:
+
+```toml
+[servers.local_ws]
+endpoint = "ws://127.0.0.1:8765"
+auth_token = "literal-token"
+```
+
+For direct connections, use `--connect-auth-token-env ENV_VAR` or
+`--connect-auth-token TOKEN`. Both send `Authorization: Bearer <token>` during
+the WebSocket upgrade. Tokens are accepted only for `wss://` or loopback
+`ws://` endpoints; non-loopback plain `ws://` with a token is rejected to avoid
+sending credentials over cleartext.
 
 When more than one server is configured, app-server commands require an explicit
 target through `--server` or `CODEX_THREADS_SERVER`.
@@ -263,8 +309,9 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `completion [SHELL]` | Print shell completion setup instructions for `bash`, `zsh`, or `fish`. |
 
 Every app-server command accepts `--server ALIAS` and `--json`. Global
-`--config PATH` and `--connect ENDPOINT` may be placed before or after the
-subcommand because they are global options.
+`--config PATH`, `--connect ENDPOINT`, `--connect-auth-token-env ENV_VAR`, and
+`--connect-auth-token TOKEN` may be placed before or after the subcommand
+because they are global options.
 Global `--no-yolo` disables the default permission override for action commands
 that create, resume before action, or start Codex work. `settings show` is a
 read path and does not force yolo permissions even though it resumes the thread
@@ -458,13 +505,13 @@ cargo clippy --all-targets --all-features
 cargo build --release
 ```
 
-The integration smoke tests in `tests/mock_smoke.rs` start a mock UDS
-WebSocket app-server and exercise the compiled CLI binary end to end.
+The integration smoke tests in `tests/mock_smoke.rs` start mock UDS and TCP
+WebSocket app-servers and exercise the compiled CLI binary end to end.
 
 Live smoke checks are opt-in:
 
 ```bash
-CODEX_SOCK=unix:///path/to/codex.sock smoke/live_smoke.sh
+CODEX_ENDPOINT=unix:///path/to/codex.sock smoke/live_smoke.sh
 ```
 
 Set `RUN_CODEX_TURN=1` to run a real model turn through the live app-server.

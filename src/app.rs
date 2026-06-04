@@ -11,7 +11,8 @@ use crate::completion::{
     completion_candidates, completion_instructions, completion_script, normalize_shell,
 };
 use crate::config::{
-    AppConfig, Target, is_valid_reasoning_effort, load_config, resolve_config_path, resolve_target,
+    AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
+    resolve_config_path, resolve_direct_target, resolve_target,
 };
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
 
@@ -78,12 +79,21 @@ async fn run(cli: Cli) -> Result<i32> {
     let config_path = resolve_config_path(cli.config.clone());
     let yolo = !cli.no_yolo;
     if let Command::Servers(command) = &cli.command {
-        return servers_command(&config_path, cli.connect.as_deref(), command).await;
+        return servers_command(
+            &config_path,
+            cli.connect.as_deref(),
+            cli.connect_auth_token_env.as_deref(),
+            cli.connect_auth_token.as_deref(),
+            command,
+        )
+        .await;
     }
     let config = if cli.connect.is_some() {
         AppConfig::default()
     } else {
-        load_config(&config_path)?
+        let config = load_config(&config_path)?;
+        print_legacy_warnings(&config);
+        config
     };
     match cli.command {
         Command::Servers(_) => unreachable!(),
@@ -91,6 +101,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { list_command(target, client, command).await },
             )
@@ -100,6 +112,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { search_command(target, client, command).await },
             )
@@ -109,6 +123,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { show_command(target, client, command).await },
             )
@@ -118,6 +134,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { messages_command(target, client, command).await },
             )
@@ -127,6 +145,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { new_command(target, client, command, yolo).await },
             )
@@ -136,6 +156,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { send_command(target, client, command, yolo).await },
             )
@@ -147,6 +169,8 @@ async fn run(cli: Cli) -> Result<i32> {
                     with_client(
                         &config,
                         cli.connect.as_deref(),
+                        cli.connect_auth_token_env.as_deref(),
+                        cli.connect_auth_token.as_deref(),
                         command.server.server.clone(),
                         |target, client| async move {
                             settings_show_command(target, client, command).await
@@ -158,6 +182,8 @@ async fn run(cli: Cli) -> Result<i32> {
                     with_client(
                         &config,
                         cli.connect.as_deref(),
+                        cli.connect_auth_token_env.as_deref(),
+                        cli.connect_auth_token.as_deref(),
                         command.server.server.clone(),
                         |target, client| async move {
                             settings_set_command(target, client, command, yolo).await
@@ -171,6 +197,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { status_command(target, client, command).await },
             )
@@ -180,6 +208,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { steer_command(target, client, command, yolo).await },
             )
@@ -189,6 +219,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { interrupt_command(target, client, command).await },
             )
@@ -198,6 +230,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { name_command(target, client, command).await },
             )
@@ -206,6 +240,8 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Archive(command) => with_client(
             &config,
             cli.connect.as_deref(),
+            cli.connect_auth_token_env.as_deref(),
+            cli.connect_auth_token.as_deref(),
             command.server.server.clone(),
             |target, client| async move { archive_command(target, client, command, true).await },
         )
@@ -213,6 +249,8 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Unarchive(command) => with_client(
             &config,
             cli.connect.as_deref(),
+            cli.connect_auth_token_env.as_deref(),
+            cli.connect_auth_token.as_deref(),
             command.server.server.clone(),
             |target, client| async move { archive_command(target, client, command, false).await },
         )
@@ -221,6 +259,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { models_command(target, client, command).await },
             )
@@ -230,6 +270,8 @@ async fn run(cli: Cli) -> Result<i32> {
             with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { usage_command(target, client, command).await },
             )
@@ -240,6 +282,8 @@ async fn run(cli: Cli) -> Result<i32> {
                 with_client(
                     &config,
                     cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
                     command.server.server.clone(),
                     |target, client| async move { goal_get_command(target, client, command).await },
                 )
@@ -249,6 +293,8 @@ async fn run(cli: Cli) -> Result<i32> {
                 with_client(
                     &config,
                     cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
                     command.server.server.clone(),
                     |target, client| async move { goal_set_command(target, client, command).await },
                 )
@@ -257,6 +303,8 @@ async fn run(cli: Cli) -> Result<i32> {
             GoalSubcommand::Clear(command) => with_client(
                 &config,
                 cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
                 |target, client| async move { goal_clear_command(target, client, command).await },
             )
@@ -269,6 +317,8 @@ async fn run(cli: Cli) -> Result<i32> {
 async fn with_client<F, Fut>(
     config: &AppConfig,
     connect: Option<&str>,
+    connect_auth_token_env: Option<&str>,
+    connect_auth_token: Option<&str>,
     server: Option<String>,
     f: F,
 ) -> Result<i32>
@@ -276,39 +326,64 @@ where
     F: FnOnce(Target, RpcClient) -> Fut,
     Fut: std::future::Future<Output = Result<i32>>,
 {
-    let target = resolve_target(config, connect, server.as_deref())?;
-    let client = RpcClient::connect(&target.path).await?;
+    let target = if let Some(endpoint) = connect {
+        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
+            return Err(usage_error(
+                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+            ));
+        }
+        resolve_direct_target(endpoint, connect_auth_token_env, connect_auth_token)?
+    } else {
+        if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+            return Err(usage_error(
+                "--connect-auth-token and --connect-auth-token-env require --connect",
+            ));
+        }
+        resolve_target(config, None, server.as_deref())?
+    };
+    let client = RpcClient::connect(&target.endpoint).await?;
     f(target, client).await
 }
 
 async fn servers_command(
     config_path: &std::path::Path,
     connect: Option<&str>,
+    connect_auth_token_env: Option<&str>,
+    connect_auth_token: Option<&str>,
     command: &ServersCommand,
 ) -> Result<i32> {
     let config = if connect.is_some() {
         AppConfig::default()
     } else {
-        load_config(config_path)?
+        let config = load_config(config_path)?;
+        print_legacy_warnings(&config);
+        config
     };
     match &command.command {
         None => {
+            if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+                return Err(usage_error(
+                    "--connect-auth-token and --connect-auth-token-env require --connect",
+                ));
+            }
             let rows: Vec<_> = config
                 .servers
                 .iter()
-                .map(|(alias, server)| json!({"alias": alias, "type": server.kind, "path": server.path}))
-                .collect();
+                .map(|(alias, server)| {
+                    let endpoint = server.endpoint_display(alias)?;
+                    Ok(json!({"alias": alias, "endpoint": endpoint}))
+                })
+                .collect::<Result<Vec<_>>>()?;
             if command.json {
                 print_json(&json!({ "servers": rows }))?;
             } else {
                 print_table(
-                    &["ALIAS", "TYPE", "PATH"],
+                    &["ALIAS", "ENDPOINT"],
                     rows.iter()
                         .map(|row| {
                             vec![
                                 table_cell(row["alias"].as_str().unwrap_or("")),
-                                table_cell(row["type"].as_str().unwrap_or("")),
-                                table_cell(row["path"].as_str().unwrap_or("")),
+                                table_cell(row["endpoint"].as_str().unwrap_or("")),
                             ]
                         })
                         .collect(),
@@ -322,18 +397,35 @@ async fn servers_command(
                     "--connect cannot be combined with servers ping --all",
                 ));
             }
+            if connect.is_some()
+                && (ping.server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok())
+            {
+                return Err(usage_error(
+                    "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+                ));
+            }
             let targets = if ping.all {
                 config
                     .servers
                     .iter()
                     .map(|(server, cfg)| Target::configured(server, cfg, &config))
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>>>()?
             } else {
-                vec![resolve_target(&config, connect, ping.server.as_deref())?]
+                let target = if let Some(endpoint) = connect {
+                    resolve_direct_target(endpoint, connect_auth_token_env, connect_auth_token)?
+                } else {
+                    if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+                        return Err(usage_error(
+                            "--connect-auth-token and --connect-auth-token-env require --connect",
+                        ));
+                    }
+                    resolve_target(&config, None, ping.server.as_deref())?
+                };
+                vec![target]
             };
             let mut results = Vec::new();
             for target in targets {
-                let ok = RpcClient::connect(&target.path).await.is_ok();
+                let ok = RpcClient::connect(&target.endpoint).await.is_ok();
                 results.push(json!({"server": target.server, "ok": ok}));
             }
             if ping.json {
@@ -821,6 +913,12 @@ async fn start_turn(
                 }
             }
         }
+    }
+}
+
+fn print_legacy_warnings(config: &AppConfig) {
+    for warning in legacy_server_warnings(config) {
+        eprintln!("warning: {warning}");
     }
 }
 
@@ -1977,6 +2075,12 @@ fn classify_error(err: &anyhow::Error) -> i32 {
         return error.code;
     }
     let text = err.to_string();
+    if text.contains("auth token requires")
+        || text.contains("cannot set both `auth_token`")
+        || text.contains("endpoint must")
+    {
+        return 2;
+    }
     if text.contains("requires experimentalApi")
         || text.contains("app-server")
         || text.contains("UDS")

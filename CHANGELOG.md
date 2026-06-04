@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add endpoint-based server configuration for `unix://`, `ws://`, and
+  `wss://` Codex app-server targets.
+- Add WebSocket-over-TCP app-server connections with optional bearer-token auth
+  from `auth_token_env`, `auth_token`, `--connect-auth-token-env`, or
+  `--connect-auth-token`.
+
+### Changed
+
+- Normalize `servers` output around endpoint strings.
+- Deprecated legacy `type = "uds"` plus `path` server config; existing configs
+  continue to work with a warning.
 
 ## [0.1.3] - 2026-06-04
 

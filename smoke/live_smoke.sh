@@ -3,18 +3,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/debug/codex-threads}"
-CODEX_SOCK="${CODEX_SOCK:-unix:///var/run/user/1000/codex.sock}"
+CODEX_ENDPOINT="${CODEX_ENDPOINT:-${CODEX_SOCK:-unix:///var/run/user/1000/codex.sock}}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_EFFORT="${CODEX_EFFORT:-high}"
 WORKDIR="${WORKDIR:-}"
 
-if [[ "$CODEX_SOCK" != unix://* ]]; then
-	echo "CODEX_SOCK must use unix://, got: $CODEX_SOCK" >&2
+if [[ "$CODEX_ENDPOINT" != unix://* && "$CODEX_ENDPOINT" != ws://* && "$CODEX_ENDPOINT" != wss://* ]]; then
+	echo "CODEX_ENDPOINT must use unix://, ws://, or wss://, got: $CODEX_ENDPOINT" >&2
 	exit 2
 fi
 
-SOCK_PATH="${CODEX_SOCK#unix://}"
-if [[ ! -S "$SOCK_PATH" ]]; then
+if [[ "$CODEX_ENDPOINT" == unix://* && ! -S "${CODEX_ENDPOINT#unix://}" ]]; then
+	SOCK_PATH="${CODEX_ENDPOINT#unix://}"
 	echo "Codex socket does not exist or is not a socket: $SOCK_PATH" >&2
 	exit 3
 fi
@@ -43,8 +43,7 @@ model = "$CODEX_MODEL"
 model_reasoning_effort = "$CODEX_EFFORT"
 
 [servers.live]
-type = "uds"
-path = "$SOCK_PATH"
+endpoint = "$CODEX_ENDPOINT"
 EOF
 
 run() {

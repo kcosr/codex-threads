@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use url::Url;
 
 pub const REASONING_EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -19,9 +21,17 @@ pub struct AppConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub endpoint: Option<String>,
     #[serde(rename = "type")]
-    pub kind: String,
-    pub path: PathBuf,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
+    #[serde(default)]
+    pub auth_token: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -31,22 +41,75 @@ pub struct ServerConfig {
 #[derive(Debug, Clone)]
 pub struct Target {
     pub server: String,
-    pub path: PathBuf,
+    pub endpoint: Endpoint,
     pub model: Option<String>,
     pub model_reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    Unix {
+        path: PathBuf,
+    },
+    WebSocket {
+        url: String,
+        auth_token: Option<String>,
+    },
+}
+
+impl Endpoint {
+    pub fn display(&self) -> String {
+        match self {
+            Endpoint::Unix { path } => format!("unix://{}", path.display()),
+            Endpoint::WebSocket { url, .. } => url.clone(),
+        }
+    }
+}
+
 impl Target {
-    pub fn configured(alias: &str, server: &ServerConfig, config: &AppConfig) -> Self {
-        Self {
+    pub fn configured(alias: &str, server: &ServerConfig, config: &AppConfig) -> Result<Self> {
+        Ok(Self {
             server: alias.to_string(),
-            path: server.path.clone(),
+            endpoint: server.resolve_endpoint(alias)?,
             model: server.model.clone().or_else(|| config.model.clone()),
             model_reasoning_effort: server
                 .model_reasoning_effort
                 .clone()
                 .or_else(|| config.model_reasoning_effort.clone()),
-        }
+        })
+    }
+}
+
+impl ServerConfig {
+    pub fn endpoint_display(&self, alias: &str) -> Result<String> {
+        Ok(self.resolve_endpoint(alias)?.display())
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.endpoint.is_none() && self.kind.as_deref() == Some("uds") && self.path.is_some()
+    }
+
+    fn resolve_endpoint(&self, alias: &str) -> Result<Endpoint> {
+        let endpoint = if let Some(endpoint) = self.endpoint.as_deref() {
+            endpoint
+        } else {
+            let path = self
+                .path
+                .as_ref()
+                .ok_or_else(|| anyhow!("server `{alias}` is missing `endpoint`"))?;
+            return resolve_endpoint(
+                alias,
+                &format!("unix://{}", path.display()),
+                self.auth_token_env.as_deref(),
+                self.auth_token.as_deref(),
+            );
+        };
+        resolve_endpoint(
+            alias,
+            endpoint,
+            self.auth_token_env.as_deref(),
+            self.auth_token.as_deref(),
+        )
     }
 }
 
@@ -69,15 +132,8 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         if alias.trim().is_empty() {
             return Err(anyhow!("server alias must not be empty"));
         }
-        if server.kind != "uds" {
-            return Err(anyhow!(
-                "server `{alias}` has unsupported type `{}`; only `uds` is supported",
-                server.kind
-            ));
-        }
-        if server.path.as_os_str().is_empty() {
-            return Err(anyhow!("server `{alias}` is missing `path`"));
-        }
+        validate_server_shape(alias, server)?;
+        validate_server_endpoint(alias, server)?;
         validate_defaults(
             &format!("server `{alias}`"),
             server.model.as_deref(),
@@ -85,6 +141,126 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn validate_server_shape(alias: &str, server: &ServerConfig) -> Result<()> {
+    if server.endpoint.is_some() && (server.kind.is_some() || server.path.is_some()) {
+        return Err(anyhow!(
+            "server `{alias}` cannot combine `endpoint` with deprecated `type`/`path`"
+        ));
+    }
+    if server.endpoint.is_none() {
+        match (server.kind.as_deref(), server.path.as_ref()) {
+            (Some("uds"), Some(path)) if !path.as_os_str().is_empty() => {}
+            (Some("uds"), _) => return Err(anyhow!("server `{alias}` is missing `path`")),
+            (Some(kind), _) => {
+                return Err(anyhow!(
+                    "server `{alias}` has unsupported type `{kind}`; use `endpoint = \"unix:///...\"`, `endpoint = \"ws://host:port\"`, or `endpoint = \"wss://host:port\"`"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(anyhow!(
+                    "server `{alias}` has `path` without `type = \"uds\"`; use `endpoint = \"unix:///path/to.sock\"`"
+                ));
+            }
+            (None, None) => return Err(anyhow!("server `{alias}` is missing `endpoint`")),
+        }
+    } else if server
+        .endpoint
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("server `{alias}` has empty `endpoint`"));
+    }
+    if server.auth_token.is_some() && server.auth_token_env.is_some() {
+        return Err(anyhow!(
+            "server `{alias}` cannot set both `auth_token` and `auth_token_env`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_server_endpoint(alias: &str, server: &ServerConfig) -> Result<()> {
+    let endpoint = if let Some(endpoint) = server.endpoint.as_deref() {
+        endpoint.to_string()
+    } else {
+        let path = server
+            .path
+            .as_ref()
+            .ok_or_else(|| anyhow!("server `{alias}` is missing `endpoint`"))?;
+        format!("unix://{}", path.display())
+    };
+    validate_endpoint_syntax(&format!("server `{alias}`"), &endpoint)?;
+    if server.auth_token.is_some() || server.auth_token_env.is_some() {
+        let url = Url::parse(&endpoint).ok();
+        match url.as_ref().map(Url::scheme) {
+            Some("ws" | "wss") => {
+                let url = url.expect("checked");
+                if !websocket_url_supports_auth_token(&url) {
+                    return Err(anyhow!(
+                        "server `{alias}` auth token requires a wss:// or loopback ws:// endpoint"
+                    ));
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "server `{alias}` auth token requires a websocket endpoint"
+                ));
+            }
+        }
+    }
+    if let Some(token) = server.auth_token.as_deref()
+        && token.trim().is_empty()
+    {
+        return Err(anyhow!("server `{alias}` has empty `auth_token`"));
+    }
+    if let Some(env_name) = server.auth_token_env.as_deref()
+        && env_name.trim().is_empty()
+    {
+        return Err(anyhow!("server `{alias}` has empty `auth_token_env`"));
+    }
+    Ok(())
+}
+
+fn validate_endpoint_syntax(scope: &str, endpoint: &str) -> Result<()> {
+    let Some((scheme, _rest)) = endpoint.split_once("://") else {
+        return Err(anyhow!(
+            "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"
+        ));
+    };
+    match scheme {
+        "unix" => {
+            let path = endpoint
+                .strip_prefix("unix://")
+                .expect("scheme checked")
+                .trim();
+            if path.is_empty() {
+                return Err(anyhow!("{scope} endpoint `unix://` is missing a path"));
+            }
+            Ok(())
+        }
+        "ws" | "wss" => {
+            let url = Url::parse(endpoint)
+                .with_context(|| format!("{scope} has invalid websocket endpoint `{endpoint}`"))?;
+            if url.host().is_none() {
+                return Err(anyhow!("{scope} websocket endpoint must include a host"));
+            }
+            if url.port().is_none() {
+                return Err(anyhow!(
+                    "{scope} websocket endpoint must include an explicit port"
+                ));
+            }
+            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                return Err(anyhow!(
+                    "{scope} websocket endpoint must not include a path, query, or fragment"
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(anyhow!(
+            "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"
+        )),
+    }
 }
 
 fn validate_defaults(scope: &str, model: Option<&str>, effort: Option<&str>) -> Result<()> {
@@ -154,9 +330,6 @@ pub fn resolve_target_from(
     server_env: Option<&str>,
 ) -> Result<Target> {
     if let Some(endpoint) = connect {
-        let path = endpoint
-            .strip_prefix("unix://")
-            .ok_or_else(|| anyhow!("--connect currently supports only unix:// endpoints"))?;
         if server_flag.is_some() || server_env.is_some() {
             return Err(anyhow!(
                 "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER"
@@ -164,7 +337,7 @@ pub fn resolve_target_from(
         }
         return Ok(Target {
             server: endpoint.to_string(),
-            path: PathBuf::from(path),
+            endpoint: resolve_endpoint("direct connection", endpoint, None, None)?,
             model: None,
             model_reasoning_effort: None,
         });
@@ -175,12 +348,12 @@ pub fn resolve_target_from(
             .servers
             .get(alias)
             .ok_or_else(|| anyhow!("unknown server alias `{alias}`"))?;
-        return Ok(Target::configured(alias, server, config));
+        return Target::configured(alias, server, config);
     }
 
     if config.servers.len() == 1 {
         let (alias, server) = config.servers.iter().next().expect("len checked");
-        return Ok(Target::configured(alias, server, config));
+        return Target::configured(alias, server, config);
     }
 
     if config.servers.is_empty() {
@@ -190,4 +363,148 @@ pub fn resolve_target_from(
     Err(anyhow!(
         "multiple servers configured; pass --server ALIAS or set CODEX_THREADS_SERVER"
     ))
+}
+
+pub fn resolve_direct_target(
+    endpoint: &str,
+    auth_token_env: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<Target> {
+    Ok(Target {
+        server: endpoint.to_string(),
+        endpoint: resolve_endpoint("direct connection", endpoint, auth_token_env, auth_token)?,
+        model: None,
+        model_reasoning_effort: None,
+    })
+}
+
+pub fn legacy_server_warnings(config: &AppConfig) -> Vec<String> {
+    config
+        .servers
+        .iter()
+        .filter_map(|(alias, server)| {
+            if server.is_legacy() {
+                let path = server.path.as_ref()?;
+                Some(format!(
+                    "server `{alias}` uses deprecated `type = \"uds\"` + `path`; replace with `endpoint = \"unix://{}\"`",
+                    path.display()
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn resolve_endpoint(
+    scope: &str,
+    endpoint: &str,
+    auth_token_env: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<Endpoint> {
+    if auth_token.is_some() && auth_token_env.is_some() {
+        return Err(anyhow!(
+            "{scope} cannot set both `auth_token` and `auth_token_env`"
+        ));
+    }
+    let Some((scheme, _rest)) = endpoint.split_once("://") else {
+        return Err(anyhow!(
+            "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"
+        ));
+    };
+    match scheme {
+        "unix" => {
+            if auth_token.is_some() || auth_token_env.is_some() {
+                return Err(anyhow!("{scope} auth token requires a websocket endpoint"));
+            }
+            let path = endpoint
+                .strip_prefix("unix://")
+                .expect("scheme checked")
+                .trim();
+            if path.is_empty() {
+                return Err(anyhow!("{scope} endpoint `unix://` is missing a path"));
+            }
+            Ok(Endpoint::Unix {
+                path: PathBuf::from(path),
+            })
+        }
+        "ws" | "wss" => resolve_websocket_endpoint(scope, endpoint, auth_token_env, auth_token),
+        _ => Err(anyhow!(
+            "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"
+        )),
+    }
+}
+
+fn resolve_websocket_endpoint(
+    scope: &str,
+    endpoint: &str,
+    auth_token_env: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<Endpoint> {
+    let url = Url::parse(endpoint)
+        .with_context(|| format!("{scope} has invalid websocket endpoint `{endpoint}`"))?;
+    if url.host().is_none() {
+        return Err(anyhow!("{scope} websocket endpoint must include a host"));
+    }
+    if url.port().is_none() {
+        return Err(anyhow!(
+            "{scope} websocket endpoint must include an explicit port"
+        ));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(anyhow!(
+            "{scope} websocket endpoint must not include a path, query, or fragment"
+        ));
+    }
+    let auth_token = resolve_auth_token(scope, &url, auth_token_env, auth_token)?;
+    Ok(Endpoint::WebSocket {
+        url: url.to_string(),
+        auth_token,
+    })
+}
+
+fn resolve_auth_token(
+    scope: &str,
+    url: &Url,
+    auth_token_env: Option<&str>,
+    auth_token: Option<&str>,
+) -> Result<Option<String>> {
+    let token = match (auth_token_env, auth_token) {
+        (Some(env_name), None) => {
+            let env_name = env_name.trim();
+            if env_name.is_empty() {
+                return Err(anyhow!("{scope} has empty `auth_token_env`"));
+            }
+            let token = env::var(env_name)
+                .with_context(|| format!("{scope} `auth_token_env` is not set or is invalid"))?;
+            Some(non_empty_token(scope, &token, "`auth_token_env` value")?)
+        }
+        (None, Some(token)) => Some(non_empty_token(scope, token, "`auth_token`")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked by caller"),
+    };
+    if token.is_some() && !websocket_url_supports_auth_token(url) {
+        return Err(anyhow!(
+            "{scope} auth token requires a wss:// or loopback ws:// endpoint"
+        ));
+    }
+    Ok(token)
+}
+
+fn non_empty_token(scope: &str, value: &str, field: &str) -> Result<String> {
+    let token = value.trim();
+    if token.is_empty() {
+        return Err(anyhow!("{scope} has empty {field}"));
+    }
+    Ok(token.to_string())
+}
+
+fn websocket_url_supports_auth_token(url: &Url) -> bool {
+    match (url.scheme(), url.host()) {
+        ("wss", Some(_)) => true,
+        ("ws", Some(url::Host::Domain(domain))) => domain.eq_ignore_ascii_case("localhost"),
+        ("ws", Some(url::Host::Ipv4(addr))) => IpAddr::V4(addr).is_loopback(),
+        ("ws", Some(url::Host::Ipv6(addr))) => IpAddr::V6(addr).is_loopback(),
+        _ => false,
+    }
 }

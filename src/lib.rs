@@ -11,7 +11,8 @@ pub async fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::config::{
-        AppConfig, ServerConfig, resolve_config_path_from, resolve_target_from, validate_config,
+        AppConfig, Endpoint, ServerConfig, resolve_config_path_from, resolve_target_from,
+        validate_config,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -37,18 +38,34 @@ mod tests {
         );
     }
 
+    fn server(endpoint: &str) -> ServerConfig {
+        ServerConfig {
+            endpoint: Some(endpoint.to_string()),
+            kind: None,
+            path: None,
+            auth_token_env: None,
+            auth_token: None,
+            model: None,
+            model_reasoning_effort: None,
+        }
+    }
+
+    fn legacy_server(path: &str) -> ServerConfig {
+        ServerConfig {
+            endpoint: None,
+            kind: Some("uds".to_string()),
+            path: Some(PathBuf::from(path)),
+            auth_token_env: None,
+            auth_token: None,
+            model: None,
+            model_reasoning_effort: None,
+        }
+    }
+
     #[test]
     fn target_precedence_handles_connect_server_env_and_singleton() {
         let mut servers = BTreeMap::new();
-        servers.insert(
-            "main".to_string(),
-            ServerConfig {
-                kind: "uds".to_string(),
-                path: PathBuf::from("/tmp/main.sock"),
-                model: None,
-                model_reasoning_effort: None,
-            },
-        );
+        servers.insert("main".to_string(), server("unix:///tmp/main.sock"));
         let config = AppConfig {
             model: None,
             model_reasoning_effort: None,
@@ -57,7 +74,12 @@ mod tests {
         let target =
             resolve_target_from(&config, Some("unix:///tmp/direct.sock"), None, None).unwrap();
         assert_eq!(target.server, "unix:///tmp/direct.sock");
-        assert_eq!(target.path, PathBuf::from("/tmp/direct.sock"));
+        assert_eq!(
+            target.endpoint,
+            Endpoint::Unix {
+                path: PathBuf::from("/tmp/direct.sock")
+            }
+        );
 
         let target = resolve_target_from(&config, None, None, None).unwrap();
         assert_eq!(target.server, "main");
@@ -72,8 +94,11 @@ mod tests {
         servers.insert(
             "main".to_string(),
             ServerConfig {
-                kind: "uds".to_string(),
-                path: PathBuf::from("/tmp/main.sock"),
+                endpoint: Some("unix:///tmp/main.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
                 model: None,
                 model_reasoning_effort: Some("high".to_string()),
             },
@@ -81,8 +106,11 @@ mod tests {
         servers.insert(
             "work".to_string(),
             ServerConfig {
-                kind: "uds".to_string(),
-                path: PathBuf::from("/tmp/work.sock"),
+                endpoint: Some("unix:///tmp/work.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
                 model: Some("gpt-5.5".to_string()),
                 model_reasoning_effort: None,
             },
@@ -113,8 +141,11 @@ mod tests {
         servers.insert(
             "main".to_string(),
             ServerConfig {
-                kind: "uds".to_string(),
-                path: PathBuf::from("/tmp/main.sock"),
+                endpoint: Some("unix:///tmp/main.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
                 model: Some("gpt-5.5".to_string()),
                 model_reasoning_effort: None,
             },
@@ -146,5 +177,70 @@ mod tests {
             servers: BTreeMap::new(),
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn config_validation_accepts_legacy_uds_and_rejects_mixed_endpoint_shape() {
+        let mut servers = BTreeMap::new();
+        servers.insert("main".to_string(), legacy_server("/tmp/main.sock"));
+        assert!(
+            validate_config(&AppConfig {
+                model: None,
+                model_reasoning_effort: None,
+                servers,
+            })
+            .is_ok()
+        );
+
+        let mut servers = BTreeMap::new();
+        let mut mixed = server("unix:///tmp/main.sock");
+        mixed.kind = Some("uds".to_string());
+        servers.insert("main".to_string(), mixed);
+        let err = validate_config(&AppConfig {
+            model: None,
+            model_reasoning_effort: None,
+            servers,
+        })
+        .expect_err("mixed endpoint and legacy fields should fail");
+        assert!(err.to_string().contains("cannot combine"));
+    }
+
+    #[test]
+    fn config_validation_rejects_path_without_legacy_type() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "main".to_string(),
+            ServerConfig {
+                endpoint: None,
+                kind: None,
+                path: Some(PathBuf::from("/tmp/main.sock")),
+                auth_token_env: None,
+                auth_token: None,
+                model: None,
+                model_reasoning_effort: None,
+            },
+        );
+        let err = validate_config(&AppConfig {
+            model: None,
+            model_reasoning_effort: None,
+            servers,
+        })
+        .expect_err("path alone should fail");
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[test]
+    fn config_validation_rejects_websocket_tokens_on_insecure_non_loopback_ws() {
+        let mut servers = BTreeMap::new();
+        let mut server = server("ws://example.com:1234");
+        server.auth_token = Some("secret".to_string());
+        servers.insert("main".to_string(), server);
+        let err = validate_config(&AppConfig {
+            model: None,
+            model_reasoning_effort: None,
+            servers,
+        })
+        .expect_err("non-loopback ws auth token should fail");
+        assert!(err.to_string().contains("wss:// or loopback ws://"));
     }
 }
