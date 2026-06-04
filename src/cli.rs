@@ -16,6 +16,20 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub connect: Option<String>,
     #[arg(
+        long,
+        global = true,
+        requires = "connect",
+        conflicts_with = "connect_auth_token"
+    )]
+    pub connect_auth_token_env: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        requires = "connect",
+        conflicts_with = "connect_auth_token_env"
+    )]
+    pub connect_auth_token: Option<String>,
+    #[arg(
         long = "no-yolo",
         global = true,
         help = "Use Codex app-server approval and sandbox defaults instead of forcing approvalPolicy=never and full-access sandboxing"

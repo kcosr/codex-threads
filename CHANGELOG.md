@@ -2,7 +2,32 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add endpoint-based server configuration for `unix://`, `ws://`, and
+  `wss://` Codex app-server targets
+  ([#4](https://github.com/kcosr/codex-threads/pull/4)).
+- Add WebSocket-over-TCP app-server connections with optional bearer-token auth
+  from `auth_token_env`, `auth_token`, `--connect-auth-token-env`, or
+  `--connect-auth-token`
+  ([#4](https://github.com/kcosr/codex-threads/pull/4)).
+
+### Changed
+
+- Normalize `servers` output around endpoint strings
+  ([#4](https://github.com/kcosr/codex-threads/pull/4)).
+- Deprecated legacy `type = "uds"` plus `path` server config; existing configs
+  continue to work with a warning
+  ([#4](https://github.com/kcosr/codex-threads/pull/4)).
+
+### Fixed
+
+- Keep `servers` listing from resolving auth token environment variables, and
+  report unresolved auth for `servers ping --all` as a per-server failure
+  ([#4](https://github.com/kcosr/codex-threads/pull/4)).
+- Reject unknown config fields so misspelled auth keys do not silently drop
+  credentials
+  ([#4](https://github.com/kcosr/codex-threads/pull/4)).
 
 ## [0.1.3] - 2026-06-04
 

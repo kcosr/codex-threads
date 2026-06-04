@@ -1,24 +1,40 @@
 # codex-threads Smoke Tests
 
 Deterministic mock smoke coverage lives in `tests/mock_smoke.rs` and runs as
-part of `cargo test`. Those tests launch a mock Codex app-server over a Unix
-domain socket and exercise the compiled CLI binary.
+part of `cargo test`. Those tests launch mock Codex app-servers over Unix
+domain sockets and TCP WebSockets and exercise the compiled CLI binary.
 
 This directory contains opt-in live smoke checks against a real Codex
 app-server.
 
 ## Live Smoke
 
-Use the running app-server socket:
+Use the running app-server endpoint:
 
 ```bash
-CODEX_SOCK=unix:///var/run/user/1000/codex.sock smoke/live_smoke.sh
+CODEX_ENDPOINT=unix:///var/run/user/1000/codex.sock smoke/live_smoke.sh
+# or
+CODEX_ENDPOINT=ws://127.0.0.1:8765 smoke/live_smoke.sh
+```
+
+For an authenticated WebSocket app-server, provide one token source:
+
+```bash
+CODEX_ENDPOINT=ws://127.0.0.1:8765 \
+CODEX_AUTH_TOKEN_ENV=CODEX_APP_SERVER_TOKEN \
+smoke/live_smoke.sh
+
+CODEX_ENDPOINT=ws://127.0.0.1:8765 \
+CODEX_AUTH_TOKEN=literal-token \
+smoke/live_smoke.sh
 ```
 
 The script:
 
 - builds the CLI if needed;
 - writes a temporary config with one `live` server plus model defaults;
+- writes `auth_token_env` or `auth_token` when requested for WebSocket smoke
+  testing;
 - runs `servers ping`, `models`, promptless `new`, `status`, `settings show`,
   `name`, and `goal get/set/clear`, verifying `settings show` reports the
   configured model and effort and goal state round-trips correctly;
@@ -31,7 +47,7 @@ To include a real turn:
 RUN_CODEX_TURN=1 \
 CODEX_MODEL=gpt-5.5 \
 CODEX_EFFORT=high \
-CODEX_SOCK=unix:///var/run/user/1000/codex.sock \
+CODEX_ENDPOINT=unix:///var/run/user/1000/codex.sock \
 smoke/live_smoke.sh
 ```
 

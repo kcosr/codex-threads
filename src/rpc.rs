@@ -1,17 +1,26 @@
 use std::fmt;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{WebSocketStream, client_async_with_config};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_with_config, connect_async_with_config,
+};
+
+use crate::config::Endpoint;
 
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 
 #[derive(Debug, Clone)]
 pub struct RpcError {
@@ -40,32 +49,104 @@ pub struct Notification {
 }
 
 pub struct RpcClient {
-    stream: WebSocketStream<UnixStream>,
+    stream: RpcStream,
     next_id: i64,
 }
 
 impl RpcClient {
-    pub async fn connect(path: &Path) -> Result<Self> {
-        let request = HANDSHAKE_URL
-            .into_client_request()
-            .context("invalid UDS websocket handshake URL")?;
-        let unix = tokio::time::timeout(Duration::from_secs(10), UnixStream::connect(path))
-            .await
-            .context("timed out connecting to app-server UDS")?
-            .with_context(|| format!("failed to connect to app-server UDS `{}`", path.display()))?;
-        let (stream, _) = tokio::time::timeout(
-            Duration::from_secs(10),
-            client_async_with_config(request, unix, None),
-        )
-        .await
-        .context("timed out upgrading UDS connection to websocket")?
-        .context("failed to upgrade UDS connection to websocket")?;
-
+    pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
+        let stream = match endpoint {
+            Endpoint::Unix { path } => RpcStream::Unix(connect_unix(path).await?),
+            Endpoint::WebSocket { url, auth_token } => {
+                RpcStream::Tcp(connect_websocket(url, auth_token.as_deref()).await?)
+            }
+        };
         let mut client = Self { stream, next_id: 1 };
         client.initialize().await?;
         Ok(client)
     }
+}
 
+enum RpcStream {
+    Unix(WebSocketStream<UnixStream>),
+    Tcp(WebSocketStream<MaybeTlsStream<TcpStream>>),
+}
+
+impl RpcStream {
+    async fn send(
+        &mut self,
+        message: Message,
+    ) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
+        match self {
+            RpcStream::Unix(stream) => stream.send(message).await,
+            RpcStream::Tcp(stream) => stream.send(message).await,
+        }
+    }
+
+    async fn next(
+        &mut self,
+    ) -> Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        match self {
+            RpcStream::Unix(stream) => stream.next().await,
+            RpcStream::Tcp(stream) => stream.next().await,
+        }
+    }
+}
+
+async fn connect_unix(path: &std::path::Path) -> Result<WebSocketStream<UnixStream>> {
+    let request = HANDSHAKE_URL
+        .into_client_request()
+        .context("invalid UDS websocket handshake URL")?;
+    let unix = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(path))
+        .await
+        .context("timed out connecting to app-server UDS")?
+        .with_context(|| format!("failed to connect to app-server UDS `{}`", path.display()))?;
+    let (stream, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client_async_with_config(request, unix, Some(websocket_config())),
+    )
+    .await
+    .context("timed out upgrading UDS connection to websocket")?
+    .context("failed to upgrade UDS connection to websocket")?;
+    Ok(stream)
+}
+
+async fn connect_websocket(
+    url: &str,
+    auth_token: Option<&str>,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    // Codex TCP app-server listeners accept WebSocket upgrades at the listener
+    // root; UDS uses HANDSHAKE_URL only because tungstenite needs an HTTP URL
+    // while the actual peer is the already-connected Unix stream.
+    let mut request = url
+        .into_client_request()
+        .with_context(|| format!("invalid websocket endpoint `{url}`"))?;
+    if let Some(auth_token) = auth_token {
+        let header_value = HeaderValue::from_str(&format!("Bearer {auth_token}"))
+            .context("invalid websocket authorization header")?;
+        request.headers_mut().insert(AUTHORIZATION, header_value);
+    }
+    let (stream, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_async_with_config(
+            request,
+            Some(websocket_config()),
+            /*disable_nagle*/ false,
+        ),
+    )
+    .await
+    .with_context(|| format!("timed out connecting to app-server websocket `{url}`"))?
+    .with_context(|| format!("failed to connect to app-server websocket `{url}`"))?;
+    Ok(stream)
+}
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(Some(MAX_WEBSOCKET_MESSAGE_SIZE))
+        .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_SIZE))
+}
+
+impl RpcClient {
     async fn initialize(&mut self) -> Result<()> {
         let result = self
             .request(

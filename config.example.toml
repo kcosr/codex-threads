@@ -4,12 +4,11 @@ model = "gpt-5.5"
 model_reasoning_effort = "high"
 
 [servers.main]
-type = "uds"
-path = "/path/to/codex.sock"
+endpoint = "unix:///path/to/codex.sock"
 
 # Optional per-server overrides.
 # [servers.work]
-# type = "uds"
-# path = "/path/to/work/app-server-control.sock"
+# endpoint = "ws://127.0.0.1:8765"
+# auth_token_env = "CODEX_APP_SERVER_TOKEN"
 # model = "gpt-5.5"
 # model_reasoning_effort = "low"
