@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod completion;
 mod config;
 mod rpc;
 

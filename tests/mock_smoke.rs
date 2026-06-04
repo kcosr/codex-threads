@@ -658,6 +658,14 @@ fn run_json(server: &MockServer, args: &[&str]) -> Value {
     serde_json::from_slice(&output).expect("json output")
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'\''"#))
+}
+
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', r"\\").replace('"', "\\\""))
+}
+
 fn write_config(server: &MockServer, contents: impl AsRef<str>) {
     fs::write(&server.config, contents.as_ref()).expect("config");
 }
@@ -765,6 +773,238 @@ path = "/tmp/two.sock"
         .assert()
         .code(2)
         .stderr(predicates::str::contains("multiple servers configured"));
+}
+
+#[test]
+fn completion_commands_print_setup_scripts_and_candidates() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &config,
+        r#"
+[servers.work]
+type = "uds"
+path = "/tmp/work.sock"
+
+[servers.personal]
+type = "uds"
+path = "/tmp/personal.sock"
+"#,
+    )
+    .expect("config");
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .env("SHELL", "/bin/bash")
+        .args(["completion"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Detected shell: bash"))
+        .stdout(predicates::str::contains(
+            "source <(codex-threads completion script bash)",
+        ));
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["completion", "script", "bash"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("mapfile -t COMPREPLY"))
+        .stdout(predicates::str::contains(
+            "complete -o bashdefault -o default -F _codex_threads_completion codex-threads",
+        ))
+        .stdout(predicates::str::contains(
+            "codex-threads __complete -- \"$cur\"",
+        ));
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["completion", "script", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "compdef _codex_threads codex-threads",
+        ))
+        .stdout(predicates::str::contains("_files"))
+        .stdout(predicates::str::contains(
+            "codex-threads __complete -- \"$current\"",
+        ));
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["completion", "script", "fish"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("complete -c codex-threads -a"))
+        .stdout(predicates::str::contains(
+            "codex-threads __complete -- \"$current\"",
+        ));
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["__complete", "--", "l"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("list\n"));
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["__complete", "--", "p", "servers"])
+        .assert()
+        .success()
+        .stdout("ping\n");
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["__complete", "--", "--so", "list"])
+        .assert()
+        .success()
+        .stdout("--sort\n");
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["__complete", "--", "u", "list", "--sort"])
+        .assert()
+        .success()
+        .stdout("updated\n");
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args([
+            "__complete",
+            "--",
+            "wo",
+            "--config",
+            config.to_str().expect("utf8 path"),
+            "list",
+            "--server",
+        ])
+        .assert()
+        .success()
+        .stdout("work\n");
+
+    let bash_completion = |words: &[&str], cword: usize| -> String {
+        let binary = assert_cmd::cargo::cargo_bin("codex-threads");
+        let binary_dir = binary.parent().expect("binary parent");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(binary_dir.to_path_buf()).chain(std::env::split_paths(&path)),
+        )
+        .expect("join path");
+        let words = words
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "source <(codex-threads completion script bash); \
+             COMP_WORDS=({words}); \
+             COMP_CWORD={cword}; \
+             _codex_threads_completion; \
+             printf '%s\\n' \"${{COMPREPLY[@]}}\""
+        );
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &script])
+            .env("PATH", path)
+            .env_remove("CODEX_THREADS_CONFIG")
+            .env_remove("CODEX_THREADS_SERVER")
+            .output()
+            .expect("run bash completion smoke");
+        assert!(
+            output.status.success(),
+            "bash completion failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf8 stdout")
+    };
+
+    assert_eq!(bash_completion(&["codex-threads", "l"], 1), "list\n");
+    assert_eq!(
+        bash_completion(&["codex-threads", "servers", "p"], 2),
+        "ping\n"
+    );
+    assert_eq!(
+        bash_completion(&["codex-threads", "list", "--so"], 2),
+        "--sort\n"
+    );
+    assert_eq!(
+        bash_completion(&["codex-threads", "list", "--sort", "u"], 3),
+        "updated\n"
+    );
+    assert_eq!(
+        bash_completion(&["codex-threads", "list", "--sort=u"], 2),
+        "--sort=updated\n"
+    );
+    assert_eq!(
+        bash_completion(
+            &[
+                "codex-threads",
+                "--config",
+                config.to_str().expect("utf8 path"),
+                "list",
+                "--server",
+                "wo",
+            ],
+            5,
+        ),
+        "work\n"
+    );
+    assert!(!bash_completion(&["codex-threads", ""], 1).contains("__complete"));
+
+    let marker = temp.path().join("completion-pwned");
+    let malicious_alias = format!("$(touch {})", marker.display());
+    fs::write(
+        &config,
+        format!(
+            r#"
+[servers.work]
+type = "uds"
+path = "/tmp/work.sock"
+
+[servers.{malicious_alias}]
+type = "uds"
+path = "/tmp/malicious.sock"
+"#,
+            malicious_alias = toml_string(&malicious_alias),
+        ),
+    )
+    .expect("config");
+
+    assert_eq!(
+        bash_completion(
+            &[
+                "codex-threads",
+                "--config",
+                config.to_str().expect("utf8 path"),
+                "list",
+                "--server",
+                "$",
+            ],
+            5,
+        ),
+        format!("{malicious_alias}\n")
+    );
+    assert!(
+        !marker.exists(),
+        "completion candidate executed as shell code"
+    );
+}
+
+#[test]
+fn clap_value_parsers_reject_invalid_static_values_before_connecting() {
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["new", "--cwd", ".", "--effort", "extreme"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("invalid value"));
+
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["goal", "set", "thread_1", "--status", "finished"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("invalid value"));
 }
 
 #[test]

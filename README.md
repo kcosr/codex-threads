@@ -260,6 +260,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `goal get THREAD_ID` | Read the active goal. |
 | `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
 | `goal clear THREAD_ID` | Clear the active goal. |
+| `completion [SHELL]` | Print shell completion setup instructions for `bash`, `zsh`, or `fish`. |
 
 Every app-server command accepts `--server ALIAS` and `--json`. Global
 `--config PATH` and `--connect ENDPOINT` may be placed before or after the
@@ -277,6 +278,58 @@ by default, or app-server defaults when global `--no-yolo` is passed.
 Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and
 `xhigh`. Accepted `goal set --status` values are `active`, `paused`, `blocked`,
 `usage-limited`, `budget-limited`, and `complete`.
+
+## Shell Completion
+
+Print setup instructions for the detected shell:
+
+```bash
+codex-threads completion
+codex-threads completion bash
+codex-threads completion zsh
+codex-threads completion fish
+```
+
+Enable completion only for the current shell:
+
+```bash
+source <(codex-threads completion script bash)
+source <(codex-threads completion script zsh)
+codex-threads completion script fish | source
+```
+
+For permanent bash setup, generate a static completion file and source it from
+`~/.bashrc`:
+
+```bash
+mkdir -p ~/.local/share/codex-threads
+codex-threads completion script bash > ~/.local/share/codex-threads/completion.bash
+printf '\nsource ~/.local/share/codex-threads/completion.bash\n' >> ~/.bashrc
+```
+
+For permanent zsh setup:
+
+```bash
+mkdir -p ~/.local/share/codex-threads
+codex-threads completion script zsh > ~/.local/share/codex-threads/completion.zsh
+printf '\nsource ~/.local/share/codex-threads/completion.zsh\n' >> ~/.zshrc
+```
+
+For permanent fish setup:
+
+```fish
+mkdir -p ~/.config/fish/completions
+codex-threads completion script fish > ~/.config/fish/completions/codex-threads.fish
+```
+
+Regenerate the completion file after upgrading `codex-threads`.
+
+Completions suggest command names, nested subcommands, option names, static
+values such as `--sort updated|created`, `--items summary|full|none`,
+`--role user|assistant`, `--effort none|minimal|low|medium|high|xhigh`, goal
+status values, shell names for `completion`, and local configured server aliases
+for `--server`. Completion does not connect to Codex app-server, so thread IDs,
+turn IDs, and remote model IDs are not completed.
 
 ## Output
 
