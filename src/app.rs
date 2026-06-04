@@ -339,7 +339,7 @@ where
                 "--connect-auth-token and --connect-auth-token-env require --connect",
             ));
         }
-        resolve_target(config, None, server.as_deref())?
+        resolve_target(config, server.as_deref())?
     };
     let client = RpcClient::connect(&target.endpoint).await?;
     f(target, client).await
@@ -413,31 +413,7 @@ async fn servers_command(
                     };
                     results.push(json!({"server": server, "ok": ok}));
                 }
-                if ping.json {
-                    print_json(&json!({"servers": results}))?;
-                } else {
-                    print_table(
-                        &["SERVER", "STATUS"],
-                        results
-                            .iter()
-                            .map(|row| {
-                                vec![
-                                    table_cell(row["server"].as_str().unwrap_or("")),
-                                    table_cell(if row["ok"].as_bool() == Some(true) {
-                                        "ok"
-                                    } else {
-                                        "error"
-                                    }),
-                                ]
-                            })
-                            .collect(),
-                    );
-                }
-                return Ok(if results.iter().all(|r| r["ok"].as_bool() == Some(true)) {
-                    0
-                } else {
-                    3
-                });
+                return render_server_ping_results(results, ping.json);
             }
 
             let targets = {
@@ -449,7 +425,7 @@ async fn servers_command(
                             "--connect-auth-token and --connect-auth-token-env require --connect",
                         ));
                     }
-                    resolve_target(&config, None, ping.server.as_deref())?
+                    resolve_target(&config, ping.server.as_deref())?
                 };
                 vec![target]
             };
@@ -458,33 +434,37 @@ async fn servers_command(
                 let ok = RpcClient::connect(&target.endpoint).await.is_ok();
                 results.push(json!({"server": target.server, "ok": ok}));
             }
-            if ping.json {
-                print_json(&json!({"servers": results}))?;
-            } else {
-                print_table(
-                    &["SERVER", "STATUS"],
-                    results
-                        .iter()
-                        .map(|row| {
-                            vec![
-                                table_cell(row["server"].as_str().unwrap_or("")),
-                                table_cell(if row["ok"].as_bool() == Some(true) {
-                                    "ok"
-                                } else {
-                                    "error"
-                                }),
-                            ]
-                        })
-                        .collect(),
-                );
-            }
-            Ok(if results.iter().all(|r| r["ok"].as_bool() == Some(true)) {
-                0
-            } else {
-                3
-            })
+            render_server_ping_results(results, ping.json)
         }
     }
+}
+
+fn render_server_ping_results(results: Vec<Value>, json_output: bool) -> Result<i32> {
+    if json_output {
+        print_json(&json!({"servers": results}))?;
+    } else {
+        print_table(
+            &["SERVER", "STATUS"],
+            results
+                .iter()
+                .map(|row| {
+                    vec![
+                        table_cell(row["server"].as_str().unwrap_or("")),
+                        table_cell(if row["ok"].as_bool() == Some(true) {
+                            "ok"
+                        } else {
+                            "error"
+                        }),
+                    ]
+                })
+                .collect(),
+        );
+    }
+    Ok(if results.iter().all(|r| r["ok"].as_bool() == Some(true)) {
+        0
+    } else {
+        3
+    })
 }
 
 async fn list_command(target: Target, mut client: RpcClient, command: ListCommand) -> Result<i32> {

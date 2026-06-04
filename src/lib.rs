@@ -11,8 +11,8 @@ pub async fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::config::{
-        AppConfig, Endpoint, ServerConfig, resolve_config_path_from, resolve_target_from,
-        validate_config,
+        AppConfig, Endpoint, ServerConfig, resolve_config_path_from, resolve_direct_target,
+        resolve_target_from, validate_config,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -71,8 +71,7 @@ mod tests {
             model_reasoning_effort: None,
             servers,
         };
-        let target =
-            resolve_target_from(&config, Some("unix:///tmp/direct.sock"), None, None).unwrap();
+        let target = resolve_direct_target("unix:///tmp/direct.sock", None, None).unwrap();
         assert_eq!(target.server, "unix:///tmp/direct.sock");
         assert_eq!(
             target.endpoint,
@@ -81,10 +80,10 @@ mod tests {
             }
         );
 
-        let target = resolve_target_from(&config, None, None, None).unwrap();
+        let target = resolve_target_from(&config, None, None).unwrap();
         assert_eq!(target.server, "main");
 
-        let target = resolve_target_from(&config, None, None, Some("main")).unwrap();
+        let target = resolve_target_from(&config, None, Some("main")).unwrap();
         assert_eq!(target.server, "main");
     }
 
@@ -121,16 +120,15 @@ mod tests {
             servers,
         };
 
-        let main = resolve_target_from(&config, None, Some("main"), None).unwrap();
+        let main = resolve_target_from(&config, Some("main"), None).unwrap();
         assert_eq!(main.model.as_deref(), Some("gpt-global"));
         assert_eq!(main.model_reasoning_effort.as_deref(), Some("high"));
 
-        let work = resolve_target_from(&config, None, Some("work"), None).unwrap();
+        let work = resolve_target_from(&config, Some("work"), None).unwrap();
         assert_eq!(work.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(work.model_reasoning_effort.as_deref(), Some("low"));
 
-        let direct =
-            resolve_target_from(&config, Some("unix:///tmp/direct.sock"), None, None).unwrap();
+        let direct = resolve_direct_target("unix:///tmp/direct.sock", None, None).unwrap();
         assert_eq!(direct.model, None);
         assert_eq!(direct.model_reasoning_effort, None);
     }
@@ -156,7 +154,7 @@ mod tests {
             servers,
         };
 
-        let target = resolve_target_from(&config, None, None, None).unwrap();
+        let target = resolve_target_from(&config, None, None).unwrap();
         assert_eq!(target.server, "main");
         assert_eq!(target.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(target.model_reasoning_effort.as_deref(), Some("high"));

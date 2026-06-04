@@ -354,14 +354,9 @@ pub fn resolve_config_path_from(
     home.join(".config/codex-threads/config.toml")
 }
 
-pub fn resolve_target(
-    config: &AppConfig,
-    connect: Option<&str>,
-    server_flag: Option<&str>,
-) -> Result<Target> {
+pub fn resolve_target(config: &AppConfig, server_flag: Option<&str>) -> Result<Target> {
     resolve_target_from(
         config,
-        connect,
         server_flag,
         env::var("CODEX_THREADS_SERVER").ok().as_deref(),
     )
@@ -369,24 +364,9 @@ pub fn resolve_target(
 
 pub fn resolve_target_from(
     config: &AppConfig,
-    connect: Option<&str>,
     server_flag: Option<&str>,
     server_env: Option<&str>,
 ) -> Result<Target> {
-    if let Some(endpoint) = connect {
-        if server_flag.is_some() || server_env.is_some() {
-            return Err(anyhow!(
-                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER"
-            ));
-        }
-        return Ok(Target {
-            server: endpoint.to_string(),
-            endpoint: resolve_endpoint("direct connection", endpoint, None, None)?,
-            model: None,
-            model_reasoning_effort: None,
-        });
-    }
-
     if let Some(alias) = server_flag.or(server_env) {
         let server = config
             .servers

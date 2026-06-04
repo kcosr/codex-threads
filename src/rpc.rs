@@ -115,6 +115,9 @@ async fn connect_websocket(
     url: &str,
     auth_token: Option<&str>,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    // Codex TCP app-server listeners accept WebSocket upgrades at the listener
+    // root; UDS uses HANDSHAKE_URL only because tungstenite needs an HTTP URL
+    // while the actual peer is the already-connected Unix stream.
     let mut request = url
         .into_client_request()
         .with_context(|| format!("invalid websocket endpoint `{url}`"))?;
