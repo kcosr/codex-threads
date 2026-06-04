@@ -243,4 +243,16 @@ mod tests {
         .expect_err("non-loopback ws auth token should fail");
         assert!(err.to_string().contains("wss:// or loopback ws://"));
     }
+
+    #[test]
+    fn config_parse_rejects_unknown_fields() {
+        let err = toml::from_str::<AppConfig>(
+            r#"[servers.main]
+endpoint = "ws://127.0.0.1:1234"
+auth_token_en = "CODEX_APP_SERVER_TOKEN"
+"#,
+        )
+        .expect_err("misspelled auth field should fail");
+        assert!(err.to_string().contains("unknown field"));
+    }
 }

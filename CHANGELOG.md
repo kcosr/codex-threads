@@ -16,6 +16,13 @@
 - Deprecated legacy `type = "uds"` plus `path` server config; existing configs
   continue to work with a warning.
 
+### Fixed
+
+- Keep `servers` listing from resolving auth token environment variables, and
+  report unresolved auth for `servers ping --all` as a per-server failure.
+- Reject unknown config fields so misspelled auth keys do not silently drop
+  credentials.
+
 ## [0.1.3] - 2026-06-04
 
 ### Added

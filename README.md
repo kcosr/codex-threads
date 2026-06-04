@@ -229,6 +229,9 @@ endpoint = "unix:///path/to/codex.sock"
 endpoint = "ws://127.0.0.1:8765"
 ```
 
+`ws://` and `wss://` endpoints must include an explicit port and must not
+include a path, query, or fragment.
+
 Legacy UDS config still works, but prints a deprecation warning:
 
 ```toml
@@ -261,9 +264,11 @@ auth_token = "literal-token"
 ```
 
 For direct connections, use `--connect-auth-token-env ENV_VAR` or
-`--connect-auth-token TOKEN`. Both send `Authorization: Bearer <token>` during
-the WebSocket upgrade. Tokens are accepted only for `wss://` or loopback
-`ws://` endpoints; non-loopback plain `ws://` with a token is rejected to avoid
+`--connect-auth-token TOKEN`. Prefer the env-var form on shared machines because
+literal command-line tokens may be visible through process listings. Both send
+`Authorization: Bearer <token>` during the WebSocket upgrade. Tokens are
+accepted only for `wss://` or loopback `ws://` endpoints; non-loopback plain
+`ws://` with a token is rejected to avoid
 sending credentials over cleartext.
 
 When more than one server is configured, app-server commands require an explicit

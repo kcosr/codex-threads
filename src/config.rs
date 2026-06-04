@@ -10,6 +10,7 @@ use url::Url;
 pub const REASONING_EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub model: Option<String>,
@@ -20,6 +21,7 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -46,7 +48,7 @@ pub struct Target {
     pub model_reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Endpoint {
     Unix {
         path: PathBuf,
@@ -57,11 +59,15 @@ pub enum Endpoint {
     },
 }
 
-impl Endpoint {
-    pub fn display(&self) -> String {
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Endpoint::Unix { path } => format!("unix://{}", path.display()),
-            Endpoint::WebSocket { url, .. } => url.clone(),
+            Endpoint::Unix { path } => formatter.debug_struct("Unix").field("path", path).finish(),
+            Endpoint::WebSocket { url, auth_token } => formatter
+                .debug_struct("WebSocket")
+                .field("url", url)
+                .field("auth_token", &auth_token.as_ref().map(|_| "<redacted>"))
+                .finish(),
         }
     }
 }
@@ -82,7 +88,16 @@ impl Target {
 
 impl ServerConfig {
     pub fn endpoint_display(&self, alias: &str) -> Result<String> {
-        Ok(self.resolve_endpoint(alias)?.display())
+        let endpoint = if let Some(endpoint) = self.endpoint.as_deref() {
+            endpoint
+        } else {
+            let path = self
+                .path
+                .as_ref()
+                .ok_or_else(|| anyhow!("server `{alias}` is missing `endpoint`"))?;
+            return Ok(format!("unix://{}", path.display()));
+        };
+        endpoint_display(&format!("server `{alias}`"), endpoint)
     }
 
     pub fn is_legacy(&self) -> bool {
@@ -256,6 +271,35 @@ fn validate_endpoint_syntax(scope: &str, endpoint: &str) -> Result<()> {
                 ));
             }
             Ok(())
+        }
+        _ => Err(anyhow!(
+            "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"
+        )),
+    }
+}
+
+fn endpoint_display(scope: &str, endpoint: &str) -> Result<String> {
+    let Some((scheme, _rest)) = endpoint.split_once("://") else {
+        return Err(anyhow!(
+            "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"
+        ));
+    };
+    match scheme {
+        "unix" => {
+            let path = endpoint
+                .strip_prefix("unix://")
+                .expect("scheme checked")
+                .trim();
+            if path.is_empty() {
+                return Err(anyhow!("{scope} endpoint `unix://` is missing a path"));
+            }
+            Ok(format!("unix://{path}"))
+        }
+        "ws" | "wss" => {
+            validate_endpoint_syntax(scope, endpoint)?;
+            let url = Url::parse(endpoint)
+                .with_context(|| format!("{scope} has invalid websocket endpoint `{endpoint}`"))?;
+            Ok(url.to_string())
         }
         _ => Err(anyhow!(
             "{scope} endpoint `{endpoint}` must use unix://, ws://, or wss://"

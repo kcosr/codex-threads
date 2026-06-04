@@ -363,7 +363,7 @@ async fn servers_command(
         None => {
             if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
                 return Err(usage_error(
-                    "--connect-auth-token and --connect-auth-token-env require --connect",
+                    "--connect-auth-token and --connect-auth-token-env are not valid for servers listing",
                 ));
             }
             let rows: Vec<_> = config
@@ -404,13 +404,43 @@ async fn servers_command(
                     "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
                 ));
             }
-            let targets = if ping.all {
-                config
-                    .servers
-                    .iter()
-                    .map(|(server, cfg)| Target::configured(server, cfg, &config))
-                    .collect::<Result<Vec<_>>>()?
-            } else {
+            if ping.all {
+                let mut results = Vec::new();
+                for (server, cfg) in &config.servers {
+                    let ok = match Target::configured(server, cfg, &config) {
+                        Ok(target) => RpcClient::connect(&target.endpoint).await.is_ok(),
+                        Err(_) => false,
+                    };
+                    results.push(json!({"server": server, "ok": ok}));
+                }
+                if ping.json {
+                    print_json(&json!({"servers": results}))?;
+                } else {
+                    print_table(
+                        &["SERVER", "STATUS"],
+                        results
+                            .iter()
+                            .map(|row| {
+                                vec![
+                                    table_cell(row["server"].as_str().unwrap_or("")),
+                                    table_cell(if row["ok"].as_bool() == Some(true) {
+                                        "ok"
+                                    } else {
+                                        "error"
+                                    }),
+                                ]
+                            })
+                            .collect(),
+                    );
+                }
+                return Ok(if results.iter().all(|r| r["ok"].as_bool() == Some(true)) {
+                    0
+                } else {
+                    3
+                });
+            }
+
+            let targets = {
                 let target = if let Some(endpoint) = connect {
                     resolve_direct_target(endpoint, connect_auth_token_env, connect_auth_token)?
                 } else {

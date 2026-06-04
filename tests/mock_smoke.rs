@@ -889,6 +889,73 @@ fn configured_ws_server_sends_literal_auth_token() {
 }
 
 #[test]
+fn servers_listing_does_not_resolve_auth_token_env() {
+    let server = MockServer::start();
+    write_config(
+        &server,
+        format!(
+            r#"[servers.local]
+endpoint = "{}"
+
+[servers.remote]
+endpoint = "ws://127.0.0.1:9"
+auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
+"#,
+            server.endpoint()
+        ),
+    );
+
+    let output = server
+        .command()
+        .env_remove("CODEX_THREADS_MISSING_TOKEN")
+        .args(["servers", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("json output");
+    assert_eq!(value["servers"].as_array().unwrap().len(), 2);
+    assert_eq!(value["servers"][0]["alias"], "local");
+    assert_eq!(value["servers"][1]["alias"], "remote");
+    assert_eq!(value["servers"][1]["endpoint"], "ws://127.0.0.1:9/");
+}
+
+#[test]
+fn servers_ping_all_reports_unresolved_auth_token_env_per_server() {
+    let server = MockServer::start();
+    write_config(
+        &server,
+        format!(
+            r#"[servers.local]
+endpoint = "{}"
+
+[servers.remote]
+endpoint = "ws://127.0.0.1:9"
+auth_token_env = "CODEX_THREADS_MISSING_TOKEN"
+"#,
+            server.endpoint()
+        ),
+    );
+
+    let output = server
+        .command()
+        .env_remove("CODEX_THREADS_MISSING_TOKEN")
+        .args(["servers", "ping", "--all", "--json"])
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("json output");
+    assert_eq!(value["servers"][0], json!({"server": "local", "ok": true}));
+    assert_eq!(
+        value["servers"][1],
+        json!({"server": "remote", "ok": false})
+    );
+}
+
+#[test]
 fn connect_ws_sends_literal_auth_token() {
     let server = TcpMockServer::start(Some("direct-token"));
     Command::cargo_bin("codex-threads")
