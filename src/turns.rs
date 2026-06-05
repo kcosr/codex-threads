@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
+#[cfg(feature = "tui")]
+use tokio::sync::mpsc;
 
 use crate::config::Target;
 use crate::errors::app_server_error;
@@ -43,6 +45,14 @@ pub struct AttachTurnOptions {
     pub yolo: bool,
     pub poll_limit: u32,
     pub timeout: Duration,
+}
+
+#[cfg(feature = "tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnControl {
+    PollNow,
+    Detach,
+    Interrupt,
 }
 
 #[cfg(feature = "tui")]
@@ -94,6 +104,7 @@ pub async fn attach_turn<F, G>(
     target: &Target,
     client: &mut RpcClient,
     options: AttachTurnOptions,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
     on_event: F,
     on_assistant_text_from_poll: G,
 ) -> Result<TurnWaitOutcome>
@@ -103,7 +114,7 @@ where
 {
     resume_thread_for_action(client, &options.thread_id, options.yolo).await?;
     let attached = json!({"type": "attached", "server": target.server, "threadId": options.thread_id, "turnId": options.turn_id, "status": "attached"});
-    wait_for_turn(
+    wait_for_turn_controlled(
         target,
         client,
         StartedTurn {
@@ -114,10 +125,139 @@ where
         },
         options.poll_limit,
         options.timeout,
+        control_rx,
+        true,
         on_event,
         on_assistant_text_from_poll,
     )
     .await
+}
+
+#[cfg(feature = "tui")]
+pub async fn wait_for_turn_controlled<F, G>(
+    target: &Target,
+    client: &mut RpcClient,
+    started: StartedTurn,
+    poll_limit: u32,
+    timeout: Duration,
+    mut control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    unsubscribe_on_detach: bool,
+    mut on_event: F,
+    mut on_assistant_text_from_poll: G,
+) -> Result<TurnWaitOutcome>
+where
+    F: FnMut(&Value) -> Result<()>,
+    G: FnMut(&str) -> Result<()>,
+{
+    let mut events = vec![started.acceptance];
+    let mut assistant_text = String::new();
+    let wait = TurnWaitContext {
+        target,
+        thread_id: &started.thread_id,
+        turn_id: &started.turn_id,
+        poll_limit,
+    };
+    for notification in started.early_notifications {
+        let before_len = events.len();
+        if let Some(terminal) =
+            process_turn_notification(&wait, notification, &mut assistant_text, &mut events)?
+        {
+            if events.len() > before_len {
+                on_event(events.last().expect("terminal event just pushed"))?;
+            }
+            return Ok(TurnWaitOutcome::Terminal(terminal));
+        }
+        if events.len() > before_len {
+            on_event(events.last().expect("event just pushed"))?;
+        }
+    }
+
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let turn_timeout = tokio::time::sleep(timeout);
+    tokio::pin!(turn_timeout);
+    loop {
+        tokio::select! {
+            _ = &mut turn_timeout => {
+                return Err(app_server_error(format!(
+                    "timed out waiting for turn `{}` to complete",
+                    started.turn_id
+                )));
+            }
+            control = control_rx.recv() => {
+                match control {
+                    Some(TurnControl::PollNow) => {
+                        let before_len = events.len();
+                        if let Some(terminal) = poll_turn_completion(
+                            client,
+                            &wait,
+                            &mut assistant_text,
+                            &mut events,
+                            &mut on_assistant_text_from_poll,
+                        ).await? {
+                            if events.len() > before_len {
+                                on_event(events.last().expect("terminal event just pushed"))?;
+                            }
+                            return Ok(TurnWaitOutcome::Terminal(terminal));
+                        }
+                    }
+                    Some(TurnControl::Detach) | None => {
+                        if unsubscribe_on_detach {
+                            let _ = client
+                                .request("thread/unsubscribe", json!({"threadId": started.thread_id}), |_| {})
+                                .await;
+                        }
+                        return Ok(TurnWaitOutcome::LocalInterrupt {
+                            thread_id: started.thread_id,
+                            turn_id: started.turn_id,
+                        });
+                    }
+                    Some(TurnControl::Interrupt) => {
+                        let _ = client
+                            .request(
+                                "turn/interrupt",
+                                json!({"threadId": started.thread_id, "turnId": started.turn_id}),
+                                |_| {},
+                            )
+                            .await?;
+                    }
+                }
+            }
+            notification = client.next_notification_or_request() => {
+                let notification = notification?;
+                let before_len = events.len();
+                if let Some(terminal) = process_turn_notification(
+                    &wait,
+                    notification,
+                    &mut assistant_text,
+                    &mut events,
+                )? {
+                    if events.len() > before_len {
+                        on_event(events.last().expect("terminal event just pushed"))?;
+                    }
+                    return Ok(TurnWaitOutcome::Terminal(terminal));
+                }
+                if events.len() > before_len {
+                    on_event(events.last().expect("event just pushed"))?;
+                }
+            }
+            _ = poll.tick() => {
+                let before_len = events.len();
+                if let Some(terminal) = poll_turn_completion(
+                    client,
+                    &wait,
+                    &mut assistant_text,
+                    &mut events,
+                    &mut on_assistant_text_from_poll,
+                ).await? {
+                    if events.len() > before_len {
+                        on_event(events.last().expect("terminal event just pushed"))?;
+                    }
+                    return Ok(TurnWaitOutcome::Terminal(terminal));
+                }
+            }
+        }
+    }
 }
 
 struct TurnWaitContext<'a> {

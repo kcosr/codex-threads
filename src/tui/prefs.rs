@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use fd_lock::RwLock;
@@ -17,16 +18,40 @@ const LOCK_FILE: &str = "tui.json.lock";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TuiPrefs {
     pub version: u32,
-    #[serde(rename = "visibleColumns")]
-    pub visible_columns: VisibleColumns,
-    #[serde(rename = "sortKey")]
-    pub sort_key: Option<SortKey>,
-    #[serde(rename = "sortDescending")]
-    pub sort_descending: bool,
-    #[serde(rename = "autoRefresh")]
-    pub auto_refresh: bool,
-    #[serde(rename = "autoRefreshSeconds")]
-    pub auto_refresh_seconds: u64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+    pub browser: BrowserPrefs,
+    pub detail: DetailPrefs,
+    pub refresh: RefreshPrefs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedPrefs {
+    pub prefs: TuiPrefs,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserPrefs {
+    pub columns: VisibleColumns,
+    pub sort: Option<SortKey>,
+    pub direction: SortDirectionPref,
+    #[serde(rename = "previewPane")]
+    pub preview_pane: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetailPrefs {
+    #[serde(rename = "messageMode")]
+    pub message_mode: MessageMode,
+    pub wrap: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshPrefs {
+    pub auto: bool,
+    #[serde(rename = "intervalSeconds")]
+    pub interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,15 +62,56 @@ pub struct VisibleColumns {
     pub annotation: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirectionPref {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageMode {
+    Summary,
+}
+
 impl Default for TuiPrefs {
     fn default() -> Self {
         Self {
             version: PREFS_VERSION,
-            visible_columns: VisibleColumns::default(),
-            sort_key: Some(SortKey::Updated),
-            sort_descending: true,
-            auto_refresh: false,
-            auto_refresh_seconds: 30,
+            updated_at: now_epoch_seconds(),
+            browser: BrowserPrefs::default(),
+            detail: DetailPrefs::default(),
+            refresh: RefreshPrefs::default(),
+        }
+    }
+}
+
+impl Default for BrowserPrefs {
+    fn default() -> Self {
+        Self {
+            columns: VisibleColumns::default(),
+            sort: Some(SortKey::Updated),
+            direction: SortDirectionPref::Desc,
+            preview_pane: true,
+        }
+    }
+}
+
+impl Default for DetailPrefs {
+    fn default() -> Self {
+        Self {
+            message_mode: MessageMode::Summary,
+            wrap: true,
+        }
+    }
+}
+
+impl Default for RefreshPrefs {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            interval_seconds: 30,
         }
     }
 }
@@ -81,8 +147,17 @@ pub fn resolve_prefs_path_from(
         .join(PREFS_FILE)
 }
 
-pub fn load_prefs() -> TuiPrefs {
-    read_prefs().unwrap_or_default()
+pub fn load_prefs_with_warning() -> LoadedPrefs {
+    match read_prefs() {
+        Ok(prefs) => LoadedPrefs {
+            prefs,
+            warning: None,
+        },
+        Err(err) => LoadedPrefs {
+            prefs: TuiPrefs::default(),
+            warning: Some(format!("TUI prefs reset: {err:#}")),
+        },
+    }
 }
 
 pub fn save_prefs(prefs: &TuiPrefs) -> Result<()> {
@@ -94,24 +169,62 @@ pub fn save_prefs(prefs: &TuiPrefs) -> Result<()> {
         .with_context(|| format!("failed to create TUI prefs dir `{}`", parent.display()))?;
     let mut lock = prefs_lock(&path)?;
     let _guard = lock.write()?;
-    write_prefs_atomic(&path, prefs)
+    let mut prefs = prefs.clone();
+    prefs.version = PREFS_VERSION;
+    prefs.updated_at = now_epoch_seconds();
+    write_prefs_atomic(&path, &prefs)
 }
 
 fn read_prefs() -> Result<TuiPrefs> {
     let path = prefs_path();
+    read_prefs_from_path(&path)
+}
+
+fn read_prefs_from_path(path: &Path) -> Result<TuiPrefs> {
     if !path.exists() {
         return Ok(TuiPrefs::default());
     }
     let lock = prefs_lock(&path)?;
     let _guard = lock.read()?;
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read TUI prefs `{}`", path.display()))?;
-    let prefs: TuiPrefs = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse TUI prefs `{}`", path.display()))?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            backup_corrupt_prefs(&path);
+            return Err(err)
+                .with_context(|| format!("failed to read TUI prefs `{}`", path.display()));
+        }
+    };
+    let prefs: TuiPrefs = match serde_json::from_str(&text) {
+        Ok(prefs) => prefs,
+        Err(err) => {
+            backup_corrupt_prefs(&path);
+            return Err(err)
+                .with_context(|| format!("failed to parse TUI prefs `{}`", path.display()));
+        }
+    };
     if prefs.version != PREFS_VERSION {
-        return Ok(TuiPrefs::default());
+        backup_corrupt_prefs(&path);
+        return Err(anyhow!(
+            "unsupported TUI prefs version {}; expected {PREFS_VERSION}",
+            prefs.version
+        ));
     }
     Ok(prefs)
+}
+
+fn backup_corrupt_prefs(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let backup = path.with_file_name(format!("{PREFS_FILE}.corrupt.{}", now_epoch_seconds()));
+    let _ = fs::rename(path, backup);
+}
+
+fn now_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn prefs_lock(path: &Path) -> Result<RwLock<File>> {
@@ -172,6 +285,7 @@ fn write_prefs_atomic(path: &Path, prefs: &TuiPrefs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn prefs_path_uses_shared_state_dir() {
@@ -191,5 +305,44 @@ mod tests {
             resolve_prefs_path_from(None, None, Path::new("/home/tester")),
             PathBuf::from("/home/tester/.local/state/codex-threads/tui.json")
         );
+    }
+
+    #[test]
+    fn prefs_schema_matches_nested_design_shape() {
+        let prefs = TuiPrefs::default();
+        let value = serde_json::to_value(&prefs).expect("prefs json");
+        assert_eq!(value["version"], PREFS_VERSION);
+        assert!(value["updatedAt"].is_i64());
+        assert_eq!(value["browser"]["columns"]["status"], true);
+        assert_eq!(value["browser"]["sort"], "updated");
+        assert_eq!(value["browser"]["direction"], "desc");
+        assert_eq!(value["browser"]["previewPane"], true);
+        assert_eq!(value["detail"]["messageMode"], "summary");
+        assert_eq!(value["detail"]["wrap"], true);
+        assert_eq!(value["refresh"]["auto"], false);
+        assert_eq!(value["refresh"]["intervalSeconds"], 30);
+        assert!(value.get("visibleColumns").is_none());
+        assert!(value.get("sortKey").is_none());
+    }
+
+    #[test]
+    fn corrupt_prefs_are_backed_up_and_defaulted() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(PREFS_FILE);
+        fs::write(&path, "{not json").expect("prefs");
+        let prefs = read_prefs_from_path(&path).unwrap_or_default();
+        assert_eq!(prefs, TuiPrefs::default());
+        assert!(!path.exists());
+        let backups = fs::read_dir(temp.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tui.json.corrupt.")
+            })
+            .count();
+        assert_eq!(backups, 1);
     }
 }
