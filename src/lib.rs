@@ -3,8 +3,10 @@ mod app;
 mod cli;
 mod completion;
 mod config;
+mod errors;
 mod rpc;
 mod session;
+mod turns;
 
 pub async fn run() -> i32 {
     app::run_cli(std::env::args_os()).await

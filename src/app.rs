@@ -1,6 +1,6 @@
-use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -18,11 +18,16 @@ use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
     resolve_config_path, resolve_direct_target, resolve_target,
 };
+use crate::errors::{ExitError, app_server_error, usage_error};
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
     ShowThreadRequest, ThreadProjection, ThreadStatusRequest, list_threads, load_messages,
     loaded_status, read_thread_detail, search_threads, thread_status,
+};
+use crate::turns::{
+    TurnStartOptions, TurnTerminal, TurnWaitOutcome, start_turn as start_turn_request,
+    wait_for_turn,
 };
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
@@ -32,13 +37,6 @@ const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
 const THREAD_LABEL_WIDTH: usize = 56;
 const SEARCH_SNIPPET_WIDTH: usize = 48;
 const ANNOTATION_WIDTH: usize = 40;
-
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-struct ExitError {
-    code: i32,
-    message: String,
-}
 
 pub async fn run_cli<I, T>(args: I) -> i32
 where
@@ -775,119 +773,111 @@ async fn start_turn(
     prompt: String,
     options: TurnOptions,
 ) -> Result<i32> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(thread_id));
-    params.insert(
-        "input".to_string(),
-        json!([{"type": "text", "text": prompt, "textElements": []}]),
-    );
-    if options.yolo {
-        insert_turn_yolo_permissions(&mut params);
-    }
-    insert_opt(&mut params, "model", options.model);
     if let Some(effort) = options.effort.as_deref() {
         validate_effort(effort)?;
-        params.insert("effort".to_string(), json!(effort));
     }
-    if let Some(tier) = options.service_tier {
-        params.insert("serviceTier".to_string(), json!(tier));
-    }
-    let early_notifications = RefCell::new(Vec::new());
-    let params = Value::Object(params);
-    let result = request_with_resume_retry(
+    let json_out = options.json;
+    let stream = options.stream;
+    let no_wait = options.no_wait;
+
+    let started = start_turn_request(
+        &target,
         &mut client,
-        "turn/start",
-        params,
-        &thread_id,
-        options.yolo,
-        || {
-            early_notifications.borrow_mut().clear();
-        },
-        |notification| {
-            early_notifications.borrow_mut().push(notification);
+        thread_id,
+        prompt,
+        TurnStartOptions {
+            model: options.model,
+            effort: options.effort,
+            service_tier: options.service_tier,
+            yolo: options.yolo,
         },
     )
     .await?;
-    let turn_id = result["turn"]["id"]
-        .as_str()
-        .ok_or_else(|| app_server_error("turn/start response missing turn.id"))?
-        .to_string();
-    let acceptance = json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": turn_id, "status": "accepted"});
-    if options.json && options.stream {
-        println!("{}", serde_json::to_string(&acceptance)?);
-    } else if options.json && options.no_wait {
-        print_json(&acceptance)?;
-    } else if !options.json {
+    if json_out && stream {
+        println!("{}", serde_json::to_string(&started.acceptance)?);
+    } else if json_out && no_wait {
+        print_json(&started.acceptance)?;
+    } else if !json_out {
         print_key_values(&[
             ("server", target.server.as_str()),
-            ("threadId", thread_id.as_str()),
-            ("turnId", turn_id.as_str()),
+            ("threadId", started.thread_id.as_str()),
+            ("turnId", started.turn_id.as_str()),
             ("status", "accepted"),
         ]);
     }
-    if options.no_wait {
+    if no_wait {
         return Ok(0);
     }
 
-    let mut events = vec![acceptance];
-    let mut assistant_text = String::new();
-    let wait = TurnWaitContext {
-        target: &target,
-        thread_id: &thread_id,
-        turn_id: &turn_id,
-        json_out: options.json,
-        stream: options.stream,
-    };
-    for notification in early_notifications.into_inner() {
-        if let Some(code) =
-            process_turn_notification(&wait, notification, &mut assistant_text, &mut events)?
-        {
-            return Ok(code);
-        }
-    }
-    let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let turn_timeout = tokio::time::sleep(std::time::Duration::from_secs(TURN_WAIT_TIMEOUT_SECS));
-    tokio::pin!(turn_timeout);
-    loop {
-        tokio::select! {
-            _ = &mut turn_timeout => {
-                return Err(app_server_error(format!(
-                    "timed out waiting for turn `{turn_id}` to complete"
-                )));
+    let outcome = wait_for_turn(
+        &target,
+        &mut client,
+        started,
+        TURN_SCAN_LIMIT,
+        Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+        |event| {
+            if json_out && stream {
+                println!("{}", serde_json::to_string(event)?);
+            } else if !json_out {
+                print_human_event(event);
             }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("interrupted locally; turn is still running");
-                eprint!("{}", key_values_text(&[
+            Ok(())
+        },
+        |text| {
+            if !json_out && !text.is_empty() {
+                println!("{text}");
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    match outcome {
+        TurnWaitOutcome::Terminal(terminal) => {
+            emit_turn_terminal_output(json_out, stream, &terminal, target.server.as_str())
+        }
+        TurnWaitOutcome::LocalInterrupt { thread_id, turn_id } => {
+            eprintln!("interrupted locally; turn is still running");
+            eprint!(
+                "{}",
+                key_values_text(&[
                     ("server", target.server.as_str()),
                     ("threadId", thread_id.as_str()),
                     ("turnId", turn_id.as_str()),
-                ]));
-                return Ok(130);
-            }
-            notification = client.next_notification_or_request() => {
-                let notification = notification?;
-                if let Some(code) = process_turn_notification(
-                    &wait,
-                    notification,
-                    &mut assistant_text,
-                    &mut events,
-                )? {
-                    return Ok(code);
-                }
-            }
-            _ = poll.tick() => {
-                if let Some(code) = poll_turn_completion(
-                    &mut client,
-                    &wait,
-                    &mut assistant_text,
-                    &mut events,
-                ).await? {
-                    return Ok(code);
-                }
-            }
+                ])
+            );
+            Ok(130)
         }
     }
+}
+
+fn emit_turn_terminal_output(
+    json_out: bool,
+    stream: bool,
+    terminal: &TurnTerminal,
+    server: &str,
+) -> Result<i32> {
+    if json_out && !stream {
+        print_json(&terminal.output)?;
+    } else if !json_out {
+        if terminal
+            .output
+            .get("progress")
+            .and_then(Value::as_array)
+            .is_some_and(|events| events.iter().any(|event| event.get("delta").is_some()))
+        {
+            println!();
+        }
+        print_key_values(&[
+            ("status", terminal.output["status"].as_str().unwrap_or("")),
+            ("server", server),
+            (
+                "threadId",
+                terminal.output["threadId"].as_str().unwrap_or(""),
+            ),
+            ("turnId", terminal.output["turnId"].as_str().unwrap_or("")),
+        ]);
+    }
+    Ok(terminal.exit_code)
 }
 
 fn print_legacy_warnings(config: &AppConfig) {
@@ -972,142 +962,6 @@ fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str)
     error.method == method
         && error.error.code == -32600
         && error.error.message == format!("thread not found: {thread_id}")
-}
-
-struct TurnWaitContext<'a> {
-    target: &'a Target,
-    thread_id: &'a str,
-    turn_id: &'a str,
-    json_out: bool,
-    stream: bool,
-}
-
-async fn poll_turn_completion(
-    client: &mut RpcClient,
-    wait: &TurnWaitContext<'_>,
-    assistant_text: &mut String,
-    events: &mut Vec<Value>,
-) -> Result<Option<i32>> {
-    let mut notifications = Vec::new();
-    let result = client
-        .request(
-            "thread/turns/list",
-            json!({"threadId": wait.thread_id, "limit": TURN_SCAN_LIMIT, "sortDirection": "desc", "itemsView": "full"}),
-            |notification| notifications.push(notification),
-        )
-        .await?;
-    for notification in notifications {
-        if let Some(code) = process_turn_notification(wait, notification, assistant_text, events)? {
-            return Ok(Some(code));
-        }
-    }
-
-    let turn = result["data"].as_array().and_then(|turns| {
-        turns
-            .iter()
-            .find(|turn| turn["id"].as_str() == Some(wait.turn_id))
-    });
-    let Some(turn) = turn else {
-        return Ok(None);
-    };
-    reject_unknown_turn_status(turn)?;
-    let status = turn_status(turn);
-    if !matches!(status, "completed" | "failed" | "interrupted") {
-        return Ok(None);
-    }
-    if assistant_text.is_empty() {
-        *assistant_text = extract_assistant_text_from_turn(turn);
-        if !wait.json_out && !assistant_text.is_empty() {
-            println!("{assistant_text}");
-        }
-    }
-    let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": wait.turn_id, "status": status, "source": "poll"});
-    if wait.json_out && wait.stream {
-        println!("{}", serde_json::to_string(&event)?);
-    }
-    events.push(event);
-    emit_turn_terminal(wait, status, assistant_text, events)
-}
-
-fn process_turn_notification(
-    wait: &TurnWaitContext<'_>,
-    notification: Notification,
-    assistant_text: &mut String,
-    events: &mut Vec<Value>,
-) -> Result<Option<i32>> {
-    let Some(event) = turn_event(
-        &wait.target.server,
-        wait.thread_id,
-        wait.turn_id,
-        notification,
-        assistant_text,
-    )?
-    else {
-        return Ok(None);
-    };
-    if wait.json_out && wait.stream {
-        println!("{}", serde_json::to_string(&event)?);
-    } else if !wait.json_out {
-        print_human_event(&event);
-    }
-
-    let status = event["status"].as_str().map(str::to_string);
-    events.push(event);
-    if !matches!(
-        status.as_deref(),
-        Some("completed" | "failed" | "interrupted")
-    ) {
-        return Ok(None);
-    }
-
-    let status = status.expect("status checked");
-    emit_turn_terminal(wait, &status, assistant_text, events)
-}
-
-fn emit_turn_terminal(
-    wait: &TurnWaitContext<'_>,
-    status: &str,
-    assistant_text: &str,
-    events: &[Value],
-) -> Result<Option<i32>> {
-    let output = json!({
-        "server": wait.target.server,
-        "threadId": wait.thread_id,
-        "turnId": wait.turn_id,
-        "status": status,
-        "progress": events,
-        "assistantResponses": if assistant_text.is_empty() { Vec::<Value>::new() } else { vec![json!({"text": assistant_text})] },
-        "finalAssistantText": assistant_text
-    });
-    if wait.json_out && !wait.stream {
-        print_json(&output)?;
-    } else if !wait.json_out {
-        if events.iter().any(|event| event.get("delta").is_some()) {
-            println!();
-        }
-        print_key_values(&[
-            ("status", output["status"].as_str().unwrap_or("")),
-            ("server", wait.target.server.as_str()),
-            ("threadId", wait.thread_id),
-            ("turnId", wait.turn_id),
-        ]);
-    }
-    Ok(Some(if output["status"].as_str() == Some("completed") {
-        0
-    } else {
-        1
-    }))
-}
-
-fn extract_assistant_text_from_turn(turn: &Value) -> String {
-    turn["items"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter(|item| item["type"].as_str() == Some("agentMessage"))
-        .filter_map(|item| item["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 async fn settings_show_command(
@@ -1565,53 +1419,6 @@ async fn goal_clear_command(
         .await?;
     let output = json!({"server": target.server, "threadId": command.thread_id, "cleared": result["cleared"], "status": "accepted"});
     emit_json_or_status(command.json, &output)
-}
-
-fn turn_event(
-    server: &str,
-    thread_id: &str,
-    turn_id: &str,
-    notification: Notification,
-    assistant_text: &mut String,
-) -> Result<Option<Value>> {
-    match notification.method.as_str() {
-        "item/agentMessage/delta"
-            if notification.params["threadId"] == thread_id
-                && notification.params["turnId"] == turn_id =>
-        {
-            let delta = notification.params["delta"].as_str().unwrap_or("");
-            assistant_text.push_str(delta);
-            Ok(Some(
-                json!({"type": "progress", "server": server, "threadId": thread_id, "turnId": turn_id, "delta": delta}),
-            ))
-        }
-        "item/completed"
-            if notification.params["threadId"] == thread_id
-                && notification.params["turnId"] == turn_id =>
-        {
-            if notification.params["item"]["type"].as_str() == Some("agentMessage")
-                && let Some(text) = notification.params["item"]["text"].as_str()
-                && assistant_text.is_empty()
-            {
-                assistant_text.push_str(text);
-                return Ok(Some(
-                    json!({"type": "assistantMessage", "server": server, "threadId": thread_id, "turnId": turn_id, "text": text}),
-                ));
-            }
-            Ok(None)
-        }
-        "turn/completed"
-            if notification.params["threadId"] == thread_id
-                && notification.params["turn"]["id"] == turn_id =>
-        {
-            reject_unknown_turn_status(&notification.params["turn"])?;
-            let status = turn_status(&notification.params["turn"]);
-            Ok(Some(
-                json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status}),
-            ))
-        }
-        _ => Ok(None),
-    }
 }
 
 fn print_human_event(event: &Value) {
@@ -2114,33 +1921,12 @@ fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
     map.insert("sandbox".to_string(), json!("danger-full-access"));
 }
 
-fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
-    // Turn start uses the newer SandboxPolicy object shape.
-    map.insert("approvalPolicy".to_string(), json!("never"));
-    map.insert(
-        "sandboxPolicy".to_string(),
-        json!({"type": "dangerFullAccess"}),
-    );
-}
-
 fn turn_status(turn: &Value) -> &'static str {
     match turn["status"].as_str().unwrap_or("inProgress") {
         "completed" => "completed",
         "interrupted" => "interrupted",
         "failed" => "failed",
         _ => "inProgress",
-    }
-}
-
-fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
-    let Some(status) = turn["status"].as_str() else {
-        return Ok(());
-    };
-    match status {
-        "completed" | "interrupted" | "failed" | "inProgress" | "running" | "pending" => Ok(()),
-        _ => Err(app_server_error(format!(
-            "app-server returned unrecognized turn status `{status}`"
-        ))),
     }
 }
 
@@ -2209,20 +1995,4 @@ fn classify_error(err: &anyhow::Error) -> i32 {
     } else {
         2
     }
-}
-
-fn usage_error(message: impl Into<String>) -> anyhow::Error {
-    ExitError {
-        code: 2,
-        message: message.into(),
-    }
-    .into()
-}
-
-fn app_server_error(message: impl Into<String>) -> anyhow::Error {
-    ExitError {
-        code: 3,
-        message: message.into(),
-    }
-    .into()
 }
