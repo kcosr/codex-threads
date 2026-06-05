@@ -8,6 +8,8 @@ use crate::tui::keymap::{BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_HELP};
 use crate::tui::state::{BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState};
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
+const BROWSER_COLUMN_SPACING: u16 = 2;
+
 pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -192,7 +194,7 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ),
         )
         .block(Block::default().title(title).borders(Borders::ALL))
-        .column_spacing(1);
+        .column_spacing(BROWSER_COLUMN_SPACING);
     frame.render_widget(table, table_area);
     if let Some(area) = preview_area {
         draw_browser_preview(frame, area, state);
@@ -229,7 +231,7 @@ fn browser_column_widths(
         + usize::from(visible.updated)
         + usize::from(visible.cwd)
         + usize::from(visible.annotation);
-    let spacing = column_count.saturating_sub(1) as u16;
+    let spacing = column_count.saturating_sub(1) as u16 * BROWSER_COLUMN_SPACING;
     let available = table_width
         .saturating_sub(2)
         .saturating_sub(spacing)

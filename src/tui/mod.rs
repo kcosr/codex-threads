@@ -1794,7 +1794,7 @@ fn thread_row(item: Value, source: BrowserSource) -> ThreadRow {
         .to_string();
     let updated = thread["updatedAt"]
         .as_i64()
-        .map(format_epoch)
+        .map(format_browser_updated_epoch)
         .unwrap_or_default();
     let cwd = thread["cwd"].as_str().unwrap_or("").to_string();
     let annotation = thread["annotation"]["text"].as_str().map(str::to_string);
@@ -2198,6 +2198,28 @@ fn format_epoch(value: i64) -> String {
         .unwrap_or_default()
 }
 
+fn format_browser_updated_epoch(value: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_browser_updated_epoch_at(value, now)
+}
+
+fn format_browser_updated_epoch_at(value: i64, now: i64) -> String {
+    let age = now.saturating_sub(value);
+    if value <= now && age < 24 * 60 * 60 {
+        if age < 60 {
+            return format!("{age}s ago");
+        }
+        if age < 60 * 60 {
+            return format!("{}m ago", age / 60);
+        }
+        return format!("{}h ago", age / (60 * 60));
+    }
+    format_epoch(value)
+}
+
 fn parse_since(since: &str) -> Result<i64> {
     if let Ok(timestamp) = since.parse::<i64>() {
         return Ok(timestamp);
@@ -2336,6 +2358,26 @@ mod tests {
         assert_eq!(state.browser.current_cursor.as_deref(), Some("page-2"));
         assert_eq!(state.browser.next_cursor.as_deref(), Some("older"));
         assert_eq!(state.browser.backwards_cursor.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn browser_updated_time_is_relative_within_24_hours() {
+        let now = 1_700_000_000;
+
+        assert_eq!(format_browser_updated_epoch_at(now - 30, now), "30s ago");
+        assert_eq!(format_browser_updated_epoch_at(now - 5 * 60, now), "5m ago");
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 2 * 60 * 60, now),
+            "2h ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 24 * 60 * 60, now),
+            "2023-11-13 22:13"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now + 60, now),
+            "2023-11-14 22:14"
+        );
     }
 
     #[test]
