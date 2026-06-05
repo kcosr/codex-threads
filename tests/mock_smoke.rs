@@ -759,7 +759,10 @@ fn sample_thread_with_updated(id: &str, updated_at: i64) -> Value {
         "cwd": "/tmp/mock-work",
         "status": { "type": "idle" },
         "createdAt": 1_700_000_000_i64,
-        "updatedAt": updated_at
+        "updatedAt": updated_at,
+        "experimentalThreadField": {
+            "retained": true
+        }
     })
 }
 
@@ -781,6 +784,7 @@ fn sample_turn() -> Value {
         "status": "completed",
         "startedAt": 1_700_000_050_i64,
         "completedAt": 1_700_000_060_i64,
+        "experimentalTurnField": "retained",
         "items": [
             {
                 "id": "item_user",
@@ -819,6 +823,22 @@ fn run_json_with_state(server: &MockServer, state: &TempDir, args: &[&str]) -> V
         .stdout
         .clone();
     serde_json::from_slice(&output).expect("json output")
+}
+
+fn run_ndjson(server: &MockServer, args: &[&str]) -> Vec<Value> {
+    let output = server
+        .command()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("ndjson"))
+        .collect()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -2171,6 +2191,227 @@ fn no_yolo_uses_app_server_permission_defaults() {
     for params in server.params_for("thread/resume") {
         assert_no_yolo_params(&params);
     }
+}
+
+#[test]
+fn golden_json_output_shapes_are_stable() {
+    let server = MockServer::start();
+
+    assert_eq!(
+        run_json(&server, &["list", "--server", "work", "--json"]),
+        json!({
+            "server": "work",
+            "threads": [
+                {
+                    "id": "thread_1",
+                    "name": "Mock Thread",
+                    "preview": "Mock preview",
+                    "cwd": "/tmp/mock-work",
+                    "status": { "type": "idle" },
+                    "createdAt": 1_700_000_000_i64,
+                    "updatedAt": 1_700_000_100_i64,
+                    "experimentalThreadField": { "retained": true }
+                }
+            ],
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null
+        })
+    );
+
+    assert_eq!(
+        run_json(&server, &["search", "--server", "work", "--json", "mock"]),
+        json!({
+            "server": "work",
+            "results": [
+                {
+                    "thread": {
+                        "id": "thread_1",
+                        "name": "Mock Thread",
+                        "preview": "Mock preview",
+                        "cwd": "/tmp/mock-work",
+                        "status": { "type": "idle" },
+                        "createdAt": 1_700_000_000_i64,
+                        "updatedAt": 1_700_000_100_i64,
+                        "experimentalThreadField": { "retained": true }
+                    },
+                    "score": 1.0
+                }
+            ],
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null
+        })
+    );
+
+    assert_eq!(
+        run_json(&server, &["show", "--server", "work", "--json", "thread_1"]),
+        json!({
+            "server": "work",
+            "thread": {
+                "id": "thread_1",
+                "name": "Mock Thread",
+                "preview": "Mock preview",
+                "cwd": "/tmp/mock-work",
+                "status": { "type": "idle" },
+                "createdAt": 1_700_000_000_i64,
+                "updatedAt": 1_700_000_100_i64,
+                "experimentalThreadField": { "retained": true }
+            },
+            "turns": {
+                "data": [
+                    {
+                        "id": "turn_1",
+                        "status": "completed",
+                        "startedAt": 1_700_000_050_i64,
+                        "completedAt": 1_700_000_060_i64,
+                        "experimentalTurnField": "retained",
+                        "items": [
+                            {
+                                "id": "item_user",
+                                "type": "userMessage",
+                                "content": [{ "type": "text", "text": "hello" }]
+                            },
+                            {
+                                "id": "item_agent",
+                                "type": "agentMessage",
+                                "text": "done"
+                            }
+                        ]
+                    }
+                ],
+                "nextCursor": Value::Null,
+                "backwardsCursor": Value::Null
+            }
+        })
+    );
+
+    assert_eq!(
+        run_json(
+            &server,
+            &["messages", "--server", "work", "--json", "thread_1"]
+        ),
+        json!({
+            "server": "work",
+            "threadId": "thread_1",
+            "messages": [
+                {
+                    "role": "user",
+                    "text": "hello",
+                    "turnId": "turn_1",
+                    "itemId": "item_user",
+                    "turnStartedAt": 1_700_000_050_i64,
+                    "turnCompletedAt": 1_700_000_060_i64
+                },
+                {
+                    "role": "assistant",
+                    "text": "done",
+                    "turnId": "turn_1",
+                    "itemId": "item_agent",
+                    "turnStartedAt": 1_700_000_050_i64,
+                    "turnCompletedAt": 1_700_000_060_i64
+                }
+            ],
+            "truncated": false,
+            "nextCursor": Value::Null
+        })
+    );
+
+    assert_eq!(
+        run_json(
+            &server,
+            &["status", "--server", "work", "--json", "thread_1"]
+        ),
+        json!({
+            "server": "work",
+            "threadId": "thread_1",
+            "thread": {
+                "id": "thread_1",
+                "name": "Mock Thread",
+                "preview": "Mock preview",
+                "cwd": "/tmp/mock-work",
+                "status": { "type": "idle" },
+                "createdAt": 1_700_000_000_i64,
+                "updatedAt": 1_700_000_100_i64,
+                "experimentalThreadField": { "retained": true }
+            },
+            "activeTurnId": Value::Null,
+            "truncated": false
+        })
+    );
+}
+
+#[test]
+fn golden_send_json_output_shapes_are_stable() {
+    let server = MockServer::start();
+
+    assert_eq!(
+        run_json(
+            &server,
+            &["send", "--server", "work", "--json", "thread_1", "continue"]
+        ),
+        json!({
+            "server": "work",
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "status": "completed",
+            "progress": [
+                {
+                    "type": "accepted",
+                    "server": "work",
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "status": "accepted"
+                },
+                {
+                    "type": "progress",
+                    "server": "work",
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "delta": "done"
+                },
+                {
+                    "type": "completed",
+                    "server": "work",
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "status": "completed"
+                }
+            ],
+            "assistantResponses": [{ "text": "done" }],
+            "finalAssistantText": "done"
+        })
+    );
+
+    assert_eq!(
+        run_ndjson(
+            &server,
+            &[
+                "send", "--server", "work", "--json", "--stream", "thread_1", "continue",
+            ]
+        ),
+        vec![
+            json!({
+                "type": "accepted",
+                "server": "work",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "status": "accepted"
+            }),
+            json!({
+                "type": "progress",
+                "server": "work",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "delta": "done"
+            }),
+            json!({
+                "type": "completed",
+                "server": "work",
+                "threadId": "thread_1",
+                "turnId": "turn_1",
+                "status": "completed"
+            }),
+        ]
+    );
 }
 
 #[test]
