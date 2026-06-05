@@ -305,30 +305,24 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     let chunks = detail_chunks(area);
     let detail_status = detail_header_status(state);
-    let metadata = vec![Line::from(vec![
-        Span::styled(detail.thread_id.clone(), Style::default().fg(Color::Cyan)),
-        Span::raw("  "),
-        Span::raw(detail_status),
-        Span::raw("  "),
-        Span::raw(
-            detail
-                .active_turn_id
-                .as_ref()
-                .map(|turn_id| format!("active={turn_id}  "))
-                .unwrap_or_default(),
-        ),
-        Span::raw(if detail.next_cursor.is_some() {
-            "older  "
-        } else {
-            ""
-        }),
-        Span::raw(if detail.backwards_cursor.is_some() {
-            "newer  "
-        } else {
-            ""
-        }),
-        Span::raw(detail.annotation.clone().unwrap_or_default()),
-    ])];
+    let connection = detail_connection_label(state);
+    let annotation = detail.annotation.clone().unwrap_or_default();
+    let mut metadata_spans = vec![Span::raw(detail_status)];
+    if let Some(connection) = connection {
+        metadata_spans.push(Span::raw("  "));
+        metadata_spans.push(Span::raw(connection));
+    }
+    if detail.next_cursor.is_some() {
+        metadata_spans.push(Span::raw("  older"));
+    }
+    if detail.backwards_cursor.is_some() {
+        metadata_spans.push(Span::raw("  newer"));
+    }
+    if !annotation.is_empty() {
+        metadata_spans.push(Span::raw("  "));
+        metadata_spans.push(Span::raw(annotation));
+    }
+    let metadata = vec![Line::from(metadata_spans)];
     frame.render_widget(
         Paragraph::new(metadata).block(
             Block::default()
@@ -389,12 +383,41 @@ fn detail_header_status(state: &TuiState) -> String {
     let Some(detail) = &state.detail else {
         return String::new();
     };
-    if let Some(stream) = &state.stream
-        && stream.thread_id == detail.thread_id
-    {
-        return format!("stream={}", format_stream_state_label(stream));
+    if let Some(stream) = matching_detail_stream(state) {
+        return format_stream_status(stream.status).to_string();
+    }
+    if detail.active_turn_id.is_some() {
+        return "running".to_string();
     }
     detail.status.clone()
+}
+
+fn detail_connection_label(state: &TuiState) -> Option<&'static str> {
+    let detail = state.detail.as_ref()?;
+    if let Some(stream) = matching_detail_stream(state) {
+        if stream.detached || stream.status == StreamStatus::Detached {
+            return Some("detached");
+        }
+        if matches!(
+            stream.status,
+            StreamStatus::Starting | StreamStatus::Running
+        ) {
+            return Some("connected");
+        }
+        return None;
+    }
+    if detail.active_turn_id.is_some() {
+        return Some("not connected");
+    }
+    None
+}
+
+fn matching_detail_stream(state: &TuiState) -> Option<&crate::tui::state::StreamState> {
+    let detail = state.detail.as_ref()?;
+    state
+        .stream
+        .as_ref()
+        .filter(|stream| stream.thread_id == detail.thread_id)
 }
 
 fn message_header(message: &crate::tui::state::MessageBlock) -> String {
@@ -457,6 +480,26 @@ fn span_style(span: &MessageSpan, base_style: Style) -> Style {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let status = if draws_detail_background(state) {
+        detail_status_bar(state)
+    } else {
+        browser_status_bar(state)
+    };
+    frame.render_widget(Paragraph::new(status), area);
+}
+
+fn draws_detail_background(state: &TuiState) -> bool {
+    matches!(
+        state.mode,
+        Mode::Detail
+            | Mode::MessageSearchInput { .. }
+            | Mode::Compose(_)
+            | Mode::ActiveTurnPrompt { .. }
+            | Mode::ConfirmInterrupt { .. }
+    ) || (matches!(state.mode, Mode::AnnotationInput { .. }) && state.detail.is_some())
+}
+
+fn browser_status_bar(state: &TuiState) -> String {
     let loading = if state.browser.loading {
         " loading"
     } else {
@@ -474,36 +517,15 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ""
         };
     let stream = state.stream.as_ref().map(format_stream).unwrap_or_default();
-    let message_search = state
-        .detail
-        .as_ref()
-        .filter(|detail| !detail.search_query.is_empty())
-        .map(|detail| {
-            if detail.matches.is_empty() {
-                format!(" message_search={} 0 matches", detail.search_query)
-            } else {
-                format!(
-                    " message_search={} match={}/{}",
-                    detail.search_query,
-                    detail.match_index + 1,
-                    detail.matches.len()
-                )
-            }
-        })
-        .unwrap_or_default();
     let error = state
         .browser
         .last_error
         .as_ref()
         .map(|error| format!(" error={error}"))
         .unwrap_or_default();
-    let notice = state
-        .notice
-        .as_ref()
-        .map(|notice| format!(" {}", notice.message))
-        .unwrap_or_default();
-    let status = format!(
-        "{} rows={}{}{}{}{}{}{}{}",
+    let notice = notice_status(state);
+    format!(
+        "{} rows={}{}{}{}{}{}",
         match state.browser.source {
             BrowserSource::List => "list",
             BrowserSource::Search => "search",
@@ -513,11 +535,48 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         local_cwd,
         loading,
         stream,
-        message_search,
         error,
-        notice
-    );
-    frame.render_widget(Paragraph::new(status), area);
+    ) + &notice
+}
+
+fn detail_status_bar(state: &TuiState) -> String {
+    let notice = state
+        .notice
+        .as_ref()
+        .map(|notice| format!(" {}", notice.message))
+        .unwrap_or_default();
+    let message_search = state
+        .detail
+        .as_ref()
+        .filter(|detail| !detail.search_query.is_empty())
+        .map(|detail| {
+            if detail.matches.is_empty() {
+                format!("message_search={} 0 matches", detail.search_query)
+            } else {
+                format!(
+                    "message_search={} match={}/{}",
+                    detail.search_query,
+                    detail.match_index + 1,
+                    detail.matches.len()
+                )
+            }
+        })
+        .unwrap_or_default();
+    let error = state
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.last_error.as_ref())
+        .map(|error| format!(" error={error}"))
+        .unwrap_or_default();
+    format!("{message_search}{error}{notice}")
+}
+
+fn notice_status(state: &TuiState) -> String {
+    state
+        .notice
+        .as_ref()
+        .map(|notice| format!(" {}", notice.message))
+        .unwrap_or_default()
 }
 
 fn draw_help_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -997,6 +1056,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &state)).unwrap();
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
-        assert!(text.contains("stream=running"));
+        assert!(text.contains("running  connected"));
+        assert!(!text.contains("stream=running"));
+        assert!(!text.contains("thread-1"));
+        assert!(!text.contains("turn-1"));
+        assert!(!text.contains("list rows="));
     }
 }
