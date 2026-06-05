@@ -62,6 +62,7 @@ pub enum Command {
     Models(ModelsCommand),
     Usage(UsageCommand),
     Goal(GoalCommand),
+    Annotate(AnnotateCommand),
     Completion(CompletionCommand),
     #[command(name = "__complete", hide = true)]
     Complete(CompleteCommand),
@@ -394,6 +395,79 @@ pub struct GoalClearCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub thread_id: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateCommand {
+    #[command(subcommand)]
+    pub command: AnnotateSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AnnotateSubcommand {
+    Set(AnnotateSetCommand),
+    Get(AnnotateGetCommand),
+    Clear(AnnotateClearCommand),
+    List(AnnotateListCommand),
+    Search(AnnotateSearchCommand),
+    Prune(AnnotatePruneCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateSetCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    pub text: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateGetCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateClearCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateListCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    #[arg(long)]
+    pub query: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotateSearchCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub query: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AnnotatePruneCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
     #[arg(long)]
     pub json: bool,
 }

@@ -84,6 +84,19 @@ impl Target {
                 .or_else(|| config.model_reasoning_effort.clone()),
         })
     }
+
+    pub fn annotation_namespace(&self) -> String {
+        self.endpoint.display()
+    }
+}
+
+impl Endpoint {
+    pub fn display(&self) -> String {
+        match self {
+            Endpoint::Unix { path } => format!("unix://{}", path.display()),
+            Endpoint::WebSocket { url, .. } => url.clone(),
+        }
+    }
 }
 
 impl ServerConfig {

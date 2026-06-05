@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add local thread annotations with `annotate set/get/clear/list/search/prune`,
+  endpoint-scoped JSON state, and annotation projection in `list`, `search`, and
+  `show` output.
 
 ## [0.1.4] - 2026-06-04
 

@@ -39,6 +39,7 @@ CLI as a safety boundary.
 - Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
   single configured server.
 - Thread list, search, detail, status, and flattened message history commands.
+- Local thread annotations projected into list, search, and detail output.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
   and support JSON final output or newline-delimited JSON (NDJSON) streaming.
@@ -311,9 +312,16 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `goal get THREAD_ID` | Read the active goal. |
 | `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
 | `goal clear THREAD_ID` | Clear the active goal. |
+| `annotate set THREAD_ID TEXT` | Set or replace a local annotation for a thread. |
+| `annotate get THREAD_ID` | Read a local annotation. Missing annotations exit with code `2`. |
+| `annotate clear THREAD_ID` | Clear a local annotation. |
+| `annotate list` | List local annotations for the selected server, optionally filtered with `--query`. |
+| `annotate search QUERY` | Search local annotation text for the selected server. |
+| `annotate prune [--dry-run]` | Remove annotations whose threads are no longer found by app-server. |
 | `completion [SHELL]` | Print shell completion setup instructions for `bash`, `zsh`, or `fish`. |
 
-Every app-server command accepts `--server ALIAS` and `--json`. Global
+Every app-server and annotation command accepts `--server ALIAS` and `--json`.
+Global
 `--config PATH`, `--connect ENDPOINT`, `--connect-auth-token-env ENV_VAR`, and
 `--connect-auth-token TOKEN` may be placed before or after the subcommand
 because they are global options.
@@ -426,13 +434,27 @@ Codex app-server's `account/rateLimits/read` response. Human output summarizes
 the server, plan, credits, rate-limit reached state, and primary/secondary
 windows for each limit ID.
 
+Annotations are local `codex-threads` state, not Codex app-server state. The
+state file is resolved as:
+
+1. `$CODEX_THREADS_STATE/annotations.json`
+2. `$XDG_STATE_HOME/codex-threads/annotations.json`
+3. `~/.local/state/codex-threads/annotations.json`
+
+Annotations are keyed by selected server endpoint and thread ID. `annotate`
+commands can set, get, clear, list, search, and prune those local records.
+`list --json`, `search --json`, and `show --json` include an `annotation` object
+on returned thread objects when one exists. Human `list` and `search` add an
+`ANNOTATION` column only when displayed rows have annotations; human `show`
+prints the annotation in the thread detail.
+
 Exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | Command succeeded, or a blocking turn completed. |
 | `1` | A blocking `new` or `send` turn reached `failed` or `interrupted`. |
-| `2` | Usage, argument, validation, or configuration error. |
+| `2` | Usage, argument, validation, configuration, or local lookup error. |
 | `3` | App-server, connection, Unix socket, WebSocket, or capability error. |
 | `130` | Local Ctrl-C while waiting on a turn; the remote turn may still be running. |
 
