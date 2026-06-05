@@ -3023,6 +3023,111 @@ mod tests {
     }
 
     #[test]
+    fn detail_refresh_preserves_compose_overlay() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Compose(ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "t1".to_string(),
+            },
+            text: "draft in progress".to_string(),
+            send_mode: SendMode::Stream,
+            return_to_detail: true,
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let refreshed = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "new update"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+
+        state.replace_detail(1, refreshed);
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose overlay");
+        };
+        assert_eq!(compose.text, "draft in progress");
+        assert_eq!(state.detail.as_ref().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn detail_refresh_preserves_annotation_overlay() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::AnnotationInput {
+            thread_id: "t1".to_string(),
+            draft: "annotation draft".to_string(),
+            return_to_detail: true,
+        };
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let refreshed = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "new update"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+
+        state.replace_detail(1, refreshed);
+
+        let Mode::AnnotationInput { draft, .. } = &state.mode else {
+            panic!("expected annotation overlay");
+        };
+        assert_eq!(draft, "annotation draft");
+        assert_eq!(state.detail.as_ref().unwrap().messages.len(), 1);
+    }
+
+    #[test]
     fn detail_enter_opens_same_message_action_as_m() {
         let mut state = TuiState::new(TuiInit {
             query: None,

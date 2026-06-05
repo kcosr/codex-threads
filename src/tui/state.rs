@@ -343,6 +343,8 @@ impl TuiState {
         if current.epoch != epoch {
             return;
         }
+        let same_thread = current.thread_id == detail.thread_id;
+        let previous_mode = self.mode.clone();
         if current.thread_id == detail.thread_id {
             let was_at_bottom =
                 current.scroll == u16::MAX || current.scroll >= current.max_scroll();
@@ -364,7 +366,7 @@ impl TuiState {
         {
             self.update_message_search(query);
         }
-        self.mode = Mode::Detail;
+        self.mode = preserve_detail_overlay_mode(previous_mode, same_thread);
     }
 
     pub fn extend_detail_older(&mut self, epoch: u64, mut page: DetailState) {
@@ -487,6 +489,27 @@ impl TuiState {
                 .message_scroll_offset(message_index)
                 .min(u16::MAX as usize) as u16;
         }
+    }
+}
+
+fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode {
+    if !same_thread {
+        return Mode::Detail;
+    }
+    match previous_mode {
+        Mode::Detail
+        | Mode::MessageSearchInput { .. }
+        | Mode::AnnotationInput {
+            return_to_detail: true,
+            ..
+        }
+        | Mode::Compose(ComposeState {
+            return_to_detail: true,
+            ..
+        })
+        | Mode::ActiveTurnPrompt { .. }
+        | Mode::ConfirmInterrupt { .. } => previous_mode,
+        _ => Mode::Detail,
     }
 }
 
