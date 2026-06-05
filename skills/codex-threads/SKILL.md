@@ -102,8 +102,8 @@ Useful TUI keys:
 - `A` edits the local annotation with `Ctrl-S` save and `Ctrl-D` clear.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
-- `m` composes a follow-up; `Enter` sends, `Shift-Enter` inserts a newline when
-  supported by the terminal, and `Tab` toggles stream/no-wait for new turns.
+- `m` composes a follow-up; `Enter` sends, `Shift-J` inserts a newline, and
+  `Tab` toggles stream/no-wait for new turns.
 - Opening a detail view starts at the transcript bottom; while in detail,
   `Enter` opens the message action, `n/N` move between message-search matches,
   and `Esc` unlinks the local detail view and returns to the browser.

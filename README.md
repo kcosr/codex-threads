@@ -208,8 +208,8 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `]` and `[` to page when cursors are available, `p` to toggle the preview pane,
 `f` for filters, `s` for sort, `c` for visible columns, `A` to annotate, `r` to
 refresh, `y` to copy the active thread id with OSC 52, and `m` to compose.
-Compose uses `Enter` to send and `Shift-Enter` to insert a newline where the
-terminal reports that modifier; `Tab` toggles stream/no-wait for new turns.
+Compose uses `Enter` to send and `Shift-J` to insert a newline; `Tab` toggles
+stream/no-wait for new turns.
 Annotation editing uses `Ctrl-S` to save and `Ctrl-D` to clear. In detail, `T`
 attaches to an active turn, `S` steers it, `i` confirms interrupt, `Enter` opens
 the message action, and `q` quits. Opening a thread starts at the bottom of the

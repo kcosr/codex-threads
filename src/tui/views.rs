@@ -84,9 +84,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 },
             };
             let footer = match compose.target {
-                ComposeTarget::Steer { .. } => "Enter steer, Shift-Enter newline, Esc cancel",
+                ComposeTarget::Steer { .. } => "Enter steer, Shift-J newline, Esc cancel",
                 ComposeTarget::NewTurn { .. } => {
-                    "Enter send, Shift-Enter newline, Tab mode, Esc cancel"
+                    "Enter send, Shift-J newline, Tab mode, Esc cancel"
                 }
             };
             draw_compose(frame, area, label, &compose.text, footer);
@@ -946,7 +946,7 @@ mod tests {
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("first line"));
         assert!(text.contains("second line"));
-        assert!(text.contains("Enter send, Shift-Enter newline, Tab mode, Esc cancel"));
+        assert!(text.contains("Enter send, Shift-J newline, Tab mode, Esc cancel"));
     }
 
     #[test]

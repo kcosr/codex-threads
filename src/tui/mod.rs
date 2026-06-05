@@ -16,8 +16,7 @@ use anyhow::{Context, Result};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -169,15 +168,7 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            )
-        )?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         let previous_hook = panic::take_hook();
         let previous_hook = Arc::new(Mutex::new(Some(previous_hook)));
         let hook_for_panic = Arc::clone(&previous_hook);
@@ -213,7 +204,6 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
-        PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         Show,
         LeaveAlternateScreen
@@ -1247,7 +1237,7 @@ async fn handle_compose_input(
             compose.text.pop();
             state.mode = Mode::Compose(compose);
         }
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Char('J') => {
             compose.text.push('\n');
             state.mode = Mode::Compose(compose);
         }
@@ -3391,7 +3381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compose_enter_submits_and_shift_enter_inserts_newline() {
+    async fn compose_enter_submits_and_shift_j_inserts_newline() {
         let target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
@@ -3413,7 +3403,7 @@ mod tests {
         });
 
         handle_compose_input(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {
