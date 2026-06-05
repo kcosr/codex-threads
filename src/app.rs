@@ -6,6 +6,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Map, Value, json};
 
+use crate::annotations::{
+    AnnotationListItem, clear_annotation, clear_annotations, list_annotations, load_annotation,
+    namespace_annotations, set_annotation,
+};
 use crate::cli::*;
 use crate::completion::{
     completion_candidates, completion_instructions, completion_script, normalize_shell,
@@ -22,6 +26,7 @@ const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
 const THREAD_LABEL_WIDTH: usize = 56;
 const SEARCH_SNIPPET_WIDTH: usize = 48;
+const ANNOTATION_WIDTH: usize = 40;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -310,8 +315,97 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await,
         },
+        Command::Annotate(command) => match command.command {
+            AnnotateSubcommand::Set(command) => {
+                let target = resolve_target_for_command(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                )?;
+                annotate_set_command(target, command).await
+            }
+            AnnotateSubcommand::Get(command) => {
+                let target = resolve_target_for_command(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                )?;
+                annotate_get_command(target, command).await
+            }
+            AnnotateSubcommand::Clear(command) => {
+                let target = resolve_target_for_command(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                )?;
+                annotate_clear_command(target, command).await
+            }
+            AnnotateSubcommand::List(command) => {
+                let target = resolve_target_for_command(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                )?;
+                annotate_list_command(target, command).await
+            }
+            AnnotateSubcommand::Search(command) => {
+                let target = resolve_target_for_command(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                )?;
+                annotate_search_command(target, command).await
+            }
+            AnnotateSubcommand::Prune(command) => {
+                with_client(
+                    &config,
+                    cli.connect.as_deref(),
+                    cli.connect_auth_token_env.as_deref(),
+                    cli.connect_auth_token.as_deref(),
+                    command.server.server.clone(),
+                    |target, client| async move {
+                        annotate_prune_command(target, client, command).await
+                    },
+                )
+                .await
+            }
+        },
         Command::Completion(_) | Command::Complete(_) => unreachable!(),
     }
+}
+
+fn resolve_target_for_command(
+    config: &AppConfig,
+    connect: Option<&str>,
+    connect_auth_token_env: Option<&str>,
+    connect_auth_token: Option<&str>,
+    server: Option<String>,
+) -> Result<Target> {
+    if let Some(endpoint) = connect {
+        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
+            return Err(usage_error(
+                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+            ));
+        }
+        return resolve_direct_target(endpoint, connect_auth_token_env, connect_auth_token);
+    }
+
+    if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+        return Err(usage_error(
+            "--connect-auth-token and --connect-auth-token-env require --connect",
+        ));
+    }
+    resolve_target(config, server.as_deref())
 }
 
 async fn with_client<F, Fut>(
@@ -326,21 +420,13 @@ where
     F: FnOnce(Target, RpcClient) -> Fut,
     Fut: std::future::Future<Output = Result<i32>>,
 {
-    let target = if let Some(endpoint) = connect {
-        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
-            return Err(usage_error(
-                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
-            ));
-        }
-        resolve_direct_target(endpoint, connect_auth_token_env, connect_auth_token)?
-    } else {
-        if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
-            return Err(usage_error(
-                "--connect-auth-token and --connect-auth-token-env require --connect",
-            ));
-        }
-        resolve_target(config, server.as_deref())?
-    };
+    let target = resolve_target_for_command(
+        config,
+        connect,
+        connect_auth_token_env,
+        connect_auth_token,
+        server,
+    )?;
     let client = RpcClient::connect(&target.endpoint).await?;
     f(target, client).await
 }
@@ -486,7 +572,7 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
     if let Some(cwd) = command.cwd {
         params.insert("cwd".to_string(), json!(cwd));
     }
-    let result = if let Some(since) = since {
+    let mut result = if let Some(since) = since {
         scan_since_filtered(
             &mut client,
             "thread/list",
@@ -502,6 +588,7 @@ async fn list_command(target: Target, mut client: RpcClient, command: ListComman
             .request("thread/list", Value::Object(params), |_| {})
             .await?
     };
+    attach_thread_annotations(&target, &mut result, ThreadProjection::Direct)?;
     emit_threads_result(&target, command.json, result, ThreadProjection::Direct)
 }
 
@@ -519,7 +606,7 @@ async fn search_command(
     if command.archived {
         params.insert("archived".to_string(), json!(true));
     }
-    let result = if let Some(since) = since {
+    let mut result = if let Some(since) = since {
         scan_since_filtered(
             &mut client,
             "thread/search",
@@ -535,6 +622,7 @@ async fn search_command(
             .request("thread/search", Value::Object(params), |_| {})
             .await?
     };
+    attach_thread_annotations(&target, &mut result, ThreadProjection::SearchResult)?;
     emit_threads_result(
         &target,
         command.json,
@@ -609,6 +697,45 @@ fn thread_updated_at(item: &Value, projection: ThreadProjection) -> Option<i64> 
     }
 }
 
+fn attach_thread_annotations(
+    target: &Target,
+    result: &mut Value,
+    projection: ThreadProjection,
+) -> Result<()> {
+    let annotations = namespace_annotations(target)?;
+    if annotations.is_empty() {
+        return Ok(());
+    }
+    let Some(items) = result["data"].as_array_mut() else {
+        return Ok(());
+    };
+    for item in items {
+        let Some(thread) = (match projection {
+            ThreadProjection::Direct => Some(item),
+            ThreadProjection::SearchResult => item.get_mut("thread"),
+        }) else {
+            continue;
+        };
+        if let Some(thread_id) = thread["id"].as_str()
+            && let Some(annotation) = annotations.get(thread_id)
+            && let Some(thread_object) = thread.as_object_mut()
+        {
+            thread_object.insert("annotation".to_string(), json!(annotation));
+        }
+    }
+    Ok(())
+}
+
+fn attach_annotation_to_thread(target: &Target, thread: &mut Value) -> Result<()> {
+    if let Some(thread_id) = thread["id"].as_str()
+        && let Some(annotation) = load_annotation(target, thread_id)?
+        && let Some(thread_object) = thread.as_object_mut()
+    {
+        thread_object.insert("annotation".to_string(), json!(annotation));
+    }
+    Ok(())
+}
+
 async fn show_command(target: Target, mut client: RpcClient, command: ShowCommand) -> Result<i32> {
     let thread = client
         .request(
@@ -630,8 +757,9 @@ async fn show_command(target: Target, mut client: RpcClient, command: ShowComman
             |_| {},
         )
         .await?;
-    let result =
-        json!({"server": target.server, "thread": thread["thread"].clone(), "turns": turns});
+    let mut thread = thread["thread"].clone();
+    attach_annotation_to_thread(&target, &mut thread)?;
+    let result = json!({"server": target.server, "thread": thread, "turns": turns});
     if command.json {
         print_json(&result)?;
     } else {
@@ -1364,6 +1492,138 @@ async fn archive_command(
     emit_json_or_status(command.json, &output)
 }
 
+async fn annotate_set_command(target: Target, command: AnnotateSetCommand) -> Result<i32> {
+    let annotation = set_annotation(&target, &command.thread_id, &command.text)?;
+    let output = json!({
+        "server": target.server,
+        "threadId": command.thread_id,
+        "annotation": annotation,
+        "status": "accepted"
+    });
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_key_values(&[
+            ("server", output["server"].as_str().unwrap_or("")),
+            ("threadId", output["threadId"].as_str().unwrap_or("")),
+            ("status", output["status"].as_str().unwrap_or("accepted")),
+        ]);
+    }
+    Ok(0)
+}
+
+async fn annotate_get_command(target: Target, command: AnnotateGetCommand) -> Result<i32> {
+    let Some(annotation) = load_annotation(&target, &command.thread_id)? else {
+        return Err(ExitError {
+            code: 2,
+            message: format!("annotation not found for thread `{}`", command.thread_id),
+        }
+        .into());
+    };
+    let output = json!({
+        "server": target.server,
+        "threadId": command.thread_id,
+        "annotation": annotation
+    });
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_annotation_detail(&output);
+    }
+    Ok(0)
+}
+
+async fn annotate_clear_command(target: Target, command: AnnotateClearCommand) -> Result<i32> {
+    let cleared = clear_annotation(&target, &command.thread_id)?;
+    let output = json!({
+        "server": target.server,
+        "threadId": command.thread_id,
+        "cleared": cleared,
+        "status": "accepted"
+    });
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_key_values(&[
+            ("server", output["server"].as_str().unwrap_or("")),
+            ("threadId", output["threadId"].as_str().unwrap_or("")),
+            ("cleared", if cleared { "true" } else { "false" }),
+            ("status", output["status"].as_str().unwrap_or("accepted")),
+        ]);
+    }
+    Ok(0)
+}
+
+async fn annotate_list_command(target: Target, command: AnnotateListCommand) -> Result<i32> {
+    emit_annotation_list(
+        list_annotations(&target, command.query.as_deref())?,
+        command.json,
+    )
+}
+
+async fn annotate_search_command(target: Target, command: AnnotateSearchCommand) -> Result<i32> {
+    emit_annotation_list(
+        list_annotations(&target, Some(&command.query))?,
+        command.json,
+    )
+}
+
+async fn annotate_prune_command(
+    target: Target,
+    mut client: RpcClient,
+    command: AnnotatePruneCommand,
+) -> Result<i32> {
+    let annotations = list_annotations(&target, None)?;
+    let mut stale = Vec::new();
+    for item in &annotations {
+        match client
+            .request(
+                "thread/read",
+                json!({"threadId": item.thread_id, "includeTurns": false}),
+                |_| {},
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(err) if is_thread_not_found_error(&err, "thread/read", &item.thread_id) => {
+                stale.push(item.thread_id.clone());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let removed = if command.dry_run || stale.is_empty() {
+        0
+    } else {
+        clear_annotations(&target, &stale)?
+    };
+    let output = json!({
+        "server": target.server,
+        "checked": annotations.len(),
+        "stale": stale,
+        "removed": removed,
+        "dryRun": command.dry_run
+    });
+    if command.json {
+        print_json(&output)?;
+    } else {
+        print_key_values(&[
+            ("server", output["server"].as_str().unwrap_or("")),
+            ("checked", &output["checked"].to_string()),
+            (
+                "stale",
+                &output["stale"]
+                    .as_array()
+                    .unwrap_or(&Vec::new())
+                    .len()
+                    .to_string(),
+            ),
+            ("removed", &output["removed"].to_string()),
+            ("dryRun", if command.dry_run { "true" } else { "false" }),
+        ]);
+    }
+    Ok(0)
+}
+
 async fn models_command(
     target: Target,
     mut client: RpcClient,
@@ -1611,13 +1871,24 @@ fn message_role_name(role: MessageRole) -> &'static str {
 
 fn print_thread_detail(result: &Value) {
     let thread = &result["thread"];
-    print_key_values(&[
+    let mut rows = vec![
         ("server", result["server"].as_str().unwrap_or("")),
         ("id", thread["id"].as_str().unwrap_or("")),
         ("name", thread["name"].as_str().unwrap_or("")),
         ("cwd", thread["cwd"].as_str().unwrap_or("")),
         ("status", thread["status"]["type"].as_str().unwrap_or("")),
-    ]);
+    ];
+    let annotation = thread["annotation"]["text"].as_str();
+    if let Some(annotation) = annotation.filter(|text| !text.contains('\n')) {
+        rows.push(("annotation", annotation));
+    }
+    print_key_values(&rows);
+    if let Some(annotation) = annotation.filter(|text| text.contains('\n')) {
+        println!("annotation");
+        for line in annotation.lines() {
+            println!("  {line}");
+        }
+    }
     if let Some(turns) = result["turns"]["data"]
         .as_array()
         .filter(|turns| !turns.is_empty())
@@ -1636,6 +1907,54 @@ fn print_thread_detail(result: &Value) {
                 .collect(),
         );
     }
+}
+
+fn print_annotation_detail(result: &Value) {
+    print_key_values(&[
+        ("server", result["server"].as_str().unwrap_or("")),
+        ("threadId", result["threadId"].as_str().unwrap_or("")),
+        (
+            "annotation",
+            result["annotation"]["text"].as_str().unwrap_or(""),
+        ),
+        (
+            "updated",
+            &format_timestamp(result["annotation"]["updatedAt"].as_i64()),
+        ),
+    ]);
+}
+
+fn emit_annotation_list(items: Vec<AnnotationListItem>, json_out: bool) -> Result<i32> {
+    if json_out {
+        let annotations = items
+            .iter()
+            .map(|item| {
+                json!({
+                    "server": item.server,
+                    "endpoint": item.endpoint,
+                    "threadId": item.thread_id,
+                    "annotation": item.annotation
+                })
+            })
+            .collect::<Vec<_>>();
+        print_json(&json!({"annotations": annotations}))?;
+    } else {
+        print_table(
+            &["UPDATED", "SERVER", "THREAD ID", "ANNOTATION"],
+            items
+                .iter()
+                .map(|item| {
+                    vec![
+                        table_cell(format_timestamp(Some(item.annotation.updated_at))),
+                        table_cell(&item.server),
+                        table_cell(&item.thread_id),
+                        capped_cell(&item.annotation.text, ANNOTATION_WIDTH),
+                    ]
+                })
+                .collect(),
+        );
+    }
+    Ok(0)
 }
 
 fn print_usage(result: &Value) {
@@ -1790,15 +2109,25 @@ fn emit_threads_result(
     if json_out {
         print_json(&output)?;
     } else {
-        let headers = match projection {
-            ThreadProjection::Direct => vec!["UPDATED", "STATUS", "TITLE/PREVIEW", "THREAD ID"],
+        let empty_items = Vec::new();
+        let items = output[label].as_array().unwrap_or(&empty_items);
+        let show_annotations = items.iter().any(|item| {
+            item.get("thread")
+                .unwrap_or(item)
+                .get("annotation")
+                .is_some()
+        });
+        let mut headers = match projection {
+            ThreadProjection::Direct => vec!["UPDATED", "STATUS", "TITLE/PREVIEW"],
             ThreadProjection::SearchResult => {
-                vec!["UPDATED", "STATUS", "TITLE/PREVIEW", "SNIPPET", "THREAD ID"]
+                vec!["UPDATED", "STATUS", "TITLE/PREVIEW", "SNIPPET"]
             }
         };
-        let rows = output[label]
-            .as_array()
-            .unwrap_or(&Vec::new())
+        if show_annotations {
+            headers.push("ANNOTATION");
+        }
+        headers.push("THREAD ID");
+        let rows = items
             .iter()
             .map(|item| {
                 let thread = item.get("thread").unwrap_or(item);
@@ -1811,6 +2140,12 @@ fn emit_threads_result(
                     row.push(capped_cell(
                         item["snippet"].as_str().unwrap_or(""),
                         SEARCH_SNIPPET_WIDTH,
+                    ));
+                }
+                if show_annotations {
+                    row.push(capped_cell(
+                        thread["annotation"]["text"].as_str().unwrap_or(""),
+                        ANNOTATION_WIDTH,
                     ));
                 }
                 row.push(table_cell(thread["id"].as_str().unwrap_or("")));

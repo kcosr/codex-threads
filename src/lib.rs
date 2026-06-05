@@ -1,3 +1,4 @@
+mod annotations;
 mod app;
 mod cli;
 mod completion;

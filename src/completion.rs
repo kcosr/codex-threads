@@ -410,6 +410,10 @@ mod tests {
             "ping\n"
         );
         assert_eq!(
+            completion_candidates("s", &[String::from("annotate")]),
+            "set\nsearch\n"
+        );
+        assert_eq!(
             completion_candidates("s", &[String::from("completion")]),
             "script\n"
         );

@@ -108,6 +108,8 @@ impl TcpMockServer {
         command
             .env_remove("CODEX_THREADS_CONFIG")
             .env_remove("CODEX_THREADS_SERVER")
+            .env_remove("CODEX_THREADS_STATE")
+            .env_remove("XDG_STATE_HOME")
             .arg("--config")
             .arg(&self.config);
         command
@@ -309,6 +311,8 @@ impl MockServer {
         command
             .env_remove("CODEX_THREADS_CONFIG")
             .env_remove("CODEX_THREADS_SERVER")
+            .env_remove("CODEX_THREADS_STATE")
+            .env_remove("XDG_STATE_HOME")
             .arg("--config")
             .arg(&self.config);
         command
@@ -375,6 +379,40 @@ async fn handle_websocket<S>(
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             received.lock().expect("received").push(value.clone());
             if let Some(id) = value.get("id").cloned() {
+                if method == "thread/read" && thread_id(&value) == "thread_missing" {
+                    let response = json!({
+                        "id": id,
+                        "error": {
+                            "code": -32600,
+                            "message": "thread not found: thread_missing"
+                        }
+                    });
+                    if ws
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                if method == "thread/read" && thread_id(&value) == "thread_error" {
+                    let response = json!({
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": "temporary read failure"
+                        }
+                    });
+                    if ws
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if should_reject_first_method(method, reject_first.method, &rejected_first_method) {
                     let message = reject_first
                         .message
@@ -761,6 +799,19 @@ fn sample_turn() -> Value {
 fn run_json(server: &MockServer, args: &[&str]) -> Value {
     let output = server
         .command()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("json output")
+}
+
+fn run_json_with_state(server: &MockServer, state: &TempDir, args: &[&str]) -> Value {
+    let output = server
+        .command()
+        .env("CODEX_THREADS_STATE", state.path())
         .args(args)
         .assert()
         .success()
@@ -1392,6 +1443,266 @@ fn read_only_commands_return_scriptable_json() {
     assert_eq!(
         usage["rateLimitsByLimitId"]["priority"]["rateLimitReachedType"],
         "rate_limit_reached"
+    );
+}
+
+#[test]
+fn annotation_commands_manage_local_state_without_app_server() {
+    let server = MockServer::start();
+    let state = TempDir::new().expect("state");
+
+    let set = run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_1",
+            "Release follow-up",
+        ],
+    );
+    assert_eq!(set["server"], "work");
+    assert_eq!(set["threadId"], "thread_1");
+    assert_eq!(set["annotation"]["text"], "Release follow-up");
+    assert!(server.methods().is_empty());
+
+    let get = run_json_with_state(
+        &server,
+        &state,
+        &["annotate", "get", "--server", "work", "--json", "thread_1"],
+    );
+    assert_eq!(get["annotation"]["text"], "Release follow-up");
+
+    let listed = run_json_with_state(
+        &server,
+        &state,
+        &["annotate", "list", "--server", "work", "--json"],
+    );
+    assert_eq!(listed["annotations"][0]["threadId"], "thread_1");
+
+    let searched = run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate", "search", "--server", "work", "--json", "release",
+        ],
+    );
+    assert_eq!(
+        searched["annotations"][0]["annotation"]["text"],
+        "Release follow-up"
+    );
+
+    server
+        .command()
+        .env("CODEX_THREADS_STATE", state.path())
+        .args(["annotate", "get", "--server", "work", "--json", "missing"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("annotation not found"));
+
+    let cleared = run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate", "clear", "--server", "work", "--json", "thread_1",
+        ],
+    );
+    assert_eq!(cleared["cleared"], true);
+    assert!(
+        run_json_with_state(
+            &server,
+            &state,
+            &["annotate", "list", "--server", "work", "--json"]
+        )["annotations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn annotations_project_into_list_search_and_show_outputs() {
+    let server = MockServer::start();
+    let state = TempDir::new().expect("state");
+    run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_1",
+            "Release follow-up",
+        ],
+    );
+
+    let listed = run_json_with_state(&server, &state, &["list", "--server", "work", "--json"]);
+    assert_eq!(
+        listed["threads"][0]["annotation"]["text"],
+        "Release follow-up"
+    );
+
+    let searched = run_json_with_state(
+        &server,
+        &state,
+        &["search", "--server", "work", "--json", "mock"],
+    );
+    assert_eq!(
+        searched["results"][0]["thread"]["annotation"]["text"],
+        "Release follow-up"
+    );
+
+    let shown = run_json_with_state(
+        &server,
+        &state,
+        &["show", "--server", "work", "--json", "thread_1"],
+    );
+    assert_eq!(shown["thread"]["annotation"]["text"], "Release follow-up");
+
+    let output = server
+        .command()
+        .env("CODEX_THREADS_STATE", state.path())
+        .args(["list", "--server", "work"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.lines().next().unwrap().contains("ANNOTATION"));
+    assert!(text.contains("Release follow-up"));
+}
+
+#[test]
+fn annotation_prune_removes_only_missing_threads() {
+    let server = MockServer::start();
+    let state = TempDir::new().expect("state");
+    run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate", "set", "--server", "work", "--json", "thread_1", "Keep",
+        ],
+    );
+    run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_missing",
+            "Remove",
+        ],
+    );
+
+    let dry_run = run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate",
+            "prune",
+            "--server",
+            "work",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_eq!(dry_run["checked"], 2);
+    assert_eq!(dry_run["stale"], json!(["thread_missing"]));
+    assert_eq!(dry_run["removed"], 0);
+    assert_eq!(
+        run_json_with_state(
+            &server,
+            &state,
+            &[
+                "annotate",
+                "get",
+                "--server",
+                "work",
+                "--json",
+                "thread_missing"
+            ]
+        )["annotation"]["text"],
+        "Remove"
+    );
+
+    let pruned = run_json_with_state(
+        &server,
+        &state,
+        &["annotate", "prune", "--server", "work", "--json"],
+    );
+    assert_eq!(pruned["removed"], 1);
+    server
+        .command()
+        .env("CODEX_THREADS_STATE", state.path())
+        .args([
+            "annotate",
+            "get",
+            "--server",
+            "work",
+            "--json",
+            "thread_missing",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        run_json_with_state(
+            &server,
+            &state,
+            &["annotate", "get", "--server", "work", "--json", "thread_1"]
+        )["annotation"]["text"],
+        "Keep"
+    );
+}
+
+#[test]
+fn annotation_prune_aborts_on_unexpected_thread_read_error() {
+    let server = MockServer::start();
+    let state = TempDir::new().expect("state");
+    run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_error",
+            "Keep despite transient error",
+        ],
+    );
+
+    server
+        .command()
+        .env("CODEX_THREADS_STATE", state.path())
+        .args(["annotate", "prune", "--server", "work", "--json"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains("temporary read failure"));
+
+    assert_eq!(
+        run_json_with_state(
+            &server,
+            &state,
+            &[
+                "annotate",
+                "get",
+                "--server",
+                "work",
+                "--json",
+                "thread_error"
+            ]
+        )["annotation"]["text"],
+        "Keep despite transient error"
     );
 }
 

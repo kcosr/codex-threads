@@ -65,6 +65,8 @@ codex-threads messages <thread_id>
 codex-threads status <thread_id>
 codex-threads send <thread_id> "follow-up message"
 codex-threads new --cwd /abs/path "initial prompt"
+codex-threads annotate get <thread_id>
+codex-threads annotate set <thread_id> "note"
 ```
 
 Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, or reliable parsing.
@@ -72,6 +74,42 @@ Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors
 Default limits: `list` uses `--limit 50`, `show` uses `--last 20`, and `messages` uses `--max-turns 200` unless overridden.
 
 Examples in this skill use `jq` for compact JSON projection; use another JSON tool if `jq` is not installed.
+
+## Local Annotations
+
+`codex-threads annotate` manages local notes for threads. These annotations are
+stored by `codex-threads`, keyed by selected server endpoint and thread ID; they
+are not Codex app-server state.
+
+Use annotations to mark why a thread matters, what follow-up is pending, or how
+to recognize a thread later:
+
+```bash
+codex-threads annotate set <thread_id> "Waiting for review on PR #5"
+codex-threads annotate get <thread_id>
+codex-threads annotate clear <thread_id>
+codex-threads annotate list
+codex-threads annotate search "review"
+```
+
+`annotate get <thread_id>` exits with code `2` if there is no local annotation.
+`annotate list` and `annotate search` exit successfully with an empty result
+when there are no matches.
+
+Annotations appear automatically in `list`, `search`, and `show` output when
+present. In JSON, look for `thread.annotation.text`; in human `list` and
+`search`, an `ANNOTATION` column appears only when displayed rows have
+annotations.
+
+Use prune only when intentionally cleaning stale local records:
+
+```bash
+codex-threads annotate prune --dry-run --json
+codex-threads annotate prune --json
+```
+
+`annotate prune` contacts app-server and removes annotations whose threads are
+reported missing. Archive/unarchive does not remove annotations.
 
 ## Recommended Investigation Workflow
 
@@ -315,7 +353,7 @@ Search results:
 
 ```bash
 codex-threads search --limit 10 --json "query" \
-  | jq '{results:[.results[] | {id:.thread.id,cwd:.thread.cwd,preview:.thread.preview,status:.thread.status.type,updatedAt:.thread.updatedAt,snippet:.snippet}]}'
+  | jq '{results:[.results[] | {id:.thread.id,cwd:.thread.cwd,preview:.thread.preview,status:.thread.status.type,updatedAt:.thread.updatedAt,snippet:.snippet,annotation:.thread.annotation.text}]}'
 ```
 
 Recent messages:
@@ -330,12 +368,14 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 - `list --json` returns `{ server, threads, nextCursor, backwardsCursor }`.
 - `search --json` returns `{ server, results, nextCursor, backwardsCursor }`; each result has `thread` and `snippet`.
 - `show --json` returns `{ server, thread, turns }`; turns are under `.turns.data`.
+- When present, `list --json`, `search --json`, and `show --json` include `annotation` on thread objects.
 - `messages --json` returns `{ server, threadId, messages, nextCursor, truncated }`.
 - `status --json` returns `{ server, reachable, loadedThreadIds, nextCursor }`.
 - `status <thread_id> --json` returns `thread`, `threadId`, `activeTurnId`, and `truncated`.
 - `status <thread_id> --load --json` resumes/loads first, unsubscribes the probing connection, then returns the same shape.
 - `settings show <thread_id> --json` returns cwd/model/effort/service tier.
 - `goal get <thread_id> --json` may return `goal: null`.
+- `annotate set/get/clear/list/search/prune --json` returns local annotation state for the selected server endpoint.
 
 ## Avoid
 
@@ -344,3 +384,4 @@ codex-threads messages <thread_id> --last 3 --max-turns 50 --json \
 - Do not send to an active thread without considering whether it will interrupt/confuse current work.
 - Do not use `--connect` by default; config normally handles the main endpoint.
 - Do not treat cursor strings as timestamps or offsets; pass them back exactly, quoted.
+- Do not assume annotations exist in Codex app-server; they are local `codex-threads` state.
