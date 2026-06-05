@@ -202,9 +202,11 @@ codex-threads tui --since 24h --cwd "$PWD"
 codex-threads tui --query "release process" --limit 20
 ```
 
-Inside the TUI, use `/` to search, `Enter` to open a thread, `A` to annotate,
-`r` to refresh, `e` to send and stream a follow-up, `S` to steer an active
-turn, `i` to interrupt an active turn, and `q` to quit.
+Inside the TUI, use `/` to search, `Enter` to open a thread, `]` and `[` to
+page when cursors are available, `A` to annotate, `r` to refresh, and `e` to
+send and stream a follow-up. In detail, `T` attaches to an active turn, `S`
+steers it, `i` interrupts it, and `q` quits. Transcript rendering is
+markdown-aware for common headings, blockquotes, and fenced code blocks.
 
 ## Configuration
 

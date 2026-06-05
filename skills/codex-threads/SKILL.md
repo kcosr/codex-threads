@@ -75,6 +75,31 @@ Default limits: `list` uses `--limit 50`, `show` uses `--last 20`, and `messages
 
 Examples in this skill use `jq` for compact JSON projection; use another JSON tool if `jq` is not installed.
 
+## Interactive TUI
+
+Use `codex-threads tui` when the user wants to browse, search, inspect, annotate,
+refresh, or control threads interactively from a terminal:
+
+```bash
+codex-threads tui --since 24h --cwd "$PWD"
+codex-threads tui --query "release process" --limit 20
+```
+
+The TUI accepts the same initial discovery filters as `list`/`search`: `--query`,
+`--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc`.
+Do not use it for machine-readable automation; use the CLI `--json` commands
+instead.
+
+Useful TUI keys:
+
+- `j/k` or arrow keys move; `Enter` opens a thread.
+- `/` searches threads in the browser or loaded transcript lines in detail.
+- `]` and `[` page through browser/detail cursors when available.
+- `A` edits the local annotation; `r` refreshes; `t` toggles auto-refresh.
+- `e` sends a follow-up; `Tab` toggles stream/no-wait while composing.
+- In detail, `T` attaches to an active turn, `S` steers it, and `i` interrupts it.
+- `q` quits. Local detach leaves remote turns running unless interrupted.
+
 ## Local Annotations
 
 `codex-threads annotate` manages local notes for threads. These annotations are

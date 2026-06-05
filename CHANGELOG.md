@@ -8,6 +8,8 @@
   filters, detail viewing, local annotation editing, refresh, send-and-stream,
   no-wait send, active-turn steer, interrupt, persisted TUI preferences, and a
   responsive async fetch/stream model.
+- Add TUI cursor paging, active-turn attach, and markdown-aware transcript
+  rendering for common headings, blockquotes, and fenced code blocks.
 
 ### Changed
 
