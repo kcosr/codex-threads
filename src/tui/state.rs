@@ -95,6 +95,7 @@ pub struct DetailState {
     pub active_turn_id: Option<String>,
     pub loading: bool,
     pub epoch: u64,
+    pub last_refresh_at: Option<Instant>,
     pub last_error: Option<String>,
 }
 
@@ -142,6 +143,7 @@ pub struct ComposeState {
     pub target: ComposeTarget,
     pub text: String,
     pub send_mode: SendMode,
+    pub return_to_detail: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,12 +317,18 @@ impl TuiState {
         if current.epoch != epoch {
             return;
         }
-        let search_query = if current.thread_id == detail.thread_id {
-            current.search_query.clone()
-        } else {
-            String::new()
-        };
-        detail.search_query = search_query;
+        if current.thread_id == detail.thread_id {
+            detail.search_query = current.search_query.clone();
+            detail.scroll = if current.scroll == u16::MAX {
+                detail
+                    .transcript_line_count()
+                    .saturating_sub(1)
+                    .min(u16::MAX as usize) as u16
+            } else {
+                current.scroll
+            };
+        }
+        detail.last_refresh_at = Some(Instant::now());
         self.detail = Some(detail);
         if let Some(query) = self
             .detail
@@ -347,6 +355,7 @@ impl TuiState {
         detail.active_turn_id = page.active_turn_id;
         detail.status = page.status;
         detail.loading = false;
+        detail.last_refresh_at = Some(Instant::now());
         detail.last_error = None;
         let query = detail.search_query.clone();
         if !query.is_empty() {
@@ -371,6 +380,7 @@ impl TuiState {
         detail.active_turn_id = page.active_turn_id;
         detail.status = page.status;
         detail.loading = false;
+        detail.last_refresh_at = Some(Instant::now());
         detail.last_error = None;
         let query = detail.search_query.clone();
         if !query.is_empty() {

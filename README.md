@@ -211,7 +211,10 @@ refresh, and `m` to compose. Compose uses `Enter` to send and `Shift-Enter` to
 insert a newline where the terminal reports that modifier; `Tab` toggles
 stream/no-wait for new turns. Annotation editing uses `Ctrl-S` to save and
 `Ctrl-D` to clear. In detail, `T` attaches to an active turn, `S` steers it, `i`
-confirms interrupt, and `q` quits. Local detach leaves remote turns running.
+confirms interrupt, `Enter` opens the message action, and `q` quits. Opening a
+thread starts at the bottom of the transcript; detail views refresh in place
+while open, and `Esc` returns to the browser after unlinking the local detail
+view and detaching any local stream. Local detach leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted

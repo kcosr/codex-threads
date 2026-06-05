@@ -103,7 +103,9 @@ Useful TUI keys:
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `m` composes a follow-up; `Enter` sends, `Shift-Enter` inserts a newline when
   supported by the terminal, and `Tab` toggles stream/no-wait for new turns.
-- In detail, `n/N` move between message-search matches.
+- Opening a detail view starts at the transcript bottom; while in detail,
+  `Enter` opens the message action, `n/N` move between message-search matches,
+  and `Esc` unlinks the local detail view and returns to the browser.
 - In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms interrupt.
 - `q` quits. Local detach leaves remote turns running unless interrupted.
 

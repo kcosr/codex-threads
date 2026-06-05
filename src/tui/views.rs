@@ -700,6 +700,7 @@ mod tests {
             active_turn_id: None,
             loading: false,
             epoch: 1,
+            last_refresh_at: None,
             last_error: None,
         });
         let backend = TestBackend::new(100, 18);
@@ -759,6 +760,7 @@ mod tests {
             active_turn_id: Some("turn-1".to_string()),
             loading: false,
             epoch: 1,
+            last_refresh_at: None,
             last_error: None,
         });
         let backend = TestBackend::new(100, 18);

@@ -20,6 +20,9 @@
   without divider rules between messages.
 - Change TUI compose to submit with `Enter`, insert newlines with
   `Shift-Enter`, and toggle the browser preview pane with `p`.
+- Change TUI detail views to open at the transcript bottom, follow with
+  in-place refreshes while open, use `Enter` for the message action, and unlink
+  the local detail/stream association on `Esc`.
 
 ### Changed
 
