@@ -5,6 +5,11 @@ edition = "2024"
 license = "MIT"
 publish = false
 
+[features]
+default = ["tui"]
+tui = ["dep:crossterm", "dep:ratatui", "dep:textwrap"]
+tui-syntax-highlighting = []
+
 [[bin]]
 name = "codex-threads"
 path = "src/bin/codex-threads.rs"
@@ -13,12 +18,15 @@ path = "src/bin/codex-threads.rs"
 anyhow = "1.0.100"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
+crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
 fd-lock = "4.0.4"
 futures-util = "0.3.32"
+ratatui = { version = "0.29.0", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+textwrap = { version = "0.16.2", optional = true }
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.48.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 toml = "0.9.8"
 url = "2.5.7"

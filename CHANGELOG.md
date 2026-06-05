@@ -2,7 +2,18 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add `codex-threads tui`, an interactive thread browser with list/search
+  filters, detail viewing, local annotation editing, refresh, send-and-stream,
+  no-wait send, active-turn steer, interrupt, persisted TUI preferences, and a
+  responsive async fetch/stream model.
+
+### Changed
+
+- Extract reusable session and turn-runner operations from CLI orchestration so
+  the CLI, TUI, and future clients share request construction, annotation
+  projection, turn streaming, polling fallback, and terminal status handling.
 
 ## [0.1.5] - 2026-06-05
 

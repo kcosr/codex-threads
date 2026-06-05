@@ -6,6 +6,8 @@ mod config;
 mod errors;
 mod rpc;
 mod session;
+#[cfg(feature = "tui")]
+mod tui;
 mod turns;
 
 pub async fn run() -> i32 {

@@ -39,6 +39,8 @@ CLI as a safety boundary.
 - Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
   single configured server.
 - Thread list, search, detail, status, and flattened message history commands.
+- Interactive TUI browser for listing, searching, viewing, annotating,
+  refreshing, sending, steering, and interrupting threads.
 - Local thread annotations projected into list, search, and detail output.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
@@ -193,6 +195,17 @@ codex-threads show THREAD_ID --last 10 --items summary --json
 codex-threads show THREAD_ID --asc --items full --json
 ```
 
+Launch the interactive browser with the same initial filters:
+
+```bash
+codex-threads tui --since 24h --cwd "$PWD"
+codex-threads tui --query "release process" --limit 20
+```
+
+Inside the TUI, use `/` to search, `Enter` to open a thread, `A` to annotate,
+`r` to refresh, `e` to send and stream a follow-up, `S` to steer an active
+turn, `i` to interrupt an active turn, and `q` to quit.
+
 ## Configuration
 
 Default config path:
@@ -297,6 +310,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
+| `tui` | Launch the interactive browser with `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
@@ -447,6 +461,16 @@ commands can set, get, clear, list, search, and prune those local records.
 on returned thread objects when one exists. Human `list` and `search` add an
 `ANNOTATION` column only when displayed rows have annotations; human `show`
 prints the annotation in the thread detail.
+
+TUI preferences are local `codex-threads` state, separate from annotations:
+
+1. `$CODEX_THREADS_STATE/tui.json`
+2. `$XDG_STATE_HOME/codex-threads/tui.json`
+3. `~/.local/state/codex-threads/tui.json`
+
+The TUI persists disposable UI preferences such as visible columns,
+auto-refresh, and default sort. Corrupt or unsupported preference files fall
+back to defaults instead of blocking launch.
 
 Exit codes:
 

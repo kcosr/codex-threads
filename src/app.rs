@@ -138,6 +138,17 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await
         }
+        #[cfg(feature = "tui")]
+        Command::Tui(command) => {
+            let target = resolve_target_for_command(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+            )?;
+            crate::tui::run_tui(target, command, yolo).await
+        }
         Command::Messages(command) => {
             with_client(
                 &config,

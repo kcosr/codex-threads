@@ -1887,6 +1887,36 @@ fn messages_help_explains_scan_and_filter_order() {
 }
 
 #[test]
+fn tui_help_exposes_interactive_filter_flags() {
+    let output = Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["tui", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert!(text.contains("--query"));
+    assert!(text.contains("--since"));
+    assert!(text.contains("--cwd"));
+    assert!(text.contains("--sort"));
+    assert!(!text.contains("--json"));
+}
+
+#[test]
+fn tui_requires_interactive_terminal_before_connecting() {
+    Command::cargo_bin("codex-threads")
+        .expect("binary")
+        .args(["--connect", "unix:///tmp/missing.sock", "tui"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "tui requires an interactive terminal",
+        ));
+}
+
+#[test]
 fn list_since_filters_locally_across_server_pages() {
     let server = MockServer::start();
     let output = run_json(

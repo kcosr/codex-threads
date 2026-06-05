@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -36,6 +36,50 @@ pub enum TurnWaitOutcome {
     LocalInterrupt { thread_id: String, turn_id: String },
 }
 
+#[cfg(feature = "tui")]
+pub async fn steer_turn(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+    turn_id: String,
+    prompt: String,
+    yolo: bool,
+) -> Result<Value> {
+    let params = json!({"threadId": thread_id, "expectedTurnId": turn_id, "input": [{"type": "text", "text": prompt, "textElements": []}]});
+    let result = request_with_resume_retry(
+        client,
+        "turn/steer",
+        params,
+        &thread_id,
+        yolo,
+        || {},
+        |_| {},
+    )
+    .await?;
+    Ok(
+        json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": result["turnId"].as_str().unwrap_or(&turn_id), "status": "accepted"}),
+    )
+}
+
+#[cfg(feature = "tui")]
+pub async fn interrupt_turn(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+    turn_id: String,
+) -> Result<Value> {
+    let _ = client
+        .request(
+            "turn/interrupt",
+            json!({"threadId": thread_id, "turnId": turn_id}),
+            |_| {},
+        )
+        .await?;
+    Ok(
+        json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": turn_id, "status": "accepted"}),
+    )
+}
+
 struct TurnWaitContext<'a> {
     target: &'a Target,
     thread_id: &'a str,
@@ -66,8 +110,10 @@ pub async fn start_turn(
     if let Some(tier) = options.service_tier {
         params.insert("serviceTier".to_string(), json!(tier));
     }
-    let early_notifications = RefCell::new(Vec::new());
+    let early_notifications = Arc::new(Mutex::new(Vec::new()));
     let params = Value::Object(params);
+    let retry_notifications = early_notifications.clone();
+    let captured_notifications = early_notifications.clone();
     let result = request_with_resume_retry(
         client,
         "turn/start",
@@ -75,10 +121,16 @@ pub async fn start_turn(
         &thread_id,
         options.yolo,
         || {
-            early_notifications.borrow_mut().clear();
+            retry_notifications
+                .lock()
+                .expect("early notification buffer poisoned")
+                .clear();
         },
         |notification| {
-            early_notifications.borrow_mut().push(notification);
+            captured_notifications
+                .lock()
+                .expect("early notification buffer poisoned")
+                .push(notification);
         },
     )
     .await?;
@@ -91,7 +143,10 @@ pub async fn start_turn(
         acceptance,
         thread_id,
         turn_id,
-        early_notifications: early_notifications.into_inner(),
+        early_notifications: early_notifications
+            .lock()
+            .expect("early notification buffer poisoned")
+            .clone(),
     })
 }
 
