@@ -10,6 +10,11 @@
   active-turn attach/steer/interrupt, persisted TUI preferences, mouse support,
   Vim-style navigation, and OSC 52 thread id copy.
 
+### Fixed
+
+- Preserve streamed assistant message item ids so the TUI and JSON output keep
+  separate assistant messages distinct within a turn.
+
 ## [0.1.5] - 2026-06-05
 
 ### Added

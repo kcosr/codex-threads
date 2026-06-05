@@ -2396,6 +2396,7 @@ fn golden_send_json_output_shapes_are_stable() {
                     "server": "work",
                     "threadId": "thread_1",
                     "turnId": "turn_1",
+                    "itemId": "item_agent",
                     "delta": "done"
                 },
                 {
@@ -2406,7 +2407,7 @@ fn golden_send_json_output_shapes_are_stable() {
                     "status": "completed"
                 }
             ],
-            "assistantResponses": [{ "text": "done" }],
+            "assistantResponses": [{ "itemId": "item_agent", "text": "done" }],
             "finalAssistantText": "done"
         })
     );
@@ -2431,6 +2432,7 @@ fn golden_send_json_output_shapes_are_stable() {
                 "server": "work",
                 "threadId": "thread_1",
                 "turnId": "turn_1",
+                "itemId": "item_agent",
                 "delta": "done"
             }),
             json!({

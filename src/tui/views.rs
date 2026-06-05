@@ -907,17 +907,14 @@ mod tests {
 
     #[test]
     fn stream_status_omits_ids_and_duplicate_attachment_flags() {
-        let stream = StreamState {
-            thread_id: "019e95bd-1b12-7c32-81de-89d02e9bcbfc".to_string(),
-            turn_id: Some("019e99e7-decc-7bb2-8c80-0c7f0a54d413".to_string()),
-            status: StreamStatus::Detached,
-            accumulated_text: String::new(),
-            events: Vec::new(),
-            attached: true,
-            detached: true,
-            last_error: None,
-            last_poll_at: Some(std::time::Instant::now()),
-        };
+        let mut stream = StreamState::new(
+            "019e95bd-1b12-7c32-81de-89d02e9bcbfc".to_string(),
+            Some("019e99e7-decc-7bb2-8c80-0c7f0a54d413".to_string()),
+            StreamStatus::Detached,
+            true,
+        );
+        stream.detached = true;
+        stream.last_poll_at = Some(std::time::Instant::now());
 
         assert_eq!(format_stream(&stream), " stream=detached");
     }
@@ -1154,17 +1151,12 @@ mod tests {
             viewport_height: None,
             last_error: None,
         });
-        state.stream = Some(StreamState {
-            thread_id: "thread-1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            status: StreamStatus::Running,
-            accumulated_text: String::new(),
-            events: Vec::new(),
-            attached: false,
-            detached: false,
-            last_error: None,
-            last_poll_at: None,
-        });
+        state.stream = Some(StreamState::new(
+            "thread-1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
 
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).unwrap();

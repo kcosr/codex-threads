@@ -164,12 +164,40 @@ pub struct StreamState {
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub status: StreamStatus,
-    pub accumulated_text: String,
+    pub assistant_items: Vec<StreamAssistantItem>,
     pub events: Vec<Value>,
     pub attached: bool,
     pub detached: bool,
     pub last_error: Option<String>,
     pub last_poll_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamAssistantItem {
+    pub turn_id: Option<String>,
+    pub item_id: Option<String>,
+    pub text: String,
+}
+
+impl StreamState {
+    pub fn new(
+        thread_id: String,
+        turn_id: Option<String>,
+        status: StreamStatus,
+        attached: bool,
+    ) -> Self {
+        Self {
+            thread_id,
+            turn_id,
+            status,
+            assistant_items: Vec::new(),
+            events: Vec::new(),
+            attached,
+            detached: false,
+            last_error: None,
+            last_poll_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

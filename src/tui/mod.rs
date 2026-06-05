@@ -43,8 +43,8 @@ use crate::tui::input::{InputAction, ModeKind};
 use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
     BrowserSource, ComposeState, ComposeTarget, DetailState, MessageBlock, MessageLine,
-    MessageLineKind, MessageSpan, Mode, SendMode, StreamState, StreamStatus, ThreadRow, TuiInit,
-    TuiState,
+    MessageLineKind, MessageSpan, Mode, SendMode, StreamAssistantItem, StreamState, StreamStatus,
+    ThreadRow, TuiInit, TuiState,
 };
 use crate::turns::{
     AttachTurnOptions, ControlledTurnWaitOptions, TurnControl, TurnStartOptions, TurnWaitOutcome,
@@ -673,17 +673,12 @@ async fn handle_terminal_event(
                 KeyCode::Esc => state.mode = Mode::Detail,
                 KeyCode::Enter | KeyCode::Char('T') | KeyCode::Char('t') => {
                     let (control_tx, control_rx) = mpsc::unbounded_channel();
-                    state.stream = Some(StreamState {
-                        thread_id: thread_id.clone(),
-                        turn_id: Some(turn_id.clone()),
-                        status: StreamStatus::Running,
-                        accumulated_text: String::new(),
-                        events: Vec::new(),
-                        attached: true,
-                        detached: false,
-                        last_error: None,
-                        last_poll_at: None,
-                    });
+                    state.stream = Some(StreamState::new(
+                        thread_id.clone(),
+                        Some(turn_id.clone()),
+                        StreamStatus::Running,
+                        true,
+                    ));
                     state.stream_control = Some(control_tx);
                     state.mode = Mode::Detail;
                     spawn_attach_task(
@@ -882,17 +877,12 @@ async fn handle_terminal_event(
                 && let Some(turn_id) = detail.active_turn_id.clone()
             {
                 let (control_tx, control_rx) = mpsc::unbounded_channel();
-                state.stream = Some(StreamState {
-                    thread_id: detail.thread_id.clone(),
-                    turn_id: Some(turn_id.clone()),
-                    status: StreamStatus::Running,
-                    accumulated_text: String::new(),
-                    events: Vec::new(),
-                    attached: true,
-                    detached: false,
-                    last_error: None,
-                    last_poll_at: None,
-                });
+                state.stream = Some(StreamState::new(
+                    detail.thread_id.clone(),
+                    Some(turn_id.clone()),
+                    StreamStatus::Running,
+                    true,
+                ));
                 state.stream_control = Some(control_tx);
                 spawn_attach_task(
                     target.clone(),
@@ -1274,17 +1264,12 @@ fn submit_compose(
     match compose.target {
         ComposeTarget::NewTurn { thread_id } => {
             let (control_tx, control_rx) = mpsc::unbounded_channel();
-            state.stream = Some(StreamState {
-                thread_id: thread_id.clone(),
-                turn_id: None,
-                status: StreamStatus::Starting,
-                accumulated_text: String::new(),
-                events: Vec::new(),
-                attached: false,
-                detached: false,
-                last_error: None,
-                last_poll_at: None,
-            });
+            state.stream = Some(StreamState::new(
+                thread_id.clone(),
+                None,
+                StreamStatus::Starting,
+                false,
+            ));
             state.stream_control = Some(control_tx);
             append_detail_message(
                 state,
@@ -1505,36 +1490,57 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             if state.stream.is_none()
                 && let Some(thread_id) = event["threadId"].as_str()
             {
-                state.stream = Some(StreamState {
-                    thread_id: thread_id.to_string(),
-                    turn_id: event["turnId"].as_str().map(str::to_string),
-                    status: StreamStatus::Running,
-                    accumulated_text: String::new(),
-                    events: Vec::new(),
-                    attached: event["type"].as_str() == Some("attached"),
-                    detached: false,
-                    last_error: None,
-                    last_poll_at: None,
-                });
+                state.stream = Some(StreamState::new(
+                    thread_id.to_string(),
+                    event["turnId"].as_str().map(str::to_string),
+                    StreamStatus::Running,
+                    event["type"].as_str() == Some("attached"),
+                ));
             }
             let mut pending_turn_id = None;
-            let mut assistant_text = None;
+            let mut assistant_updates = Vec::new();
             if let Some(stream) = &mut state.stream {
                 if let Some(turn_id) = event["turnId"].as_str() {
                     stream.turn_id = Some(turn_id.to_string());
                     pending_turn_id = Some(turn_id.to_string());
                 }
+                let event_turn_id = event["turnId"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| stream.turn_id.clone());
                 if let Some(delta) = event["delta"].as_str() {
-                    stream.accumulated_text.push_str(delta);
-                    assistant_text = Some(stream.accumulated_text.clone());
+                    let item_id = event["itemId"].as_str().map(str::to_string);
+                    let text = append_stream_assistant_delta(
+                        stream,
+                        event_turn_id.clone(),
+                        item_id.clone(),
+                        delta,
+                    );
+                    assistant_updates.push((event_turn_id.clone(), item_id, text));
                 } else if let Some(text) = event["text"].as_str() {
-                    stream.accumulated_text = text.to_string();
-                    assistant_text = Some(stream.accumulated_text.clone());
+                    let item_id = event["itemId"].as_str().map(str::to_string);
+                    set_stream_assistant_text(stream, event_turn_id.clone(), item_id.clone(), text);
+                    assistant_updates.push((event_turn_id.clone(), item_id, text.to_string()));
+                } else if let Some(responses) = event["assistantResponses"].as_array() {
+                    for response in responses {
+                        let Some(text) = response["text"].as_str() else {
+                            continue;
+                        };
+                        let item_id = response["itemId"].as_str().map(str::to_string);
+                        set_stream_assistant_text(
+                            stream,
+                            event_turn_id.clone(),
+                            item_id.clone(),
+                            text,
+                        );
+                        assistant_updates.push((event_turn_id.clone(), item_id, text.to_string()));
+                    }
                 } else if let Some(text) = event["finalAssistantText"].as_str()
                     && !text.is_empty()
+                    && stream.assistant_items.is_empty()
                 {
-                    stream.accumulated_text = text.to_string();
-                    assistant_text = Some(stream.accumulated_text.clone());
+                    set_stream_assistant_text(stream, event_turn_id.clone(), None, text);
+                    assistant_updates.push((event_turn_id.clone(), None, text.to_string()));
                 }
                 stream.status = match event["status"].as_str() {
                     Some("completed") => StreamStatus::Completed,
@@ -1550,8 +1556,8 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             if let Some(turn_id) = pending_turn_id {
                 fill_pending_turn_ids(state, &turn_id);
             }
-            if let Some(text) = assistant_text {
-                upsert_streaming_assistant_message(state, &text);
+            for (turn_id, item_id, text) in assistant_updates {
+                upsert_streaming_assistant_message(state, turn_id, item_id, &text);
             }
         }
         AppEvent::StreamFailed(error) => {
@@ -1683,7 +1689,57 @@ fn fill_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
     }
 }
 
-fn upsert_streaming_assistant_message(state: &mut TuiState, text: &str) {
+fn append_stream_assistant_delta(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    delta: &str,
+) -> String {
+    let item = stream_assistant_item_mut(stream, turn_id, item_id);
+    item.text.push_str(delta);
+    item.text.clone()
+}
+
+fn set_stream_assistant_text(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+) {
+    stream_assistant_item_mut(stream, turn_id, item_id).text = text.to_string();
+}
+
+fn stream_assistant_item_mut(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+) -> &mut StreamAssistantItem {
+    if let Some(index) = stream.assistant_items.iter().position(|item| {
+        if item_id.is_some() || item.item_id.is_some() {
+            item.item_id == item_id
+        } else {
+            item.turn_id == turn_id
+        }
+    }) {
+        return &mut stream.assistant_items[index];
+    }
+    stream.assistant_items.push(StreamAssistantItem {
+        turn_id,
+        item_id,
+        text: String::new(),
+    });
+    stream
+        .assistant_items
+        .last_mut()
+        .expect("stream assistant item just pushed")
+}
+
+fn upsert_streaming_assistant_message(
+    state: &mut TuiState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+) {
     let Some(stream) = &state.stream else {
         return;
     };
@@ -1694,18 +1750,21 @@ fn upsert_streaming_assistant_message(state: &mut TuiState, text: &str) {
         return;
     }
     let was_at_bottom = detail.is_at_bottom();
-    let turn_id = stream.turn_id.clone();
-    if let Some(message) = detail
-        .messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.role == "assistant" && message.turn_id == turn_id)
-    {
+    if let Some(message) = detail.messages.iter_mut().rev().find(|message| {
+        if item_id.is_some() || message.item_id.is_some() {
+            message.role == "assistant" && message.item_id == item_id
+        } else {
+            message.role == "assistant" && message.turn_id == turn_id
+        }
+    }) {
         message.lines = markdown_lines(text, 100);
+        if message.turn_id.is_none() {
+            message.turn_id = turn_id.clone();
+        }
     } else {
         detail.messages.push(message_block(
             turn_id,
-            None,
+            item_id,
             "assistant",
             Some("streaming".to_string()),
             text,
@@ -2693,6 +2752,7 @@ mod tests {
                 "type": "delta",
                 "threadId": "t1",
                 "turnId": "turn-1",
+                "itemId": "assistant-1",
                 "delta": "first prune"
             })),
             &mut state,
@@ -2702,6 +2762,7 @@ mod tests {
                 "type": "delta",
                 "threadId": "t1",
                 "turnId": "turn-1",
+                "itemId": "assistant-1",
                 "delta": " chunk"
             })),
             &mut state,
@@ -2712,8 +2773,73 @@ mod tests {
         assert_eq!(detail.messages.len(), 2);
         assert_eq!(detail.messages[0].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(detail.messages[1].role, "assistant");
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-1"));
         assert_eq!(detail.messages[1].lines[0].text, "first prune chunk");
         assert_eq!(detail.matches, vec![1]);
+    }
+
+    #[test]
+    fn stream_deltas_for_distinct_assistant_items_render_separate_messages() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        for event in [
+            serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": "first"
+            }),
+            serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": " message"
+            }),
+            serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-2",
+                "delta": "second"
+            }),
+            serde_json::json!({
+                "type": "assistantMessage",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-2",
+                "text": "second corrected"
+            }),
+        ] {
+            handle_app_event(AppEvent::StreamEvent(event), &mut state);
+        }
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[0].lines[0].text, "first message");
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-2"));
+        assert_eq!(detail.messages[1].lines[0].text, "second corrected");
     }
 
     #[test]
@@ -2777,17 +2903,12 @@ mod tests {
         });
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         state.stream_control = Some(control_tx);
-        state.stream = Some(StreamState {
-            thread_id: "t1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            status: StreamStatus::Running,
-            accumulated_text: String::new(),
-            events: Vec::new(),
-            attached: true,
-            detached: false,
-            last_error: None,
-            last_poll_at: None,
-        });
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
 
         detach_stream(&mut state);
         let stream = state.stream.as_ref().expect("stream");
@@ -2831,17 +2952,12 @@ mod tests {
         ));
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         state.stream_control = Some(control_tx);
-        state.stream = Some(StreamState {
-            thread_id: "t1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            status: StreamStatus::Running,
-            accumulated_text: String::new(),
-            events: Vec::new(),
-            attached: true,
-            detached: false,
-            last_error: None,
-            last_poll_at: None,
-        });
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
 
         unlink_detail_session(&mut state);
 
@@ -2880,17 +2996,12 @@ mod tests {
 
         assert_eq!(detail_follow_refresh_thread(&state).as_deref(), Some("t1"));
 
-        state.stream = Some(StreamState {
-            thread_id: "t1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            status: StreamStatus::Running,
-            accumulated_text: String::new(),
-            events: Vec::new(),
-            attached: true,
-            detached: false,
-            last_error: None,
-            last_poll_at: None,
-        });
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
         assert!(detail_follow_refresh_thread(&state).is_none());
     }
 
@@ -3229,17 +3340,12 @@ mod tests {
         });
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         state.stream_control = Some(control_tx);
-        state.stream = Some(StreamState {
-            thread_id: "t1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            status: StreamStatus::Running,
-            accumulated_text: String::new(),
-            events: Vec::new(),
-            attached: true,
-            detached: false,
-            last_error: None,
-            last_poll_at: None,
-        });
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
 
         handle_app_event(AppEvent::ShutdownSignal, &mut state);
         assert!(state.should_quit);

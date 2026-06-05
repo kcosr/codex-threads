@@ -38,6 +38,103 @@ pub enum TurnWaitOutcome {
     LocalInterrupt { thread_id: String, turn_id: String },
 }
 
+#[derive(Debug, Clone, Default)]
+struct AssistantResponses {
+    items: Vec<AssistantResponse>,
+}
+
+#[derive(Debug, Clone)]
+struct AssistantResponse {
+    item_id: Option<String>,
+    text: String,
+}
+
+impl AssistantResponses {
+    fn is_empty(&self) -> bool {
+        self.items.iter().all(|item| item.text.is_empty())
+    }
+
+    fn contains_item(&self, item_id: Option<&str>) -> bool {
+        self.items.iter().any(|item| match item_id {
+            Some(item_id) => item.item_id.as_deref() == Some(item_id),
+            None => item.item_id.is_none(),
+        })
+    }
+
+    fn text_for_item(&self, item_id: Option<&str>) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|item| match item_id {
+                Some(item_id) => item.item_id.as_deref() == Some(item_id),
+                None => item.item_id.is_none(),
+            })
+            .map(|item| item.text.as_str())
+    }
+
+    fn append_delta(&mut self, item_id: Option<&str>, delta: &str) {
+        self.item_mut(item_id).text.push_str(delta);
+    }
+
+    fn set_text(&mut self, item_id: Option<&str>, text: &str) {
+        self.item_mut(item_id).text = text.to_string();
+    }
+
+    fn replace_from_turn(&mut self, turn: &Value) {
+        self.items = turn["items"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter(|item| item["type"].as_str() == Some("agentMessage"))
+            .filter_map(|item| {
+                Some(AssistantResponse {
+                    item_id: item["id"].as_str().map(str::to_string),
+                    text: item["text"].as_str()?.to_string(),
+                })
+            })
+            .collect();
+    }
+
+    fn final_text(&self) -> String {
+        self.items
+            .iter()
+            .filter(|item| !item.text.is_empty())
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn to_json(&self) -> Vec<Value> {
+        self.items
+            .iter()
+            .filter(|item| !item.text.is_empty())
+            .map(|item| {
+                let mut map = Map::new();
+                if let Some(item_id) = &item.item_id {
+                    map.insert("itemId".to_string(), json!(item_id));
+                }
+                map.insert("text".to_string(), json!(item.text));
+                Value::Object(map)
+            })
+            .collect()
+    }
+
+    fn item_mut(&mut self, item_id: Option<&str>) -> &mut AssistantResponse {
+        if let Some(index) = self.items.iter().position(|item| match item_id {
+            Some(item_id) => item.item_id.as_deref() == Some(item_id),
+            None => item.item_id.is_none(),
+        }) {
+            return &mut self.items[index];
+        }
+        self.items.push(AssistantResponse {
+            item_id: item_id.map(str::to_string),
+            text: String::new(),
+        });
+        self.items
+            .last_mut()
+            .expect("assistant response just pushed")
+    }
+}
+
 #[cfg(feature = "tui")]
 pub struct AttachTurnOptions {
     pub thread_id: String,
@@ -157,7 +254,7 @@ where
     G: FnMut(&str) -> Result<()>,
 {
     let mut events = vec![started.acceptance];
-    let mut assistant_text = String::new();
+    let mut assistant = AssistantResponses::default();
     let wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
@@ -167,7 +264,7 @@ where
     for notification in started.early_notifications {
         let before_len = events.len();
         if let Some(terminal) =
-            process_turn_notification(&wait, notification, &mut assistant_text, &mut events)?
+            process_turn_notification(&wait, notification, &mut assistant, &mut events)?
         {
             if events.len() > before_len {
                 on_event(events.last().expect("terminal event just pushed"))?;
@@ -198,7 +295,7 @@ where
                         if let Some(terminal) = poll_turn_completion(
                             client,
                             &wait,
-                            &mut assistant_text,
+                            &mut assistant,
                             &mut events,
                             &mut on_assistant_text_from_poll,
                         ).await? {
@@ -236,7 +333,7 @@ where
                 if let Some(terminal) = process_turn_notification(
                     &wait,
                     notification,
-                    &mut assistant_text,
+                    &mut assistant,
                     &mut events,
                 )? {
                     if events.len() > before_len {
@@ -253,7 +350,7 @@ where
                 if let Some(terminal) = poll_turn_completion(
                     client,
                     &wait,
-                    &mut assistant_text,
+                    &mut assistant,
                     &mut events,
                     &mut on_assistant_text_from_poll,
                 ).await? {
@@ -351,7 +448,7 @@ where
     G: FnMut(&str) -> Result<()>,
 {
     let mut events = vec![started.acceptance];
-    let mut assistant_text = String::new();
+    let mut assistant = AssistantResponses::default();
     let wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
@@ -361,7 +458,7 @@ where
     for notification in started.early_notifications {
         let before_len = events.len();
         if let Some(terminal) =
-            process_turn_notification(&wait, notification, &mut assistant_text, &mut events)?
+            process_turn_notification(&wait, notification, &mut assistant, &mut events)?
         {
             if events.len() > before_len {
                 on_event(events.last().expect("terminal event just pushed"))?;
@@ -396,7 +493,7 @@ where
                 if let Some(terminal) = process_turn_notification(
                     &wait,
                     notification,
-                    &mut assistant_text,
+                    &mut assistant,
                     &mut events,
                 )? {
                     if events.len() > before_len {
@@ -413,7 +510,7 @@ where
                 if let Some(terminal) = poll_turn_completion(
                     client,
                     &wait,
-                    &mut assistant_text,
+                    &mut assistant,
                     &mut events,
                     &mut on_assistant_text_from_poll,
                 ).await? {
@@ -488,7 +585,7 @@ fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str)
 async fn poll_turn_completion(
     client: &mut RpcClient,
     wait: &TurnWaitContext<'_>,
-    assistant_text: &mut String,
+    assistant: &mut AssistantResponses,
     events: &mut Vec<Value>,
     on_assistant_text_from_poll: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<Option<TurnTerminal>> {
@@ -501,9 +598,7 @@ async fn poll_turn_completion(
         )
         .await?;
     for notification in notifications {
-        if let Some(terminal) =
-            process_turn_notification(wait, notification, assistant_text, events)?
-        {
+        if let Some(terminal) = process_turn_notification(wait, notification, assistant, events)? {
             return Ok(Some(terminal));
         }
     }
@@ -521,21 +616,22 @@ async fn poll_turn_completion(
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
-    if assistant_text.is_empty() {
-        *assistant_text = extract_assistant_text_from_turn(turn);
-        if !assistant_text.is_empty() {
-            on_assistant_text_from_poll(assistant_text)?;
+    if assistant.is_empty() {
+        assistant.replace_from_turn(turn);
+        let final_text = assistant.final_text();
+        if !final_text.is_empty() {
+            on_assistant_text_from_poll(&final_text)?;
         }
     }
     let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": wait.turn_id, "status": status, "source": "poll"});
     events.push(event);
-    Ok(Some(turn_terminal(wait, status, assistant_text, events)))
+    Ok(Some(turn_terminal(wait, status, assistant, events)))
 }
 
 fn process_turn_notification(
     wait: &TurnWaitContext<'_>,
     notification: Notification,
-    assistant_text: &mut String,
+    assistant: &mut AssistantResponses,
     events: &mut Vec<Value>,
 ) -> Result<Option<TurnTerminal>> {
     let Some(event) = turn_event(
@@ -543,7 +639,7 @@ fn process_turn_notification(
         wait.thread_id,
         wait.turn_id,
         notification,
-        assistant_text,
+        assistant,
     )?
     else {
         return Ok(None);
@@ -559,23 +655,24 @@ fn process_turn_notification(
     }
 
     let status = status.expect("status checked");
-    Ok(Some(turn_terminal(wait, &status, assistant_text, events)))
+    Ok(Some(turn_terminal(wait, &status, assistant, events)))
 }
 
 fn turn_terminal(
     wait: &TurnWaitContext<'_>,
     status: &str,
-    assistant_text: &str,
+    assistant: &AssistantResponses,
     events: &[Value],
 ) -> TurnTerminal {
+    let final_text = assistant.final_text();
     let output = json!({
         "server": wait.target.server,
         "threadId": wait.thread_id,
         "turnId": wait.turn_id,
         "status": status,
         "progress": events,
-        "assistantResponses": if assistant_text.is_empty() { Vec::<Value>::new() } else { vec![json!({"text": assistant_text})] },
-        "finalAssistantText": assistant_text
+        "assistantResponses": assistant.to_json(),
+        "finalAssistantText": final_text
     });
     let exit_code = if output["status"].as_str() == Some("completed") {
         0
@@ -585,23 +682,12 @@ fn turn_terminal(
     TurnTerminal { output, exit_code }
 }
 
-fn extract_assistant_text_from_turn(turn: &Value) -> String {
-    turn["items"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter(|item| item["type"].as_str() == Some("agentMessage"))
-        .filter_map(|item| item["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn turn_event(
     server: &str,
     thread_id: &str,
     turn_id: &str,
     notification: Notification,
-    assistant_text: &mut String,
+    assistant: &mut AssistantResponses,
 ) -> Result<Option<Value>> {
     match notification.method.as_str() {
         "item/agentMessage/delta"
@@ -609,10 +695,16 @@ fn turn_event(
                 && notification.params["turnId"] == turn_id =>
         {
             let delta = notification.params["delta"].as_str().unwrap_or("");
-            assistant_text.push_str(delta);
-            Ok(Some(
-                json!({"type": "progress", "server": server, "threadId": thread_id, "turnId": turn_id, "delta": delta}),
-            ))
+            let item_id = notification.params["itemId"].as_str();
+            assistant.append_delta(item_id, delta);
+            let mut event = Map::new();
+            event.insert("type".to_string(), json!("progress"));
+            event.insert("server".to_string(), json!(server));
+            event.insert("threadId".to_string(), json!(thread_id));
+            event.insert("turnId".to_string(), json!(turn_id));
+            insert_opt(&mut event, "itemId", item_id.map(str::to_string));
+            event.insert("delta".to_string(), json!(delta));
+            Ok(Some(Value::Object(event)))
         }
         "item/completed"
             if notification.params["threadId"] == thread_id
@@ -620,12 +712,21 @@ fn turn_event(
         {
             if notification.params["item"]["type"].as_str() == Some("agentMessage")
                 && let Some(text) = notification.params["item"]["text"].as_str()
-                && assistant_text.is_empty()
             {
-                assistant_text.push_str(text);
-                return Ok(Some(
-                    json!({"type": "assistantMessage", "server": server, "threadId": thread_id, "turnId": turn_id, "text": text}),
-                ));
+                let item_id = notification.params["item"]["id"].as_str();
+                let previous_text = assistant.text_for_item(item_id).map(str::to_string);
+                let was_known = assistant.contains_item(item_id);
+                assistant.set_text(item_id, text);
+                if !was_known || previous_text.as_deref() != Some(text) {
+                    let mut event = Map::new();
+                    event.insert("type".to_string(), json!("assistantMessage"));
+                    event.insert("server".to_string(), json!(server));
+                    event.insert("threadId".to_string(), json!(thread_id));
+                    event.insert("turnId".to_string(), json!(turn_id));
+                    insert_opt(&mut event, "itemId", item_id.map(str::to_string));
+                    event.insert("text".to_string(), json!(text));
+                    return Ok(Some(Value::Object(event)));
+                }
             }
             Ok(None)
         }
@@ -680,5 +781,112 @@ fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
         _ => Err(app_server_error(format!(
             "app-server returned unrecognized turn status `{status}`"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::Endpoint;
+
+    #[test]
+    fn turn_terminal_preserves_multiple_assistant_item_responses() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "turn-1",
+            poll_limit: 50,
+        };
+        let mut assistant = AssistantResponses::default();
+        let mut events = Vec::new();
+
+        for notification in [
+            Notification {
+                method: "item/agentMessage/delta".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-1",
+                    "delta": "first"
+                }),
+            },
+            Notification {
+                method: "item/agentMessage/delta".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-1",
+                    "delta": " response"
+                }),
+            },
+            Notification {
+                method: "item/agentMessage/delta".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-2",
+                    "delta": "second"
+                }),
+            },
+            Notification {
+                method: "item/completed".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "assistant-2",
+                        "type": "agentMessage",
+                        "text": "second corrected"
+                    }
+                }),
+            },
+        ] {
+            assert!(
+                process_turn_notification(&wait, notification, &mut assistant, &mut events)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let terminal = process_turn_notification(
+            &wait,
+            Notification {
+                method: "turn/completed".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }),
+            },
+            &mut assistant,
+            &mut events,
+        )
+        .unwrap()
+        .expect("terminal turn");
+
+        assert_eq!(
+            terminal.output["finalAssistantText"],
+            "first response\nsecond corrected"
+        );
+        assert_eq!(
+            terminal.output["assistantResponses"],
+            json!([
+                {"itemId": "assistant-1", "text": "first response"},
+                {"itemId": "assistant-2", "text": "second corrected"}
+            ])
+        );
+        assert_eq!(terminal.output["progress"][0]["itemId"], "assistant-1");
+        assert_eq!(terminal.output["progress"][2]["itemId"], "assistant-2");
+        assert_eq!(terminal.output["progress"][3]["type"], "assistantMessage");
+        assert_eq!(terminal.output["progress"][3]["itemId"], "assistant-2");
     }
 }

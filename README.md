@@ -437,6 +437,10 @@ commands. Blocking `new PROMPT --json` and `send --json` include:
 - `assistantResponses`
 - `finalAssistantText`
 
+Streamed assistant progress events include Codex `itemId` when available, and
+`assistantResponses` contains one entry per assistant item so clients can keep
+separate assistant messages distinct.
+
 `--json --stream` is available for `new PROMPT` and `send`. It emits NDJSON:
 one accepted event, zero or more progress events, and one terminal event.
 
