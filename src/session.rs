@@ -143,6 +143,30 @@ pub async fn search_threads(
     Ok(result)
 }
 
+#[cfg(feature = "tui")]
+pub async fn set_thread_archived(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+    archived: bool,
+) -> Result<Value> {
+    let method = if archived {
+        "thread/archive"
+    } else {
+        "thread/unarchive"
+    };
+    let result = client
+        .request(method, json!({"threadId": thread_id}), |_| {})
+        .await?;
+    Ok(json!({
+        "server": target.server,
+        "threadId": thread_id,
+        "archived": archived,
+        "status": "accepted",
+        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
+    }))
+}
+
 pub async fn read_thread_detail(
     target: &Target,
     client: &mut RpcClient,

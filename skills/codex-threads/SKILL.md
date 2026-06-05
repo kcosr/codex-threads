@@ -99,8 +99,10 @@ Useful TUI keys:
 - `]` and `[` page through browser/detail cursors when available.
 - `p` toggles the browser preview pane.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
-  relative updated-time display toggle.
-- `A` edits the local annotation with `Ctrl-S` save and `Ctrl-D` clear.
+  relative updated-time display toggle. In filters, `a` toggles the archived
+  thread filter.
+- `a` edits the local annotation with `Ctrl-S` save and `Ctrl-D` clear.
+- `A` archives or unarchives the active thread.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
 - `m` composes a follow-up; `Enter` sends, `Shift-J` inserts a newline, and

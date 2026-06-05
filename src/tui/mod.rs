@@ -36,7 +36,7 @@ use crate::errors::usage_error;
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStatusRequest, list_threads,
-    read_thread_detail, search_threads, thread_status,
+    read_thread_detail, search_threads, set_thread_archived, thread_status,
 };
 use crate::tui::events::{AppEvent, BrowserQuery, DetailPageDirection, FetchRequest};
 use crate::tui::input::{InputAction, ModeKind};
@@ -118,6 +118,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
             }
             Some(event) = app_rx.recv() => {
                 let refresh_detail_after_stream = stream_finish_detail_thread(&event, &state);
+                let refresh_after_archive = archive_changed_thread(&event);
                 handle_app_event(event, &mut state);
                 if let Some(thread_id) = refresh_detail_after_stream
                     && !state.should_quit
@@ -127,6 +128,9 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                         .is_some_and(|detail| detail.thread_id == thread_id)
                 {
                     schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                }
+                if refresh_after_archive.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
             }
             _ = tick.tick() => {
@@ -836,7 +840,7 @@ async fn handle_terminal_event(
         KeyCode::Char('N') if matches!(state.mode, Mode::Detail) => {
             state.previous_message_match();
         }
-        KeyCode::Char('A') => {
+        KeyCode::Char('a') => {
             if let Some(thread_id) = active_thread_id(state) {
                 let draft = active_annotation(state).unwrap_or_default();
                 let return_to_detail = matches!(state.mode, Mode::Detail);
@@ -845,6 +849,16 @@ async fn handle_terminal_event(
                     draft,
                     return_to_detail,
                 };
+            }
+        }
+        KeyCode::Char('A') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                let archived = !active_thread_is_archived(state);
+                state.set_notice(format!(
+                    "{} {thread_id}...",
+                    if archived { "archiving" } else { "unarchiving" }
+                ));
+                spawn_archive_task(target.clone(), thread_id, archived, app_tx.clone());
             }
         }
         KeyCode::Char('y') => {
@@ -1393,6 +1407,37 @@ fn spawn_interrupt_task(
     });
 }
 
+fn spawn_archive_task(
+    target: Target,
+    thread_id: String,
+    archived: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<Value> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            set_thread_archived(&target, &mut client, thread_id.clone(), archived).await
+        }
+        .await;
+        match result {
+            Ok(output) => app_tx
+                .send(AppEvent::ArchiveChanged {
+                    thread_id,
+                    archived,
+                    thread: output["thread"].clone(),
+                })
+                .ok(),
+            Err(err) => app_tx
+                .send(AppEvent::ArchiveChangeFailed {
+                    thread_id,
+                    archived,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
 fn spawn_send_task(
     target: Target,
     thread_id: String,
@@ -1576,10 +1621,38 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
             state.stream_control = None;
         }
+        AppEvent::ArchiveChanged {
+            thread_id,
+            archived,
+            thread,
+        } => {
+            apply_archive_change(state, &thread_id, archived, &thread);
+            state.set_notice(format!(
+                "{} {thread_id}",
+                if archived { "archived" } else { "unarchived" }
+            ));
+        }
+        AppEvent::ArchiveChangeFailed {
+            thread_id,
+            archived,
+            error,
+        } => {
+            state.set_notice(format!(
+                "failed to {} {thread_id}: {error}",
+                if archived { "archive" } else { "unarchive" }
+            ));
+        }
         AppEvent::ShutdownSignal => {
             detach_stream(state);
             state.should_quit = true;
         }
+    }
+}
+
+fn archive_changed_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::ArchiveChanged { thread_id, .. } => Some(thread_id.clone()),
+        _ => None,
     }
 }
 
@@ -1787,6 +1860,20 @@ fn active_thread_id(state: &TuiState) -> Option<String> {
     }
 }
 
+fn active_thread_is_archived(state: &TuiState) -> bool {
+    match state.mode {
+        Mode::Detail => state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.status == "archived" || state.browser.archived),
+        _ => state
+            .browser
+            .rows
+            .get(state.browser.selected)
+            .is_some_and(|row| row.status == "archived" || state.browser.archived),
+    }
+}
+
 fn active_annotation(state: &TuiState) -> Option<String> {
     match state.mode {
         Mode::Detail => state
@@ -1794,6 +1881,34 @@ fn active_annotation(state: &TuiState) -> Option<String> {
             .as_ref()
             .and_then(|detail| detail.annotation.clone()),
         _ => state.selected_thread_annotation().map(str::to_string),
+    }
+}
+
+fn apply_archive_change(state: &mut TuiState, thread_id: &str, archived: bool, thread: &Value) {
+    let status = if archived {
+        "archived".to_string()
+    } else {
+        thread_status_label(thread)
+    };
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.status = status.clone();
+            if !thread.is_null() {
+                row.raw = thread.clone();
+            }
+        }
+    }
+    if state.browser.archived != archived {
+        state.browser.rows.retain(|row| row.id != thread_id);
+        state.browser.selected = state
+            .browser
+            .selected
+            .min(state.browser.rows.len().saturating_sub(1));
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.status = status;
     }
 }
 
@@ -1856,11 +1971,7 @@ fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> Thr
         .or_else(|| thread["preview"].as_str())
         .unwrap_or(&id)
         .to_string();
-    let status = thread["status"]["type"]
-        .as_str()
-        .or_else(|| thread["status"].as_str())
-        .unwrap_or("")
-        .to_string();
+    let status = thread_status_label(thread);
     let updated = thread["updatedAt"]
         .as_i64()
         .map(|updated_at| format_browser_updated_epoch(updated_at, relative_updated))
@@ -1881,6 +1992,14 @@ fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> Thr
         snippet,
         raw: item,
     }
+}
+
+fn thread_status_label(thread: &Value) -> String {
+    thread["status"]["type"]
+        .as_str()
+        .or_else(|| thread["status"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn detail_state(
@@ -3395,6 +3514,78 @@ mod tests {
         set_annotation_in_state(&mut state, "t1", None);
         assert!(state.browser.rows[0].annotation.is_none());
         assert!(state.detail.as_ref().unwrap().annotation.is_none());
+    }
+
+    #[test]
+    fn archive_change_updates_visible_rows_and_detail_status() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle"), test_thread_row("t2", "idle")];
+        state.browser.selected = 1;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        apply_archive_change(
+            &mut state,
+            "t1",
+            true,
+            &serde_json::json!({"id": "t1", "status": {"type": "archived"}}),
+        );
+
+        assert_eq!(
+            state
+                .browser
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t2"]
+        );
+        assert_eq!(state.browser.selected, 0);
+        assert_eq!(state.detail.as_ref().unwrap().status, "archived");
+    }
+
+    #[test]
+    fn archive_toggle_direction_follows_current_archived_context() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        assert!(!active_thread_is_archived(&state));
+
+        state.browser.archived = true;
+        assert!(active_thread_is_archived(&state));
+
+        apply_archive_change(
+            &mut state,
+            "t1",
+            false,
+            &serde_json::json!({"id": "t1", "status": {"type": "idle"}}),
+        );
+        assert!(state.browser.rows.is_empty());
     }
 
     #[test]

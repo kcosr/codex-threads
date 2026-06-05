@@ -766,10 +766,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let items = [
         "Browser",
         "  j/k, arrows, or wheel move; Enter opens; p toggles preview; / searches.",
-        "  f filters; s sort; c columns; A edits annotation; t toggles auto-refresh.",
+        "  a edits annotation; A toggles archive/unarchive; f filters; s sort; c columns.",
+        "  In Filters, a toggles the archived-thread filter; t toggles auto-refresh.",
         "Detail",
         "  Esc returns to the browser; / searches loaded transcript lines; gg/G jump.",
-        "  m opens compose; T attaches; S steers; i opens interrupt confirmation.",
+        "  a edits annotation; A toggles archive/unarchive; m opens compose.",
+        "  T attaches; S steers; i opens interrupt confirmation.",
         "Streams",
         "  T attaches to an active turn. Esc or q detaches locally; remote turns keep running unless interrupted.",
     ];

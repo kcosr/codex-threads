@@ -56,6 +56,16 @@ pub(crate) enum AppEvent {
     StreamEvent(Value),
     StreamFailed(String),
     StreamFinished(StreamStatus),
+    ArchiveChanged {
+        thread_id: String,
+        archived: bool,
+        thread: Value,
+    },
+    ArchiveChangeFailed {
+        thread_id: String,
+        archived: bool,
+        error: String,
+    },
     ShutdownSignal,
 }
 
