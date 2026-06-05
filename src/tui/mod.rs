@@ -29,12 +29,12 @@ use crate::session::{
 };
 use crate::tui::prefs::{TuiPrefs, load_prefs, save_prefs};
 use crate::tui::state::{
-    BrowserSource, ComposeState, ComposeTarget, DetailState, MessageLine, Mode, SendMode,
-    StreamState, StreamStatus, ThreadRow, TuiInit, TuiState,
+    BrowserSource, ComposeState, ComposeTarget, DetailState, MessageLine, MessageLineKind, Mode,
+    SendMode, StreamState, StreamStatus, ThreadRow, TuiInit, TuiState,
 };
 use crate::turns::{
-    TurnStartOptions, TurnWaitOutcome, interrupt_turn, start_turn as start_turn_request,
-    steer_turn, wait_for_turn,
+    AttachTurnOptions, TurnStartOptions, TurnWaitOutcome, attach_turn, interrupt_turn,
+    start_turn as start_turn_request, steer_turn, wait_for_turn,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -155,6 +155,7 @@ impl Drop for TerminalGuard {
 struct BrowserQuery {
     source: BrowserSource,
     query: String,
+    cursor: Option<String>,
     limit: u32,
     since: Option<i64>,
     cwd: Option<String>,
@@ -165,8 +166,15 @@ struct BrowserQuery {
 
 #[derive(Debug)]
 enum FetchRequest {
-    Browser { epoch: u64, query: BrowserQuery },
-    Detail { epoch: u64, thread_id: String },
+    Browser {
+        epoch: u64,
+        query: BrowserQuery,
+    },
+    Detail {
+        epoch: u64,
+        thread_id: String,
+        cursor: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -238,8 +246,12 @@ async fn fetch_worker(
                     }
                 }
             }
-            FetchRequest::Detail { epoch, thread_id } => {
-                let result = fetch_detail(&target, &mut client, thread_id, epoch).await;
+            FetchRequest::Detail {
+                epoch,
+                thread_id,
+                cursor,
+            } => {
+                let result = fetch_detail(&target, &mut client, thread_id, cursor, epoch).await;
                 match result {
                     Ok(detail) => {
                         let _ = app_tx.send(AppEvent::DetailLoaded {
@@ -271,7 +283,7 @@ async fn fetch_browser(
                 client,
                 ListThreadsRequest {
                     limit: query.limit,
-                    cursor: None,
+                    cursor: query.cursor,
                     since: query.since,
                     cwd: query.cwd,
                     archived: query.archived,
@@ -289,7 +301,7 @@ async fn fetch_browser(
                 SearchThreadsRequest {
                     query: query.query,
                     limit: query.limit,
-                    cursor: None,
+                    cursor: query.cursor,
                     since: query.since,
                     archived: query.archived,
                 },
@@ -319,6 +331,7 @@ async fn fetch_detail(
     target: &Target,
     client: &mut RpcClient,
     thread_id: String,
+    cursor: Option<String>,
     epoch: u64,
 ) -> Result<DetailState> {
     let output = read_thread_detail(
@@ -327,7 +340,7 @@ async fn fetch_detail(
         ShowThreadRequest {
             thread_id: thread_id.clone(),
             last: DETAIL_TURN_LIMIT,
-            cursor: None,
+            cursor,
             asc: true,
             desc: false,
             items: ItemsView::Full,
@@ -352,12 +365,21 @@ async fn schedule_browser_refresh(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
 ) -> Result<()> {
+    schedule_browser_page(state, fetch_tx, None).await
+}
+
+async fn schedule_browser_page(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    cursor: Option<String>,
+) -> Result<()> {
     state.browser.epoch += 1;
     state.browser.loading = true;
     state.browser.last_error = None;
     let query = BrowserQuery {
         source: state.browser.source,
         query: state.browser.query.clone(),
+        cursor,
         limit: state.browser.limit,
         since: state.browser.since,
         cwd: state.browser.cwd.clone(),
@@ -378,6 +400,15 @@ async fn schedule_detail_load(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
     thread_id: String,
+) -> Result<()> {
+    schedule_detail_page(state, fetch_tx, thread_id, None).await
+}
+
+async fn schedule_detail_page(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+    cursor: Option<String>,
 ) -> Result<()> {
     let epoch = state
         .detail
@@ -403,7 +434,11 @@ async fn schedule_detail_load(
     });
     state.mode = Mode::Detail;
     fetch_tx
-        .send(FetchRequest::Detail { epoch, thread_id })
+        .send(FetchRequest::Detail {
+            epoch,
+            thread_id,
+            cursor,
+        })
         .await
         .context("failed to schedule detail load")
 }
@@ -531,6 +566,50 @@ async fn handle_terminal_event(
             }
             _ => schedule_browser_refresh(state, fetch_tx).await?,
         },
+        KeyCode::Char('R') => match state.mode {
+            Mode::Detail => {
+                if let Some(thread_id) =
+                    state.detail.as_ref().map(|detail| detail.thread_id.clone())
+                {
+                    schedule_detail_load(state, fetch_tx, thread_id).await?;
+                }
+            }
+            _ => schedule_browser_refresh(state, fetch_tx).await?,
+        },
+        KeyCode::Char(']') => match state.mode {
+            Mode::Detail => {
+                if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
+                    detail
+                        .next_cursor
+                        .clone()
+                        .map(|cursor| (detail.thread_id.clone(), cursor))
+                }) {
+                    schedule_detail_page(state, fetch_tx, thread_id, Some(cursor)).await?;
+                }
+            }
+            _ => {
+                if let Some(cursor) = state.browser.next_cursor.clone() {
+                    schedule_browser_page(state, fetch_tx, Some(cursor)).await?;
+                }
+            }
+        },
+        KeyCode::Char('[') => match state.mode {
+            Mode::Detail => {
+                if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
+                    detail
+                        .backwards_cursor
+                        .clone()
+                        .map(|cursor| (detail.thread_id.clone(), cursor))
+                }) {
+                    schedule_detail_page(state, fetch_tx, thread_id, Some(cursor)).await?;
+                }
+            }
+            _ => {
+                if let Some(cursor) = state.browser.backwards_cursor.clone() {
+                    schedule_browser_page(state, fetch_tx, Some(cursor)).await?;
+                }
+            }
+        },
         KeyCode::Char('/') => match state.mode {
             Mode::Detail => {
                 let draft = state
@@ -573,6 +652,26 @@ async fn handle_terminal_event(
                     text: String::new(),
                     send_mode: SendMode::NoWait,
                 });
+            }
+        }
+        KeyCode::Char('T') => {
+            if let Some(detail) = &state.detail
+                && let Some(turn_id) = detail.active_turn_id.clone()
+            {
+                state.stream = Some(StreamState {
+                    thread_id: detail.thread_id.clone(),
+                    turn_id: Some(turn_id.clone()),
+                    status: StreamStatus::Running,
+                    events: Vec::new(),
+                    last_error: None,
+                });
+                spawn_attach_task(
+                    target.clone(),
+                    detail.thread_id.clone(),
+                    turn_id,
+                    yolo,
+                    app_tx.clone(),
+                );
             }
         }
         KeyCode::Char('i') => {
@@ -764,6 +863,53 @@ async fn handle_compose_input(
         _ => state.mode = Mode::Compose(compose),
     }
     Ok(())
+}
+
+fn spawn_attach_task(
+    target: Target,
+    thread_id: String,
+    turn_id: String,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let tx = app_tx.clone();
+            match attach_turn(
+                &target,
+                &mut client,
+                AttachTurnOptions {
+                    thread_id,
+                    turn_id,
+                    yolo,
+                    poll_limit: TURN_SCAN_LIMIT,
+                    timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                },
+                |event| {
+                    tx.send(AppEvent::StreamEvent(event.clone())).ok();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await?
+            {
+                TurnWaitOutcome::Terminal(terminal) => {
+                    tx.send(AppEvent::StreamEvent(terminal.output)).ok();
+                    Ok(match terminal.exit_code {
+                        0 => StreamStatus::Completed,
+                        _ => StreamStatus::Failed,
+                    })
+                }
+                TurnWaitOutcome::LocalInterrupt { .. } => Ok(StreamStatus::Detached),
+            }
+        }
+        .await;
+        match result {
+            Ok(status) => app_tx.send(AppEvent::StreamFinished(status)).ok(),
+            Err(err) => app_tx.send(AppEvent::StreamFailed(err.to_string())).ok(),
+        };
+    });
 }
 
 fn spawn_steer_task(
@@ -1018,10 +1164,10 @@ fn detail_state(
                         .filter_map(|input| input["text"].as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    push_wrapped_lines(&mut lines, turn_id.clone(), "user", &text, width);
+                    push_markdown_lines(&mut lines, turn_id.clone(), "user", &text, width);
                 }
                 Some("agentMessage") => {
-                    push_wrapped_lines(
+                    push_markdown_lines(
                         &mut lines,
                         turn_id.clone(),
                         "assistant",
@@ -1057,7 +1203,7 @@ fn detail_state(
     }
 }
 
-fn push_wrapped_lines(
+fn push_markdown_lines(
     lines: &mut Vec<MessageLine>,
     turn_id: Option<String>,
     role: &str,
@@ -1068,16 +1214,49 @@ fn push_wrapped_lines(
         lines.push(MessageLine {
             turn_id,
             role: role.to_string(),
+            kind: MessageLineKind::Text,
             text: String::new(),
             is_match: false,
         });
         return;
     }
+    let mut in_code = false;
     for raw_line in text.lines() {
-        for wrapped in textwrap::wrap(raw_line, width) {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            let label = trimmed.trim_matches('`').trim();
+            let text = if label.is_empty() {
+                "code".to_string()
+            } else {
+                format!("code {label}")
+            };
             lines.push(MessageLine {
                 turn_id: turn_id.clone(),
                 role: role.to_string(),
+                kind: MessageLineKind::Code,
+                text,
+                is_match: false,
+            });
+            continue;
+        }
+        let (kind, display) = if in_code {
+            (MessageLineKind::Code, raw_line.to_string())
+        } else if trimmed.starts_with('#') {
+            (
+                MessageLineKind::Heading,
+                trimmed.trim_start_matches('#').trim().to_string(),
+            )
+        } else if let Some(quote) = trimmed.strip_prefix('>') {
+            (MessageLineKind::Quote, quote.trim_start().to_string())
+        } else {
+            (MessageLineKind::Text, raw_line.to_string())
+        };
+        for wrapped in textwrap::wrap(&display, width) {
+            lines.push(MessageLine {
+                turn_id: turn_id.clone(),
+                role: role.to_string(),
+                kind,
                 text: wrapped.to_string(),
                 is_match: false,
             });
@@ -1183,7 +1362,7 @@ mod tests {
                 "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
                     {"id": "turn-1", "items": [
                         {"type": "userMessage", "content": [{"text": "hello"}]},
-                        {"type": "agentMessage", "text": "world"}
+                        {"type": "agentMessage", "text": "# Summary\n> note\n```rust\nfn main() {}\n```"}
                     ]}
                 ]}
             }),
@@ -1191,8 +1370,12 @@ mod tests {
             "t1".to_string(),
             1,
         );
-        assert_eq!(detail.lines.len(), 2);
+        assert_eq!(detail.lines.len(), 6);
         assert_eq!(detail.lines[0].role, "user");
         assert_eq!(detail.lines[1].role, "assistant");
+        assert_eq!(detail.lines[1].kind, MessageLineKind::Heading);
+        assert_eq!(detail.lines[2].kind, MessageLineKind::Quote);
+        assert_eq!(detail.lines[3].kind, MessageLineKind::Code);
+        assert_eq!(detail.lines[4].kind, MessageLineKind::Code);
     }
 }

@@ -2,8 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
+use crate::tui::state::MessageLineKind;
 use crate::tui::state::{BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState};
 
 pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
@@ -187,21 +188,28 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .add_modifier(Modifier::BOLD),
             _ => Style::default().fg(Color::Gray),
         };
-        let text_style = if line.is_match {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else {
-            Style::default()
+        let mut text_style = match line.kind {
+            MessageLineKind::Text => Style::default(),
+            MessageLineKind::Heading => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            MessageLineKind::Quote => Style::default().fg(Color::Gray),
+            MessageLineKind::Code => Style::default().fg(Color::LightBlue),
         };
-        ListItem::new(Line::from(vec![
+        if line.is_match {
+            text_style = text_style.fg(Color::Black).bg(Color::Yellow);
+        }
+        Line::from(vec![
             Span::styled(format!("{:>9} ", line.role), role_style),
             Span::styled(line.text.clone(), text_style),
-        ]))
+        ])
     });
     frame.render_widget(
-        List::new(lines)
+        Paragraph::new(lines.collect::<Vec<_>>())
             .block(Block::default().title(" Transcript ").borders(Borders::ALL))
-            .style(Style::default())
-            .highlight_style(Style::default()),
+            .scroll((detail.scroll, 0))
+            .wrap(Wrap { trim: false })
+            .style(Style::default()),
         chunks[1],
     );
 }
@@ -242,10 +250,10 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 fn draw_help_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let text = match state.mode {
         Mode::Browser => {
-            "j/k move  Enter open  / search  r refresh  A annotate  e send  c cols  t auto  ? help  q quit"
+            "j/k move  Enter open  / search  r refresh  ]/[ page  A annotate  e send  c cols  t auto  ? help  q quit"
         }
         Mode::Detail => {
-            "Esc browser  j/k scroll  / search  e send  S steer  i interrupt  A annotate  r refresh  q quit"
+            "Esc browser  j/k scroll  / search  ]/[ page  e send  T attach  S steer  i interrupt  A annotate  r refresh  q quit"
         }
         Mode::Compose(_) => "Enter send  Tab stream/no-wait  Esc cancel",
         _ => "Enter accept  Esc cancel",
@@ -282,7 +290,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Esc returns to the browser; / searches loaded transcript lines.",
         "  e opens compose; Tab in compose toggles stream and no-wait.",
         "Streams",
-        "  Esc or q detaches locally; remote turns keep running unless interrupted.",
+        "  T attaches to an active turn. Esc or q detaches locally; remote turns keep running unless interrupted.",
     ];
     frame.render_widget(
         Paragraph::new(items.join("\n"))

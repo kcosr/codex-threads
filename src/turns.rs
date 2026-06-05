@@ -37,6 +37,15 @@ pub enum TurnWaitOutcome {
 }
 
 #[cfg(feature = "tui")]
+pub struct AttachTurnOptions {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub yolo: bool,
+    pub poll_limit: u32,
+    pub timeout: Duration,
+}
+
+#[cfg(feature = "tui")]
 pub async fn steer_turn(
     target: &Target,
     client: &mut RpcClient,
@@ -78,6 +87,37 @@ pub async fn interrupt_turn(
     Ok(
         json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": turn_id, "status": "accepted"}),
     )
+}
+
+#[cfg(feature = "tui")]
+pub async fn attach_turn<F, G>(
+    target: &Target,
+    client: &mut RpcClient,
+    options: AttachTurnOptions,
+    on_event: F,
+    on_assistant_text_from_poll: G,
+) -> Result<TurnWaitOutcome>
+where
+    F: FnMut(&Value) -> Result<()>,
+    G: FnMut(&str) -> Result<()>,
+{
+    resume_thread_for_action(client, &options.thread_id, options.yolo).await?;
+    let attached = json!({"type": "attached", "server": target.server, "threadId": options.thread_id, "turnId": options.turn_id, "status": "attached"});
+    wait_for_turn(
+        target,
+        client,
+        StartedTurn {
+            acceptance: attached,
+            thread_id: options.thread_id,
+            turn_id: options.turn_id,
+            early_notifications: Vec::new(),
+        },
+        options.poll_limit,
+        options.timeout,
+        on_event,
+        on_assistant_text_from_poll,
+    )
+    .await
 }
 
 struct TurnWaitContext<'a> {

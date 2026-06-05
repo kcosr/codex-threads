@@ -79,8 +79,17 @@ pub struct DetailState {
 pub struct MessageLine {
     pub turn_id: Option<String>,
     pub role: String,
+    pub kind: MessageLineKind,
     pub text: String,
     pub is_match: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageLineKind {
+    Text,
+    Heading,
+    Quote,
+    Code,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
