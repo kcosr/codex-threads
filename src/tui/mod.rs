@@ -14,7 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -147,7 +150,7 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         let previous_hook = panic::take_hook();
         let previous_hook = Arc::new(Mutex::new(Some(previous_hook)));
         let hook_for_panic = Arc::clone(&previous_hook);
@@ -181,7 +184,12 @@ impl Drop for TerminalGuard {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        Show,
+        LeaveAlternateScreen
+    );
 }
 
 #[cfg(unix)]
@@ -500,8 +508,13 @@ async fn handle_terminal_event(
     fetch_tx: &mpsc::Sender<FetchRequest>,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
-    let Event::Key(key) = event else {
-        return Ok(());
+    let key = match event {
+        Event::Key(key) => key,
+        Event::Mouse(mouse) => {
+            handle_mouse_event(mouse, state);
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
     if key.kind != KeyEventKind::Press {
         return Ok(());
@@ -871,19 +884,11 @@ async fn handle_terminal_event(
         }
         KeyCode::Char('s') if matches!(state.mode, Mode::Browser) => state.mode = Mode::SortMenu,
         KeyCode::Down | KeyCode::Char('j') => match state.mode {
-            Mode::Detail => {
-                if let Some(detail) = &mut state.detail {
-                    detail.scroll = detail.scroll.saturating_add(1);
-                }
-            }
+            Mode::Detail => scroll_detail(state, 1),
             _ => state.move_selection(1),
         },
         KeyCode::Up | KeyCode::Char('k') => match state.mode {
-            Mode::Detail => {
-                if let Some(detail) = &mut state.detail {
-                    detail.scroll = detail.scroll.saturating_sub(1);
-                }
-            }
+            Mode::Detail => scroll_detail(state, -1),
             _ => state.move_selection(-1),
         },
         KeyCode::Enter => {
@@ -912,6 +917,46 @@ async fn handle_terminal_event(
         _ => {}
     }
     Ok(())
+}
+
+fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+    let delta: isize = match mouse.kind {
+        MouseEventKind::ScrollUp => -3,
+        MouseEventKind::ScrollDown => 3,
+        _ => return,
+    };
+    match state.mode {
+        Mode::Detail
+        | Mode::MessageSearchInput { .. }
+        | Mode::Compose(_)
+        | Mode::ActiveTurnPrompt { .. }
+        | Mode::ConfirmInterrupt { .. } => scroll_detail(state, delta),
+        Mode::Browser
+        | Mode::SearchInput { .. }
+        | Mode::FilterMenu
+        | Mode::SortMenu
+        | Mode::ColumnsMenu
+        | Mode::Help => state.move_selection(delta),
+        Mode::AnnotationInput {
+            return_to_detail: true,
+            ..
+        } => scroll_detail(state, delta),
+        Mode::AnnotationInput {
+            return_to_detail: false,
+            ..
+        } => state.move_selection(delta),
+    }
+}
+
+fn scroll_detail(state: &mut TuiState, delta: isize) {
+    let Some(detail) = &mut state.detail else {
+        return;
+    };
+    if delta.is_negative() {
+        detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs() as u16);
+    } else {
+        detail.scroll = detail.scroll.saturating_add(delta as u16);
+    }
 }
 
 async fn handle_text_input<F>(
@@ -2364,5 +2409,79 @@ mod tests {
         set_annotation_in_state(&mut state, "t1", None);
         assert!(state.browser.rows[0].annotation.is_none());
         assert!(state.detail.as_ref().unwrap().annotation.is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_moves_browser_selection() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        for index in 0..5 {
+            state.browser.rows.push(ThreadRow {
+                id: format!("t{index}"),
+                title: format!("Thread {index}"),
+                status: String::new(),
+                updated: String::new(),
+                cwd: String::new(),
+                annotation: None,
+                snippet: None,
+                raw: serde_json::json!({}),
+            });
+        }
+
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollDown), &mut state);
+        assert_eq!(state.browser.selected, 3);
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollUp), &mut state);
+        assert_eq!(state.browser.selected, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_detail_transcript() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollDown), &mut state);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 3);
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollUp), &mut state);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+    }
+
+    fn mouse_wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }
     }
 }

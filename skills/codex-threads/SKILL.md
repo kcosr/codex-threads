@@ -92,7 +92,8 @@ instead.
 
 Useful TUI keys:
 
-- `j/k` or arrow keys move; `Enter` opens a thread.
+- `j/k`, arrow keys, or mouse wheel scrolling move through the browser and
+  detail transcript; `Enter` opens a thread.
 - `/` searches threads in the browser or loaded transcript lines in detail.
 - `]` and `[` page through browser/detail cursors when available.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns.
