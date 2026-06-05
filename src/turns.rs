@@ -56,6 +56,13 @@ pub enum TurnControl {
 }
 
 #[cfg(feature = "tui")]
+pub struct ControlledTurnWaitOptions {
+    pub poll_limit: u32,
+    pub timeout: Duration,
+    pub unsubscribe_on_detach: bool,
+}
+
+#[cfg(feature = "tui")]
 pub async fn steer_turn(
     target: &Target,
     client: &mut RpcClient,
@@ -123,10 +130,12 @@ where
             turn_id: options.turn_id,
             early_notifications: Vec::new(),
         },
-        options.poll_limit,
-        options.timeout,
+        ControlledTurnWaitOptions {
+            poll_limit: options.poll_limit,
+            timeout: options.timeout,
+            unsubscribe_on_detach: true,
+        },
         control_rx,
-        true,
         on_event,
         on_assistant_text_from_poll,
     )
@@ -138,10 +147,8 @@ pub async fn wait_for_turn_controlled<F, G>(
     target: &Target,
     client: &mut RpcClient,
     started: StartedTurn,
-    poll_limit: u32,
-    timeout: Duration,
+    options: ControlledTurnWaitOptions,
     mut control_rx: mpsc::UnboundedReceiver<TurnControl>,
-    unsubscribe_on_detach: bool,
     mut on_event: F,
     mut on_assistant_text_from_poll: G,
 ) -> Result<TurnWaitOutcome>
@@ -155,7 +162,7 @@ where
         target,
         thread_id: &started.thread_id,
         turn_id: &started.turn_id,
-        poll_limit,
+        poll_limit: options.poll_limit,
     };
     for notification in started.early_notifications {
         let before_len = events.len();
@@ -174,7 +181,7 @@ where
 
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let turn_timeout = tokio::time::sleep(timeout);
+    let turn_timeout = tokio::time::sleep(options.timeout);
     tokio::pin!(turn_timeout);
     loop {
         tokio::select! {
@@ -202,7 +209,7 @@ where
                         }
                     }
                     Some(TurnControl::Detach) | None => {
-                        if unsubscribe_on_detach {
+                        if options.unsubscribe_on_detach {
                             let _ = client
                                 .request("thread/unsubscribe", json!({"threadId": started.thread_id}), |_| {})
                                 .await;

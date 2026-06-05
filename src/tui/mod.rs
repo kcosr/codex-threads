@@ -35,14 +35,15 @@ use crate::session::{
 };
 use crate::tui::events::{AppEvent, BrowserQuery, DetailPageDirection, FetchRequest};
 use crate::tui::input::{InputAction, ModeKind};
-use crate::tui::prefs::{SortDirectionPref, TuiPrefs, load_prefs_with_warning, save_prefs};
+use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
     BrowserSource, ComposeState, ComposeTarget, DetailState, MessageBlock, MessageLine,
     MessageLineKind, Mode, SendMode, StreamState, StreamStatus, ThreadRow, TuiInit, TuiState,
 };
 use crate::turns::{
-    AttachTurnOptions, TurnControl, TurnStartOptions, TurnWaitOutcome, attach_turn, interrupt_turn,
-    start_turn as start_turn_request, steer_turn, wait_for_turn_controlled,
+    AttachTurnOptions, ControlledTurnWaitOptions, TurnControl, TurnStartOptions, TurnWaitOutcome,
+    attach_turn, interrupt_turn, start_turn as start_turn_request, steer_turn,
+    wait_for_turn_controlled,
 };
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -1270,10 +1271,12 @@ fn spawn_send_task(
                 &target,
                 &mut client,
                 started,
-                TURN_SCAN_LIMIT,
-                Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                ControlledTurnWaitOptions {
+                    poll_limit: TURN_SCAN_LIMIT,
+                    timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                    unsubscribe_on_detach: false,
+                },
                 control_rx,
-                false,
                 |event| {
                     tx.send(AppEvent::StreamEvent(event.clone())).ok();
                     Ok(())
@@ -1807,6 +1810,8 @@ fn parse_since(since: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::tui::prefs::TuiPrefs;
 
     #[test]
     fn search_clearing_switches_back_to_list_mode() {

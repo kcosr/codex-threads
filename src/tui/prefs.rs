@@ -184,12 +184,12 @@ fn read_prefs_from_path(path: &Path) -> Result<TuiPrefs> {
     if !path.exists() {
         return Ok(TuiPrefs::default());
     }
-    let lock = prefs_lock(&path)?;
+    let lock = prefs_lock(path)?;
     let _guard = lock.read()?;
-    let text = match fs::read_to_string(&path) {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) => {
-            backup_corrupt_prefs(&path);
+            backup_corrupt_prefs(path);
             return Err(err)
                 .with_context(|| format!("failed to read TUI prefs `{}`", path.display()));
         }
@@ -197,13 +197,13 @@ fn read_prefs_from_path(path: &Path) -> Result<TuiPrefs> {
     let prefs: TuiPrefs = match serde_json::from_str(&text) {
         Ok(prefs) => prefs,
         Err(err) => {
-            backup_corrupt_prefs(&path);
+            backup_corrupt_prefs(path);
             return Err(err)
                 .with_context(|| format!("failed to parse TUI prefs `{}`", path.display()));
         }
     };
     if prefs.version != PREFS_VERSION {
-        backup_corrupt_prefs(&path);
+        backup_corrupt_prefs(path);
         return Err(anyhow!(
             "unsupported TUI prefs version {}; expected {PREFS_VERSION}",
             prefs.version
