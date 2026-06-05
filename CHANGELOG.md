@@ -25,6 +25,11 @@
   the local detail/stream association on `Esc`.
 - Fix TUI detail bottom scrolling so pressing Up after `G` scrolls visibly
   immediately.
+- Rebalance TUI browser column widths, preserve full updated timestamps, and
+  compact displayed home-directory paths to `~`.
+- Group active/running TUI browser rows first with a visual gap before idle
+  rows.
+- Add `y` in the TUI to copy the active thread id through OSC 52.
 
 ### Changed
 

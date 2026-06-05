@@ -191,6 +191,7 @@ pub struct TuiState {
     pub stream: Option<StreamState>,
     pub stream_control: Option<mpsc::UnboundedSender<TurnControl>>,
     pub pending_goto_top: bool,
+    pub notice: Option<String>,
     pub should_quit: bool,
 }
 
@@ -245,6 +246,7 @@ impl TuiState {
             stream: None,
             stream_control: None,
             pending_goto_top: false,
+            notice: None,
             should_quit: false,
         }
     }
@@ -290,7 +292,7 @@ impl TuiState {
             return;
         }
         let previous_id = self.selected_thread_id().map(str::to_string);
-        self.browser.rows = rows;
+        self.browser.rows = group_running_rows_first(rows);
         self.browser.next_cursor = next_cursor;
         self.browser.backwards_cursor = backwards_cursor;
         self.browser.current_cursor = current_cursor;
@@ -460,6 +462,21 @@ impl TuiState {
                 .message_scroll_offset(message_index)
                 .min(u16::MAX as usize) as u16;
         }
+    }
+}
+
+fn group_running_rows_first(rows: Vec<ThreadRow>) -> Vec<ThreadRow> {
+    let (mut running, idle): (Vec<_>, Vec<_>) = rows.into_iter().partition(ThreadRow::is_running);
+    running.extend(idle);
+    running
+}
+
+impl ThreadRow {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status.to_ascii_lowercase().as_str(),
+            "active" | "running" | "inprogress" | "starting"
+        )
     }
 }
 

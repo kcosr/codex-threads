@@ -134,54 +134,71 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         (area, None)
     };
     let visible = state.visible_columns();
-    let mut widths = vec![Constraint::Min(20)];
+    let mut widths = vec![Constraint::Fill(2)];
     let mut header = vec![Cell::from("THREAD")];
     if visible.status {
         widths.push(Constraint::Length(11));
         header.push(Cell::from("STATUS"));
     }
     if visible.updated {
-        widths.push(Constraint::Length(14));
+        widths.push(Constraint::Length(16));
         header.push(Cell::from("UPDATED"));
     }
     if visible.cwd {
-        widths.push(Constraint::Percentage(25));
+        widths.push(Constraint::Fill(4));
         header.push(Cell::from("CWD"));
     }
     if visible.annotation {
-        widths.push(Constraint::Percentage(24));
+        widths.push(Constraint::Fill(2));
         header.push(Cell::from("ANNOTATION"));
     }
 
-    let rows = state.browser.rows.iter().enumerate().map(|(index, row)| {
-        let title = if let Some(snippet) = &row.snippet {
-            format!("{}  {}", row.title, snippet)
-        } else {
-            row.title.clone()
-        };
-        let mut cells = vec![Cell::from(title)];
-        if visible.status {
-            cells.push(Cell::from(row.status.clone()));
-        }
-        if visible.updated {
-            cells.push(Cell::from(row.updated.clone()));
-        }
-        if visible.cwd {
-            cells.push(Cell::from(row.cwd.clone()));
-        }
-        if visible.annotation {
-            cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
-        }
-        let style = if index == state.browser.selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Row::new(cells).style(style)
-    });
+    let running_count = state
+        .browser
+        .rows
+        .iter()
+        .take_while(|row| row.is_running())
+        .count();
+    let show_separator = running_count > 0 && running_count < state.browser.rows.len();
+    let column_count = header.len();
+    let rows = state
+        .browser
+        .rows
+        .iter()
+        .enumerate()
+        .flat_map(|(index, row)| {
+            let title = if let Some(snippet) = &row.snippet {
+                format!("{}  {}", row.title, snippet)
+            } else {
+                row.title.clone()
+            };
+            let mut cells = vec![Cell::from(title)];
+            if visible.status {
+                cells.push(Cell::from(row.status.clone()));
+            }
+            if visible.updated {
+                cells.push(Cell::from(row.updated.clone()));
+            }
+            if visible.cwd {
+                cells.push(Cell::from(compact_home_path(&row.cwd)));
+            }
+            if visible.annotation {
+                cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
+            }
+            let style = if index == state.browser.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mut rendered = vec![Row::new(cells).style(style)];
+            if show_separator && index + 1 == running_count {
+                rendered.push(Row::new(vec![Cell::from(""); column_count]));
+            }
+            rendered
+        });
 
     let title = match state.browser.source {
         BrowserSource::List => " Threads ",
@@ -214,7 +231,7 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     let mut text = vec![
         Line::from(row.title.clone()),
-        Line::from(format!("cwd: {}", row.cwd)),
+        Line::from(format!("cwd: {}", compact_home_path(&row.cwd))),
         Line::from(format!("thread: {}", row.id)),
         Line::from(format!("updated: {}", row.updated)),
         Line::from(format!(
@@ -330,6 +347,29 @@ fn message_header(message: &crate::tui::state::MessageBlock) -> String {
     }
 }
 
+fn compact_home_path(path: &str) -> String {
+    let Ok(home) = std::env::var("HOME") else {
+        return path.to_string();
+    };
+    compact_path_with_home(path, &home)
+}
+
+fn compact_path_with_home(path: &str, home: &str) -> String {
+    if home.is_empty() || home == "/" {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    let Some(rest) = path.strip_prefix(home) else {
+        return path.to_string();
+    };
+    let Some(rest) = rest.strip_prefix('/') else {
+        return path.to_string();
+    };
+    format!("~/{rest}")
+}
+
 fn render_message_line(line: &MessageLine, base_style: Style) -> Line<'static> {
     if line.spans.is_empty() {
         return Line::from(Span::styled(line.text.clone(), base_style));
@@ -397,8 +437,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .as_ref()
         .map(|error| format!(" error={error}"))
         .unwrap_or_default();
+    let notice = state
+        .notice
+        .as_ref()
+        .map(|notice| format!(" {notice}"))
+        .unwrap_or_default();
     let status = format!(
-        "{} rows={}{}{}{}{}{}{}",
+        "{} rows={}{}{}{}{}{}{}{}",
         match state.browser.source {
             BrowserSource::List => "list",
             BrowserSource::Search => "search",
@@ -409,7 +454,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         loading,
         stream,
         message_search,
-        error
+        error,
+        notice
     );
     frame.render_widget(Paragraph::new(status), area);
 }
@@ -647,8 +693,8 @@ mod tests {
             id: "thread-1".to_string(),
             title: "Fix tests".to_string(),
             status: "idle".to_string(),
-            updated: "2026-06-05".to_string(),
-            cwd: "/repo".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: compact_path_with_home("/home/kevin/repo", "/home/kevin"),
             annotation: Some("needs review".to_string()),
             snippet: Some("recent assistant message".to_string()),
             raw: serde_json::json!({}),
@@ -659,8 +705,23 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("Fix tests"));
+        assert!(text.contains("2026-06-05 09:30"));
+        assert!(text.contains("~/repo"));
         assert!(text.contains("needs review"));
         assert!(text.contains("recent assistant message"));
+    }
+
+    #[test]
+    fn compact_path_with_home_only_rewrites_matching_home_prefix() {
+        assert_eq!(
+            compact_path_with_home("/home/kevin/repo", "/home/kevin"),
+            "~/repo"
+        );
+        assert_eq!(compact_path_with_home("/home/kevin", "/home/kevin"), "~");
+        assert_eq!(
+            compact_path_with_home("/home/kevin-other/repo", "/home/kevin"),
+            "/home/kevin-other/repo"
+        );
     }
 
     #[test]

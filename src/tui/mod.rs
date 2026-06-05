@@ -7,7 +7,7 @@ mod prefs;
 mod state;
 mod views;
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -845,6 +845,9 @@ async fn handle_terminal_event(
                     return_to_detail,
                 };
             }
+        }
+        KeyCode::Char('y') => {
+            copy_active_thread_id(state)?;
         }
         KeyCode::Char('m') => {
             if let Some(thread_id) = active_thread_id(state) {
@@ -1724,6 +1727,54 @@ fn active_annotation(state: &TuiState) -> Option<String> {
     }
 }
 
+fn copy_active_thread_id(state: &mut TuiState) -> Result<()> {
+    let Some(thread_id) = active_thread_id(state) else {
+        state.notice = Some("no thread selected".to_string());
+        return Ok(());
+    };
+    write_osc52_clipboard(&thread_id)?;
+    state.notice = Some(format!("copied {thread_id}"));
+    Ok(())
+}
+
+fn write_osc52_clipboard(text: &str) -> Result<()> {
+    let sequence = osc52_clipboard_sequence(text);
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(sequence.as_bytes())
+        .context("failed to write OSC 52 clipboard sequence")?;
+    stdout
+        .flush()
+        .context("failed to flush OSC 52 clipboard sequence")
+}
+
+fn osc52_clipboard_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
 fn thread_row(item: Value, source: BrowserSource) -> ThreadRow {
     let thread = match source {
         BrowserSource::List => &item,
@@ -2258,6 +2309,50 @@ mod tests {
         assert_eq!(state.browser.current_cursor.as_deref(), Some("page-2"));
         assert_eq!(state.browser.next_cursor.as_deref(), Some("older"));
         assert_eq!(state.browser.backwards_cursor.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn browser_rows_group_running_threads_first_and_preserve_selection() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.epoch = 1;
+        state.browser.rows = vec![
+            test_thread_row("idle-1", "idle"),
+            test_thread_row("active-1", "active"),
+            test_thread_row("idle-2", "idle"),
+        ];
+        state.browser.selected = 2;
+
+        state.set_browser_rows(
+            1,
+            vec![
+                test_thread_row("idle-1", "idle"),
+                test_thread_row("active-1", "active"),
+                test_thread_row("idle-2", "idle"),
+            ],
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            state
+                .browser
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-1", "idle-1", "idle-2"]
+        );
+        assert_eq!(state.selected_thread_id(), Some("idle-2"));
     }
 
     #[test]
@@ -2994,6 +3089,17 @@ mod tests {
         assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
     }
 
+    #[test]
+    fn osc52_clipboard_sequence_encodes_thread_id() {
+        assert_eq!(
+            osc52_clipboard_sequence("thread-1"),
+            "\x1b]52;c;dGhyZWFkLTE=\x07"
+        );
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+        assert_eq!(base64_encode(b"a"), "YQ==");
+    }
+
     #[tokio::test]
     async fn compose_enter_submits_and_shift_enter_inserts_newline() {
         let target = Target {
@@ -3143,6 +3249,19 @@ mod tests {
             column: 0,
             row: 0,
             modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn test_thread_row(id: &str, status: &str) -> ThreadRow {
+        ThreadRow {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: status.to_string(),
+            updated: String::new(),
+            cwd: String::new(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
         }
     }
 }
