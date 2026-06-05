@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::tui::keymap::{BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_HELP};
-use crate::tui::state::MessageLineKind;
 use crate::tui::state::{BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState};
+use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
 pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
@@ -277,7 +277,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             if message.is_match {
                 text_style = text_style.bg(Color::DarkGray);
             }
-            lines.push(Line::from(Span::styled(line.text.clone(), text_style)));
+            lines.push(render_message_line(line, text_style));
         }
         lines.push(Line::from(Span::styled(
             "────────────────────────────────────────────────────────────────",
@@ -304,6 +304,32 @@ fn message_header(message: &crate::tui::state::MessageBlock) -> String {
         (false, true) => format!("{role} · {timestamp}"),
         (false, false) => format!("{role} · {timestamp} · {turn_id}"),
     }
+}
+
+fn render_message_line(line: &MessageLine, base_style: Style) -> Line<'static> {
+    if line.spans.is_empty() {
+        return Line::from(Span::styled(line.text.clone(), base_style));
+    }
+    Line::from(
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.text.clone(), span_style(span, base_style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn span_style(span: &MessageSpan, base_style: Style) -> Style {
+    let mut style = base_style;
+    if let Some(MessageColor::Rgb(red, green, blue)) = span.color {
+        style = style.fg(Color::Rgb(red, green, blue));
+    }
+    if span.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if span.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    style
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -640,6 +666,7 @@ mod tests {
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Please inspect this".to_string(),
+                        spans: Vec::new(),
                     }],
                     is_match: false,
                 },
@@ -652,10 +679,12 @@ mod tests {
                         MessageLine {
                             kind: MessageLineKind::Text,
                             text: "First response line".to_string(),
+                            spans: Vec::new(),
                         },
                         MessageLine {
                             kind: MessageLineKind::Text,
                             text: "Continuation line".to_string(),
+                            spans: Vec::new(),
                         },
                     ],
                     is_match: false,
@@ -714,6 +743,7 @@ mod tests {
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "detail stays visible".to_string(),
+                    spans: Vec::new(),
                 }],
                 is_match: false,
             }],

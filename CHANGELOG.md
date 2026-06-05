@@ -11,6 +11,8 @@
   responsive async fetch/stream model.
 - Add TUI cursor paging, active-turn attach, and markdown-aware transcript
   rendering for common headings, blockquotes, lists, and fenced code blocks.
+- Add default-off `tui-syntax-highlighting` support for syntax-highlighted TUI
+  fenced code blocks with plain-text fallback guardrails.
 
 ### Changed
 

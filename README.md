@@ -210,7 +210,8 @@ stream/no-wait for new turns; annotation editing uses `Ctrl-S` to save and
 `Ctrl-D` to clear. In detail, `T` attaches to an active turn, `S` steers it,
 `i` confirms interrupt, and `q` quits. Local detach leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
-and fenced code blocks.
+and fenced code blocks. Fenced code blocks gain syntax-highlighted spans when
+the default-off `tui-syntax-highlighting` Cargo feature is enabled.
 
 ## Configuration
 

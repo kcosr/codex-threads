@@ -107,6 +107,10 @@ In TUI search mode, `--cwd` is a local refinement over the loaded search page.
 Sort controls are disabled in search mode until app-server supports server-side
 search sorting.
 
+TUI transcript rendering is markdown-aware. Syntax highlighting for fenced code
+blocks is behind the default-off Cargo feature `tui-syntax-highlighting`; normal
+release builds still show readable plain code blocks.
+
 ## Local Annotations
 
 `codex-threads annotate` manages local notes for threads. These annotations are

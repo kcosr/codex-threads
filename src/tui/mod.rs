@@ -1,4 +1,6 @@
 mod events;
+#[cfg(feature = "tui-syntax-highlighting")]
+mod highlight;
 mod input;
 mod keymap;
 mod prefs;
@@ -38,7 +40,8 @@ use crate::tui::input::{InputAction, ModeKind};
 use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
     BrowserSource, ComposeState, ComposeTarget, DetailState, MessageBlock, MessageLine,
-    MessageLineKind, Mode, SendMode, StreamState, StreamStatus, ThreadRow, TuiInit, TuiState,
+    MessageLineKind, MessageSpan, Mode, SendMode, StreamState, StreamStatus, ThreadRow, TuiInit,
+    TuiState,
 };
 use crate::turns::{
     AttachTurnOptions, ControlledTurnWaitOptions, TurnControl, TurnStartOptions, TurnWaitOutcome,
@@ -1661,6 +1664,7 @@ fn markdown_lines(text: &str, width: usize) -> Vec<MessageLine> {
         lines.push(MessageLine {
             kind: MessageLineKind::Text,
             text: String::new(),
+            spans: Vec::new(),
         });
         return lines;
     }
@@ -1669,29 +1673,61 @@ fn markdown_lines(text: &str, width: usize) -> Vec<MessageLine> {
     let mut buffer = String::new();
     let mut list_depth = 0usize;
     let mut item_open = false;
+    let mut code_language: Option<String> = None;
 
     for event in parser {
         match event {
             MarkdownEvent::Start(Tag::Heading { .. }) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 kind = MessageLineKind::Heading;
             }
             MarkdownEvent::End(TagEnd::Heading(_)) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 kind = MessageLineKind::Text;
             }
             MarkdownEvent::Start(Tag::BlockQuote(_)) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 kind = MessageLineKind::Quote;
             }
             MarkdownEvent::End(TagEnd::BlockQuote(_)) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 kind = MessageLineKind::Text;
             }
             MarkdownEvent::Start(Tag::CodeBlock(block_kind)) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 let label = match block_kind {
                     CodeBlockKind::Fenced(info) if !info.trim().is_empty() => {
+                        code_language = Some(info.trim().to_string());
                         format!("code {}", info.trim())
                     }
                     _ => "code".to_string(),
@@ -1699,51 +1735,96 @@ fn markdown_lines(text: &str, width: usize) -> Vec<MessageLine> {
                 lines.push(MessageLine {
                     kind: MessageLineKind::Code,
                     text: label,
+                    spans: Vec::new(),
                 });
                 kind = MessageLineKind::Code;
             }
             MarkdownEvent::End(TagEnd::CodeBlock) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                code_language = None;
                 kind = MessageLineKind::Text;
             }
             MarkdownEvent::Start(Tag::List(_)) => {
                 list_depth += 1;
             }
             MarkdownEvent::End(TagEnd::List(_)) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 list_depth = list_depth.saturating_sub(1);
             }
             MarkdownEvent::Start(Tag::Item) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 if list_depth > 0 {
                     buffer.push_str("- ");
                 }
                 item_open = true;
             }
             MarkdownEvent::End(TagEnd::Item) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 item_open = false;
             }
             MarkdownEvent::Text(value) | MarkdownEvent::Code(value) => {
                 buffer.push_str(&value);
             }
             MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
                 if item_open && list_depth > 0 {
                     buffer.push_str("  ");
                 }
             }
             MarkdownEvent::End(TagEnd::Paragraph) => {
-                flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
             }
             _ => {}
         }
     }
-    flush_markdown_buffer(&mut lines, &mut buffer, kind, width);
+    flush_markdown_buffer(
+        &mut lines,
+        &mut buffer,
+        kind,
+        width,
+        code_language.as_deref(),
+    );
     if lines.is_empty() {
         lines.push(MessageLine {
             kind: MessageLineKind::Text,
             text: String::new(),
+            spans: Vec::new(),
         });
     }
     lines
@@ -1754,8 +1835,13 @@ fn flush_markdown_buffer(
     buffer: &mut String,
     kind: MessageLineKind,
     width: usize,
+    code_language: Option<&str>,
 ) {
     if buffer.is_empty() {
+        return;
+    }
+    if kind == MessageLineKind::Code {
+        flush_code_buffer(lines, buffer, width, code_language);
         return;
     }
     for raw_line in buffer.lines() {
@@ -1763,10 +1849,54 @@ fn flush_markdown_buffer(
             lines.push(MessageLine {
                 kind,
                 text: wrapped.to_string(),
+                spans: Vec::new(),
             });
         }
     }
     buffer.clear();
+}
+
+fn flush_code_buffer(
+    lines: &mut Vec<MessageLine>,
+    buffer: &mut String,
+    width: usize,
+    code_language: Option<&str>,
+) {
+    if let Some(highlighted) = highlighted_code_lines(code_language, buffer) {
+        for spans in highlighted {
+            let text = spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            lines.push(MessageLine {
+                kind: MessageLineKind::Code,
+                text,
+                spans,
+            });
+        }
+        buffer.clear();
+        return;
+    }
+    for raw_line in buffer.lines() {
+        for wrapped in textwrap::wrap(raw_line, width) {
+            lines.push(MessageLine {
+                kind: MessageLineKind::Code,
+                text: wrapped.to_string(),
+                spans: Vec::new(),
+            });
+        }
+    }
+    buffer.clear();
+}
+
+#[cfg(feature = "tui-syntax-highlighting")]
+fn highlighted_code_lines(language: Option<&str>, code: &str) -> Option<Vec<Vec<MessageSpan>>> {
+    highlight::highlight_code_lines(language, code)
+}
+
+#[cfg(not(feature = "tui-syntax-highlighting"))]
+fn highlighted_code_lines(_language: Option<&str>, _code: &str) -> Option<Vec<Vec<MessageSpan>>> {
+    None
 }
 
 fn filter_search_cwd(output: &mut Value, cwd: &str) {
@@ -1925,6 +2055,16 @@ mod tests {
         assert_eq!(detail.messages[1].lines[2].kind, MessageLineKind::Code);
         assert_eq!(detail.messages[1].lines[3].kind, MessageLineKind::Code);
         assert_eq!(detail.messages[1].lines[2].text, "code rust");
+    }
+
+    #[cfg(feature = "tui-syntax-highlighting")]
+    #[test]
+    fn markdown_code_blocks_include_highlight_spans_when_feature_enabled() {
+        let lines = markdown_lines("```rust\nfn main() {}\n```", 100);
+        assert_eq!(lines[0].text, "code rust");
+        assert_eq!(lines[1].kind, MessageLineKind::Code);
+        assert_eq!(lines[1].text, "fn main() {}");
+        assert!(!lines[1].spans.is_empty());
     }
 
     #[test]

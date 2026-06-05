@@ -112,6 +112,7 @@ pub struct MessageBlock {
 pub struct MessageLine {
     pub kind: MessageLineKind,
     pub text: String,
+    pub spans: Vec<MessageSpan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,20 @@ pub enum MessageLineKind {
     Heading,
     Quote,
     Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageSpan {
+    pub text: String,
+    pub color: Option<MessageColor>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum MessageColor {
+    Rgb(u8, u8, u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
