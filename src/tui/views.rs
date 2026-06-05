@@ -94,6 +94,35 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
+pub fn sync_viewport_state(state: &mut TuiState, area: Rect) {
+    if state.detail.is_none() {
+        return;
+    }
+    let chunks = root_chunks(area);
+    let detail_chunks = detail_chunks(chunks[0]);
+    if let Some(detail) = &mut state.detail {
+        detail.set_viewport_height(detail_chunks[1].height.saturating_sub(2));
+    }
+}
+
+fn root_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area)
+}
+
+fn detail_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area)
+}
+
 fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let (table_area, preview_area) = if state.prefs.browser.preview_pane && area.height >= 16 {
         let chunks = Layout::default()
@@ -210,10 +239,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         draw_browser(frame, area, state);
         return;
     };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(5)])
-        .split(area);
+    let chunks = detail_chunks(area);
     let metadata = vec![Line::from(vec![
         Span::styled(detail.thread_id.clone(), Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -283,9 +309,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
         lines.push(Line::from(""));
     }
-    let visible_height = chunks[1].height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(visible_height);
-    let scroll = detail.scroll.min(max_scroll.min(u16::MAX as usize) as u16);
+    let scroll = detail.scroll.min(detail.max_scroll());
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(" Transcript ").borders(Borders::ALL))
@@ -701,6 +725,7 @@ mod tests {
             loading: false,
             epoch: 1,
             last_refresh_at: None,
+            viewport_height: None,
             last_error: None,
         });
         let backend = TestBackend::new(100, 18);
@@ -761,6 +786,7 @@ mod tests {
             loading: false,
             epoch: 1,
             last_refresh_at: None,
+            viewport_height: None,
             last_error: None,
         });
         let backend = TestBackend::new(100, 18);

@@ -23,6 +23,8 @@
 - Change TUI detail views to open at the transcript bottom, follow with
   in-place refreshes while open, use `Enter` for the message action, and unlink
   the local detail/stream association on `Esc`.
+- Fix TUI detail bottom scrolling so pressing Up after `G` scrolls visibly
+  immediately.
 
 ### Changed
 

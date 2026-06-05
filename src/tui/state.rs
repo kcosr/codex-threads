@@ -96,6 +96,7 @@ pub struct DetailState {
     pub loading: bool,
     pub epoch: u64,
     pub last_refresh_at: Option<Instant>,
+    pub viewport_height: Option<u16>,
     pub last_error: Option<String>,
 }
 
@@ -319,13 +320,11 @@ impl TuiState {
         }
         if current.thread_id == detail.thread_id {
             detail.search_query = current.search_query.clone();
+            detail.viewport_height = current.viewport_height;
             detail.scroll = if current.scroll == u16::MAX {
-                detail
-                    .transcript_line_count()
-                    .saturating_sub(1)
-                    .min(u16::MAX as usize) as u16
+                detail.bottom_scroll_position()
             } else {
-                current.scroll
+                current.scroll.min(detail.max_scroll())
             };
         }
         detail.last_refresh_at = Some(Instant::now());
@@ -465,6 +464,28 @@ impl TuiState {
 }
 
 impl DetailState {
+    pub fn set_viewport_height(&mut self, height: u16) {
+        self.viewport_height = Some(height.max(1));
+        if self.scroll == u16::MAX && self.transcript_line_count() == 0 {
+            return;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn bottom_scroll_position(&self) -> u16 {
+        if self.viewport_height.is_none() {
+            return u16::MAX;
+        }
+        self.max_scroll()
+    }
+
+    pub fn max_scroll(&self) -> u16 {
+        let visible_height = self.viewport_height.unwrap_or(1).max(1) as usize;
+        self.transcript_line_count()
+            .saturating_sub(visible_height)
+            .min(u16::MAX as usize) as u16
+    }
+
     pub fn message_scroll_offset(&self, message_index: usize) -> usize {
         self.messages
             .iter()

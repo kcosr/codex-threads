@@ -102,6 +102,9 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        let size = terminal.size()?;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        views::sync_viewport_state(&mut state, area);
         terminal.draw(|frame| views::draw(frame, &state))?;
         if state.should_quit {
             break;
@@ -509,6 +512,7 @@ async fn schedule_detail_page(
             loading: true,
             epoch,
             last_refresh_at: None,
+            viewport_height: None,
             last_error: None,
         });
     }
@@ -989,10 +993,7 @@ fn jump_to_bottom(state: &mut TuiState) {
     match state.mode {
         Mode::Detail => {
             if let Some(detail) = &mut state.detail {
-                detail.scroll = detail
-                    .transcript_line_count()
-                    .saturating_sub(1)
-                    .min(u16::MAX as usize) as u16;
+                detail.scroll = detail.bottom_scroll_position();
             }
         }
         _ => {
@@ -1056,7 +1057,10 @@ fn scroll_detail(state: &mut TuiState, delta: isize) {
     if delta.is_negative() {
         detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs() as u16);
     } else {
-        detail.scroll = detail.scroll.saturating_add(delta as u16);
+        detail.scroll = detail
+            .scroll
+            .saturating_add(delta as u16)
+            .min(detail.max_scroll());
     }
 }
 
@@ -1840,6 +1844,7 @@ fn detail_state(
         loading: false,
         epoch,
         last_refresh_at: Some(std::time::Instant::now()),
+        viewport_height: None,
         last_error: None,
     }
 }
@@ -2719,6 +2724,7 @@ mod tests {
             loading: true,
             epoch: 1,
             last_refresh_at: None,
+            viewport_height: None,
             last_error: None,
         });
         let loaded = detail_state(
@@ -2735,14 +2741,15 @@ mod tests {
             1,
             None,
         );
+        state.detail.as_mut().unwrap().set_viewport_height(4);
 
         state.replace_detail(1, loaded);
 
         let detail = state.detail.as_ref().expect("detail");
-        assert_eq!(
-            detail.scroll as usize,
-            detail.transcript_line_count().saturating_sub(1)
-        );
+        assert_eq!(detail.scroll as usize, detail.transcript_line_count() - 4);
+        let bottom = detail.scroll;
+        scroll_detail(&mut state, -1);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, bottom - 1);
     }
 
     #[test]
