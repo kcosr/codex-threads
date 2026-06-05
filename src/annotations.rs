@@ -148,6 +148,9 @@ pub fn clear_annotation(target: &Target, thread_id: &str) -> Result<bool> {
 }
 
 pub fn clear_annotations(target: &Target, thread_ids: &[String]) -> Result<usize> {
+    if thread_ids.is_empty() {
+        return Ok(0);
+    }
     let removals = thread_ids.iter().cloned().collect::<BTreeSet<_>>();
     update_state(|state| {
         let namespace_key = target.annotation_namespace();
@@ -298,7 +301,7 @@ fn write_state_atomic(path: &Path, state: &AnnotationState) -> Result<()> {
         )
     })?;
     let temp_path = parent.join(format!(".{}.{}.tmp", STATE_FILE, std::process::id()));
-    {
+    let write_result = (|| -> Result<()> {
         let mut file = File::create(&temp_path).with_context(|| {
             format!(
                 "failed to create temporary annotation state `{}`",
@@ -310,14 +313,22 @@ fn write_state_atomic(path: &Path, state: &AnnotationState) -> Result<()> {
         })?;
         file.write_all(b"\n")?;
         file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
     }
-    fs::rename(&temp_path, path).with_context(|| {
+    if let Err(err) = fs::rename(&temp_path, path).with_context(|| {
         format!(
             "failed to replace annotation state `{}` with `{}`",
             path.display(),
             temp_path.display()
         )
-    })?;
+    }) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
     if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
     }
@@ -426,6 +437,26 @@ mod tests {
                 err.to_string()
                     .contains("unsupported annotation state version")
             );
+        });
+    }
+
+    #[test]
+    fn rejects_missing_state_version() {
+        with_state_dir(|temp| {
+            let path = temp.path().join(STATE_FILE);
+            fs::write(&path, r#"{"namespaces":{}}"#).unwrap();
+            let err = load_annotation(&target(), "thread_1").unwrap_err();
+            assert!(err.to_string().contains("failed to parse annotation state"));
+        });
+    }
+
+    #[test]
+    fn rejects_unknown_state_fields() {
+        with_state_dir(|temp| {
+            let path = temp.path().join(STATE_FILE);
+            fs::write(&path, r#"{"version":1,"namespaces":{},"extra":true}"#).unwrap();
+            let err = load_annotation(&target(), "thread_1").unwrap_err();
+            assert!(err.to_string().contains("failed to parse annotation state"));
         });
     }
 

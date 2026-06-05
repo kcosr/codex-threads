@@ -396,6 +396,23 @@ async fn handle_websocket<S>(
                     }
                     continue;
                 }
+                if method == "thread/read" && thread_id(&value) == "thread_error" {
+                    let response = json!({
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": "temporary read failure"
+                        }
+                    });
+                    if ws
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if should_reject_first_method(method, reject_first.method, &rejected_first_method) {
                     let message = reject_first
                         .message
@@ -1643,6 +1660,49 @@ fn annotation_prune_removes_only_missing_threads() {
             &["annotate", "get", "--server", "work", "--json", "thread_1"]
         )["annotation"]["text"],
         "Keep"
+    );
+}
+
+#[test]
+fn annotation_prune_aborts_on_unexpected_thread_read_error() {
+    let server = MockServer::start();
+    let state = TempDir::new().expect("state");
+    run_json_with_state(
+        &server,
+        &state,
+        &[
+            "annotate",
+            "set",
+            "--server",
+            "work",
+            "--json",
+            "thread_error",
+            "Keep despite transient error",
+        ],
+    );
+
+    server
+        .command()
+        .env("CODEX_THREADS_STATE", state.path())
+        .args(["annotate", "prune", "--server", "work", "--json"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains("temporary read failure"));
+
+    assert_eq!(
+        run_json_with_state(
+            &server,
+            &state,
+            &[
+                "annotate",
+                "get",
+                "--server",
+                "work",
+                "--json",
+                "thread_error"
+            ]
+        )["annotation"]["text"],
+        "Keep despite transient error"
     );
 }
 

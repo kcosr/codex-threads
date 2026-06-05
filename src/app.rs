@@ -710,9 +710,11 @@ fn attach_thread_annotations(
         return Ok(());
     };
     for item in items {
-        let thread = match projection {
-            ThreadProjection::Direct => item,
-            ThreadProjection::SearchResult => &mut item["thread"],
+        let Some(thread) = (match projection {
+            ThreadProjection::Direct => Some(item),
+            ThreadProjection::SearchResult => item.get_mut("thread"),
+        }) else {
+            continue;
         };
         if let Some(thread_id) = thread["id"].as_str()
             && let Some(annotation) = annotations.get(thread_id)
@@ -1583,13 +1585,13 @@ async fn annotate_prune_command(
             .await
         {
             Ok(_) => {}
-            Err(err) if is_thread_missing_error(&err, "thread/read", &item.thread_id) => {
+            Err(err) if is_thread_not_found_error(&err, "thread/read", &item.thread_id) => {
                 stale.push(item.thread_id.clone());
             }
             Err(err) => return Err(err),
         }
     }
-    let removed = if command.dry_run {
+    let removed = if command.dry_run || stale.is_empty() {
         0
     } else {
         clear_annotations(&target, &stale)?
@@ -1620,13 +1622,6 @@ async fn annotate_prune_command(
         ]);
     }
     Ok(0)
-}
-
-fn is_thread_missing_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
-    let Some(error) = err.downcast_ref::<RpcRequestError>() else {
-        return false;
-    };
-    error.method == method && error.error.message == format!("thread not found: {thread_id}")
 }
 
 async fn models_command(
