@@ -1660,6 +1660,7 @@ fn append_detail_message(
     detail
         .messages
         .push(message_block(turn_id, None, role, timestamp, text, 100));
+    detail.scroll = detail.bottom_scroll_position();
     if !detail.search_query.is_empty() {
         let query = detail.search_query.clone();
         state.update_message_search(query);
@@ -1687,6 +1688,7 @@ fn upsert_streaming_assistant_message(state: &mut TuiState, text: &str) {
     if detail.thread_id != stream.thread_id {
         return;
     }
+    let was_at_bottom = detail.is_at_bottom();
     let turn_id = stream.turn_id.clone();
     if let Some(message) = detail
         .messages
@@ -1704,6 +1706,9 @@ fn upsert_streaming_assistant_message(state: &mut TuiState, text: &str) {
             text,
             100,
         ));
+    }
+    if was_at_bottom {
+        detail.scroll = detail.bottom_scroll_position();
     }
     if !detail.search_query.is_empty() {
         let query = detail.search_query.clone();
@@ -2672,6 +2677,53 @@ mod tests {
     }
 
     #[test]
+    fn streaming_updates_follow_bottom_when_detail_was_at_bottom() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "userMessage", "content": [{"type": "input_text", "text": "one\ntwo\nthree\nfour"}]}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let detail = state.detail.as_mut().expect("detail");
+        detail.set_viewport_height(4);
+        detail.scroll = detail.bottom_scroll_position();
+        let before = detail.scroll;
+
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "type": "delta",
+                "threadId": "t1",
+                "turnId": "turn-2",
+                "delta": "assistant\nresponse\nkeeps\ngrowing"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.scroll, detail.bottom_scroll_position());
+        assert!(detail.scroll > before);
+    }
+
+    #[test]
     fn stream_finish_and_detach_update_local_state() {
         let mut state = TuiState::new(TuiInit {
             query: None,
@@ -2914,6 +2966,60 @@ mod tests {
         let bottom = detail.scroll;
         scroll_detail(&mut state, -1);
         assert_eq!(state.detail.as_ref().unwrap().scroll, bottom - 1);
+    }
+
+    #[test]
+    fn detail_refresh_follows_bottom_when_new_messages_arrive() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let detail = state.detail.as_mut().expect("detail");
+        detail.set_viewport_height(4);
+        detail.scroll = detail.bottom_scroll_position();
+        let before = detail.scroll;
+        let refreshed = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"},
+                        {"id": "b", "type": "agentMessage", "text": "five\nsix\nseven\neight"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+
+        state.replace_detail(1, refreshed);
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.scroll, detail.bottom_scroll_position());
+        assert!(detail.scroll > before);
     }
 
     #[test]

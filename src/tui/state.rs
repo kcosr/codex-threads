@@ -344,9 +344,11 @@ impl TuiState {
             return;
         }
         if current.thread_id == detail.thread_id {
+            let was_at_bottom =
+                current.scroll == u16::MAX || current.scroll >= current.max_scroll();
             detail.search_query = current.search_query.clone();
             detail.viewport_height = current.viewport_height;
-            detail.scroll = if current.scroll == u16::MAX {
+            detail.scroll = if was_at_bottom {
                 detail.bottom_scroll_position()
             } else {
                 current.scroll.min(detail.max_scroll())
@@ -517,6 +519,10 @@ impl DetailState {
             return u16::MAX;
         }
         self.max_scroll()
+    }
+
+    pub fn is_at_bottom(&self) -> bool {
+        self.scroll == u16::MAX || self.scroll >= self.max_scroll()
     }
 
     pub fn max_scroll(&self) -> u16 {
