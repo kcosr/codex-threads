@@ -209,7 +209,7 @@ fn browser_column_widths(
     const CWD_MAX: u16 = 46;
     const ANNOTATION_MAX: u16 = 40;
     const STATUS_WIDTH: u16 = 11;
-    const UPDATED_WIDTH: u16 = 16;
+    const UPDATED_WIDTH: u16 = 22;
 
     let mut fixed_width = 0;
     let mut flexible_columns = vec![(0_u16, TITLE_MAX, 4_u16)];
@@ -707,6 +707,10 @@ fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             format!("2 updated: {}", on_off(columns.updated)),
             format!("3 cwd: {}", on_off(columns.cwd)),
             format!("4 annotation: {}", on_off(columns.annotation)),
+            format!(
+                "5 relative updated: {}",
+                on_off(state.prefs.browser.relative_updated)
+            ),
             "Esc close".to_string(),
         ],
     );
@@ -894,7 +898,7 @@ mod tests {
             vec![
                 Constraint::Length(44),
                 Constraint::Length(11),
-                Constraint::Length(16),
+                Constraint::Length(22),
                 Constraint::Length(46),
                 Constraint::Length(40),
             ]

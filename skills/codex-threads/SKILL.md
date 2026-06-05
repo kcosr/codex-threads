@@ -98,7 +98,8 @@ Useful TUI keys:
 - `/` searches threads in the browser or loaded transcript lines in detail.
 - `]` and `[` page through browser/detail cursors when available.
 - `p` toggles the browser preview pane.
-- `f` opens filters, `s` opens sort, and `c` opens visible columns.
+- `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
+  relative updated-time display toggle.
 - `A` edits the local annotation with `Ctrl-S` save and `Ctrl-D` clear.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.

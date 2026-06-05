@@ -38,6 +38,8 @@ pub struct BrowserPrefs {
     pub direction: SortDirectionPref,
     #[serde(rename = "previewPane")]
     pub preview_pane: bool,
+    #[serde(rename = "relativeUpdated")]
+    pub relative_updated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +96,7 @@ impl Default for BrowserPrefs {
             sort: Some(SortKey::Updated),
             direction: SortDirectionPref::Desc,
             preview_pane: true,
+            relative_updated: true,
         }
     }
 }
@@ -317,6 +320,7 @@ mod tests {
         assert_eq!(value["browser"]["sort"], "updated");
         assert_eq!(value["browser"]["direction"], "desc");
         assert_eq!(value["browser"]["previewPane"], true);
+        assert_eq!(value["browser"]["relativeUpdated"], true);
         assert_eq!(value["detail"]["messageMode"], "summary");
         assert_eq!(value["detail"]["wrap"], true);
         assert_eq!(value["refresh"]["auto"], false);

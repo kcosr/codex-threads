@@ -15,6 +15,7 @@ pub(crate) struct BrowserQuery {
     pub archived: bool,
     pub sort: Option<SortKey>,
     pub descending: bool,
+    pub relative_updated: bool,
 }
 
 #[derive(Debug)]

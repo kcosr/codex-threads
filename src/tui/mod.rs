@@ -355,7 +355,7 @@ async fn fetch_browser(
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|item| thread_row(item, query.source))
+        .map(|item| thread_row(item, query.source, query.relative_updated))
         .collect();
     Ok((
         rows,
@@ -431,6 +431,7 @@ async fn schedule_browser_page(
         archived: state.browser.archived,
         sort: state.browser.sort,
         descending: state.browser.descending,
+        relative_updated: state.prefs.browser.relative_updated,
     };
     fetch_tx
         .send(FetchRequest::Browser {
@@ -654,6 +655,10 @@ async fn handle_terminal_event(
                 }
                 KeyCode::Char('4') => {
                     state.prefs.browser.columns.annotation = !state.prefs.browser.columns.annotation
+                }
+                KeyCode::Char('5') => {
+                    state.prefs.browser.relative_updated = !state.prefs.browser.relative_updated;
+                    schedule_browser_refresh(state, fetch_tx).await?;
                 }
                 _ => {}
             }
@@ -1781,7 +1786,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn thread_row(item: Value, source: BrowserSource) -> ThreadRow {
+fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> ThreadRow {
     let thread = match source {
         BrowserSource::List => &item,
         BrowserSource::Search => item.get("thread").unwrap_or(&item),
@@ -1799,7 +1804,7 @@ fn thread_row(item: Value, source: BrowserSource) -> ThreadRow {
         .to_string();
     let updated = thread["updatedAt"]
         .as_i64()
-        .map(format_browser_updated_epoch)
+        .map(|updated_at| format_browser_updated_epoch(updated_at, relative_updated))
         .unwrap_or_default();
     let cwd = thread["cwd"].as_str().unwrap_or("").to_string();
     let annotation = thread["annotation"]["text"].as_str().map(str::to_string);
@@ -2203,26 +2208,47 @@ fn format_epoch(value: i64) -> String {
         .unwrap_or_default()
 }
 
-fn format_browser_updated_epoch(value: i64) -> String {
+fn format_browser_updated_epoch(value: i64, relative: bool) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    format_browser_updated_epoch_at(value, now)
+    format_browser_updated_epoch_at(value, now, relative)
 }
 
-fn format_browser_updated_epoch_at(value: i64, now: i64) -> String {
-    let age = now.saturating_sub(value);
-    if value <= now && age < 24 * 60 * 60 {
-        if age < 60 {
-            return format!("{age}s ago");
-        }
-        if age < 60 * 60 {
-            return format!("{}m ago", age / 60);
-        }
-        return format!("{}h ago", age / (60 * 60));
+fn format_browser_updated_epoch_at(value: i64, now: i64, relative: bool) -> String {
+    if !relative || value > now {
+        return format_epoch(value);
     }
-    format_epoch(value)
+    let age = now.saturating_sub(value);
+    if age < 60 {
+        return format!("{} ago", plural_duration(age, "second"));
+    }
+    if age < 60 * 60 {
+        return format!("{} ago", plural_duration(age / 60, "minute"));
+    }
+    if age < 24 * 60 * 60 {
+        return format!("{} ago", plural_duration(age / (60 * 60), "hour"));
+    }
+    let days = age / (24 * 60 * 60);
+    let hours = (age % (24 * 60 * 60)) / (60 * 60);
+    if hours == 0 {
+        format!("{} ago", plural_duration(days, "day"))
+    } else {
+        format!(
+            "{}, {} ago",
+            plural_duration(days, "day"),
+            plural_duration(hours, "hour")
+        )
+    }
+}
+
+fn plural_duration(value: i64, unit: &str) -> String {
+    if value == 1 {
+        format!("{value} {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
 }
 
 fn parse_since(since: &str) -> Result<i64> {
@@ -2366,21 +2392,35 @@ mod tests {
     }
 
     #[test]
-    fn browser_updated_time_is_relative_within_24_hours() {
+    fn browser_updated_time_is_toggleable_and_relative_for_all_past_times() {
         let now = 1_700_000_000;
 
-        assert_eq!(format_browser_updated_epoch_at(now - 30, now), "30s ago");
-        assert_eq!(format_browser_updated_epoch_at(now - 5 * 60, now), "5m ago");
         assert_eq!(
-            format_browser_updated_epoch_at(now - 2 * 60 * 60, now),
-            "2h ago"
+            format_browser_updated_epoch_at(now - 30, now, true),
+            "30 seconds ago"
         );
         assert_eq!(
-            format_browser_updated_epoch_at(now - 24 * 60 * 60, now),
-            "2023-11-13 22:13"
+            format_browser_updated_epoch_at(now - 5 * 60, now, true),
+            "5 minutes ago"
         );
         assert_eq!(
-            format_browser_updated_epoch_at(now + 60, now),
+            format_browser_updated_epoch_at(now - 2 * 60 * 60, now, true),
+            "2 hours ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 24 * 60 * 60, now, true),
+            "1 day ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - (3 * 24 * 60 * 60 + 4 * 60 * 60), now, true),
+            "3 days, 4 hours ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 30, now, false),
+            "2023-11-14 22:12"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now + 60, now, true),
             "2023-11-14 22:14"
         );
     }
