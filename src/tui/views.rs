@@ -89,7 +89,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                     "Enter send, Shift-Enter newline, Tab mode, Esc cancel"
                 }
             };
-            draw_prompt(frame, area, label, &compose.text, footer);
+            draw_compose(frame, area, label, &compose.text, footer);
         }
         Mode::Help => draw_help(frame, area),
         _ => {}
@@ -607,6 +607,53 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, foot
     );
 }
 
+fn draw_compose(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, footer: &str) {
+    let panel_width = area.width.saturating_mul(80).checked_div(100).unwrap_or(0);
+    let inner_width = panel_width.saturating_sub(4).max(1) as usize;
+    let lines = compose_display_lines(value, inner_width);
+    let desired_height = (lines.len() as u16).saturating_add(2);
+    let max_height = area.height.saturating_sub(1).clamp(3, 18);
+    let min_height = 6.min(max_height);
+    let height = desired_height.min(max_height).max(min_height);
+    let content_height = height.saturating_sub(2).max(1) as usize;
+    let scroll = lines
+        .len()
+        .saturating_sub(content_height)
+        .min(u16::MAX as usize) as u16;
+    let area = bottom_centered_rect(area, 80, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default()
+                .title(title)
+                .title_bottom(Line::from(Span::styled(
+                    footer,
+                    Style::default().fg(Color::Gray),
+                )))
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn compose_display_lines(value: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if value.is_empty() {
+        return vec![Line::from("")];
+    }
+    let mut lines = Vec::new();
+    for raw in value.split('\n') {
+        if raw.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        for wrapped in textwrap::wrap(raw, width) {
+            lines.push(Line::from(wrapped.to_string()));
+        }
+    }
+    lines
+}
+
 fn draw_filter_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let value = if state.browser.archived { "on" } else { "off" };
     draw_static_modal(
@@ -748,6 +795,20 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn bottom_centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
+    let height = height.min(area.height);
+    let y = area.y.saturating_add(area.height.saturating_sub(height));
+    let vertical = Rect::new(area.x, y, area.width, height);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical)[1]
+}
+
 fn format_stream(state: &crate::tui::state::StreamState) -> String {
     let error = state
         .last_error
@@ -785,8 +846,8 @@ mod tests {
 
     use crate::tui::prefs::TuiPrefs;
     use crate::tui::state::{
-        DetailState, MessageBlock, MessageLine, MessageLineKind, Mode, StreamState, ThreadRow,
-        TuiInit, TuiState,
+        ComposeState, DetailState, MessageBlock, MessageLine, MessageLineKind, Mode, StreamState,
+        ThreadRow, TuiInit, TuiState,
     };
 
     use super::*;
@@ -869,6 +930,70 @@ mod tests {
         };
 
         assert_eq!(format_stream(&stream), " stream=detached");
+    }
+
+    #[test]
+    fn compose_panel_keeps_footer_separate_from_draft() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Compose(ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "thread-1".to_string(),
+            },
+            text: "first line\nsecond line".to_string(),
+            send_mode: SendMode::Stream,
+            return_to_detail: true,
+        });
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("first line"));
+        assert!(text.contains("second line"));
+        assert!(text.contains("Enter send, Shift-Enter newline, Tab mode, Esc cancel"));
+    }
+
+    #[test]
+    fn compose_panel_scrolls_to_bottom_for_long_drafts() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Compose(ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "thread-1".to_string(),
+            },
+            text: (1..=30)
+                .map(|line| format!("draft line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            send_mode: SendMode::Stream,
+            return_to_detail: true,
+        });
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("draft line 30"));
+        assert!(!text.contains("draft line 1 "));
     }
 
     #[test]
