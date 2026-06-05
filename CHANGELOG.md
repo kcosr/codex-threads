@@ -6,7 +6,7 @@
 
 - Add local thread annotations with `annotate set/get/clear/list/search/prune`,
   endpoint-scoped JSON state, and annotation projection in `list`, `search`, and
-  `show` output.
+  `show` output ([#5](https://github.com/kcosr/codex-threads/pull/5)).
 
 ## [0.1.4] - 2026-06-04
 
