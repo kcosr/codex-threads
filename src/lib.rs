@@ -4,6 +4,7 @@ mod cli;
 mod completion;
 mod config;
 mod rpc;
+mod session;
 
 pub async fn run() -> i32 {
     app::run_cli(std::env::args_os()).await

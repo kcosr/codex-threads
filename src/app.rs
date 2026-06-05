@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::annotations::{
     AnnotationListItem, clear_annotation, clear_annotations, list_annotations, load_annotation,
-    namespace_annotations, set_annotation,
+    set_annotation,
 };
 use crate::cli::*;
 use crate::completion::{
@@ -19,6 +19,11 @@ use crate::config::{
     resolve_config_path, resolve_direct_target, resolve_target,
 };
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
+use crate::session::{
+    ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
+    ShowThreadRequest, ThreadProjection, ThreadStatusRequest, list_threads, load_messages,
+    loaded_status, read_thread_detail, search_threads, thread_status,
+};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
@@ -555,40 +560,22 @@ fn render_server_ping_results(results: Vec<Value>, json_output: bool) -> Result<
 
 async fn list_command(target: Target, mut client: RpcClient, command: ListCommand) -> Result<i32> {
     let since = command.since.as_deref().map(parse_since).transpose()?;
-    let mut params = Map::new();
-    insert_opt(&mut params, "cursor", command.cursor.clone());
     let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    params.insert("limit".to_string(), json!(limit));
-    if let Some(sort) = command.sort {
-        params.insert("sortKey".to_string(), json!(sort_key(sort)));
-    }
-    params.insert(
-        "sortDirection".to_string(),
-        json!(direction(command.asc, command.desc)),
-    );
-    if command.archived {
-        params.insert("archived".to_string(), json!(true));
-    }
-    if let Some(cwd) = command.cwd {
-        params.insert("cwd".to_string(), json!(cwd));
-    }
-    let mut result = if let Some(since) = since {
-        scan_since_filtered(
-            &mut client,
-            "thread/list",
-            params,
-            command.cursor,
+    let result = list_threads(
+        &target,
+        &mut client,
+        ListThreadsRequest {
             limit,
+            cursor: command.cursor,
             since,
-            ThreadProjection::Direct,
-        )
-        .await?
-    } else {
-        client
-            .request("thread/list", Value::Object(params), |_| {})
-            .await?
-    };
-    attach_thread_annotations(&target, &mut result, ThreadProjection::Direct)?;
+            cwd: command.cwd,
+            archived: command.archived,
+            sort: command.sort,
+            asc: command.asc,
+            desc: command.desc,
+        },
+    )
+    .await?;
     emit_threads_result(&target, command.json, result, ThreadProjection::Direct)
 }
 
@@ -598,31 +585,19 @@ async fn search_command(
     command: SearchCommand,
 ) -> Result<i32> {
     let since = command.since.as_deref().map(parse_since).transpose()?;
-    let mut params = Map::new();
-    insert_opt(&mut params, "cursor", command.cursor.clone());
     let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    params.insert("limit".to_string(), json!(limit));
-    params.insert("searchTerm".to_string(), json!(command.query));
-    if command.archived {
-        params.insert("archived".to_string(), json!(true));
-    }
-    let mut result = if let Some(since) = since {
-        scan_since_filtered(
-            &mut client,
-            "thread/search",
-            params,
-            command.cursor,
+    let result = search_threads(
+        &target,
+        &mut client,
+        SearchThreadsRequest {
+            query: command.query,
             limit,
+            cursor: command.cursor,
             since,
-            ThreadProjection::SearchResult,
-        )
-        .await?
-    } else {
-        client
-            .request("thread/search", Value::Object(params), |_| {})
-            .await?
-    };
-    attach_thread_annotations(&target, &mut result, ThreadProjection::SearchResult)?;
+            archived: command.archived,
+        },
+    )
+    .await?;
     emit_threads_result(
         &target,
         command.json,
@@ -631,135 +606,20 @@ async fn search_command(
     )
 }
 
-#[derive(Clone, Copy)]
-enum ThreadProjection {
-    Direct,
-    SearchResult,
-}
-
-async fn scan_since_filtered(
-    client: &mut RpcClient,
-    method: &str,
-    mut base_params: Map<String, Value>,
-    mut cursor: Option<String>,
-    limit: u32,
-    since: i64,
-    projection: ThreadProjection,
-) -> Result<Value> {
-    let mut data = Vec::new();
-    let mut next_cursor = Value::Null;
-    let mut backwards_cursor = Value::Null;
-    let mut remaining = limit;
-
-    base_params.remove("cursor");
-    base_params.remove("limit");
-
-    while remaining > 0 {
-        let mut params = base_params.clone();
-        insert_opt(&mut params, "cursor", cursor.clone());
-        params.insert("limit".to_string(), json!(remaining));
-        let page = client
-            .request(method, Value::Object(params), |_| {})
-            .await?;
-        next_cursor = page["nextCursor"].clone();
-        backwards_cursor = page["backwardsCursor"].clone();
-
-        for item in page["data"].as_array().cloned().unwrap_or_default() {
-            if thread_updated_at(&item, projection).unwrap_or(0) >= since {
-                data.push(item);
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
-            }
-        }
-
-        let Some(next) = next_cursor.as_str().filter(|value| !value.is_empty()) else {
-            break;
-        };
-        if cursor.as_deref() == Some(next) {
-            break;
-        }
-        cursor = Some(next.to_string());
-    }
-
-    Ok(json!({
-        "data": data,
-        "nextCursor": next_cursor,
-        "backwardsCursor": backwards_cursor
-    }))
-}
-
-fn thread_updated_at(item: &Value, projection: ThreadProjection) -> Option<i64> {
-    match projection {
-        ThreadProjection::Direct => item["updatedAt"].as_i64(),
-        ThreadProjection::SearchResult => item["thread"]["updatedAt"].as_i64(),
-    }
-}
-
-fn attach_thread_annotations(
-    target: &Target,
-    result: &mut Value,
-    projection: ThreadProjection,
-) -> Result<()> {
-    let annotations = namespace_annotations(target)?;
-    if annotations.is_empty() {
-        return Ok(());
-    }
-    let Some(items) = result["data"].as_array_mut() else {
-        return Ok(());
-    };
-    for item in items {
-        let Some(thread) = (match projection {
-            ThreadProjection::Direct => Some(item),
-            ThreadProjection::SearchResult => item.get_mut("thread"),
-        }) else {
-            continue;
-        };
-        if let Some(thread_id) = thread["id"].as_str()
-            && let Some(annotation) = annotations.get(thread_id)
-            && let Some(thread_object) = thread.as_object_mut()
-        {
-            thread_object.insert("annotation".to_string(), json!(annotation));
-        }
-    }
-    Ok(())
-}
-
-fn attach_annotation_to_thread(target: &Target, thread: &mut Value) -> Result<()> {
-    if let Some(thread_id) = thread["id"].as_str()
-        && let Some(annotation) = load_annotation(target, thread_id)?
-        && let Some(thread_object) = thread.as_object_mut()
-    {
-        thread_object.insert("annotation".to_string(), json!(annotation));
-    }
-    Ok(())
-}
-
 async fn show_command(target: Target, mut client: RpcClient, command: ShowCommand) -> Result<i32> {
-    let thread = client
-        .request(
-            "thread/read",
-            json!({"threadId": command.thread_id, "includeTurns": false}),
-            |_| {},
-        )
-        .await?;
-    let turns = client
-        .request(
-            "thread/turns/list",
-            json!({
-                "threadId": command.thread_id,
-                "cursor": command.cursor,
-                "limit": command.last.unwrap_or(DEFAULT_SHOW_LAST),
-                "sortDirection": direction(command.asc, command.desc),
-                "itemsView": items_view(command.items)
-            }),
-            |_| {},
-        )
-        .await?;
-    let mut thread = thread["thread"].clone();
-    attach_annotation_to_thread(&target, &mut thread)?;
-    let result = json!({"server": target.server, "thread": thread, "turns": turns});
+    let result = read_thread_detail(
+        &target,
+        &mut client,
+        ShowThreadRequest {
+            thread_id: command.thread_id,
+            last: command.last.unwrap_or(DEFAULT_SHOW_LAST),
+            cursor: command.cursor,
+            asc: command.asc,
+            desc: command.desc,
+            items: command.items,
+        },
+    )
+    .await?;
     if command.json {
         print_json(&result)?;
     } else {
@@ -773,45 +633,21 @@ async fn messages_command(
     mut client: RpcClient,
     command: MessagesCommand,
 ) -> Result<i32> {
-    let result = client
-        .request(
-            "thread/turns/list",
-            json!({
-                "threadId": command.thread_id,
-                "limit": command.max_turns,
-                "sortDirection": "desc",
-                "itemsView": "full"
-            }),
-            |_| {},
-        )
-        .await?;
-    let mut messages = flatten_messages(&result);
-    if let Some(since) = &command.since {
-        let cutoff = parse_since(since)?;
-        messages.retain(|m| {
-            m["turnStartedAt"]
-                .as_i64()
-                .or_else(|| m["turnCompletedAt"].as_i64())
-                .unwrap_or(0)
-                >= cutoff
-        });
-    }
-    let filtered_role = command.role.map(message_role_name);
-    if let Some(role) = filtered_role {
-        messages.retain(|m| m["role"].as_str() == Some(role));
-    }
-    if let Some(last) = command.last
-        && messages.len() > last
-    {
-        messages = messages.split_off(messages.len() - last);
-    }
-    let output = json!({
-        "server": target.server,
-        "threadId": command.thread_id,
-        "messages": messages,
-        "truncated": result["nextCursor"].is_string(),
-        "nextCursor": result["nextCursor"].clone()
-    });
+    let since = command.since.as_deref().map(parse_since).transpose()?;
+    let result = load_messages(
+        &target,
+        &mut client,
+        MessagesRequest {
+            thread_id: command.thread_id,
+            last: command.last,
+            since,
+            role: command.role,
+            max_turns: command.max_turns,
+        },
+    )
+    .await?;
+    let output = result.output;
+    let filtered_role = result.filtered_role.map(message_role_name);
     if command.json {
         print_json(&output)?;
     } else {
@@ -1349,29 +1185,16 @@ async fn status_command(
     command: StatusCommand,
 ) -> Result<i32> {
     if let Some(thread_id) = command.thread_id {
-        if command.load {
-            let _ = resume_thread_for_inspection(&mut client, &thread_id).await?;
-        }
-        let thread = client
-            .request(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-                |_| {},
-            )
-            .await?;
-        let turns = client
-            .request(
-                "thread/turns/list",
-                json!({"threadId": thread_id, "limit": TURN_SCAN_LIMIT, "sortDirection": "desc", "itemsView": "notLoaded"}),
-                |_| {},
-            )
-            .await?;
-        let active_turn_id = turns["data"]
-            .as_array()
-            .and_then(|turns| turns.iter().find(|turn| turn_status(turn) == "inProgress"))
-            .and_then(|turn| turn["id"].as_str())
-            .map(str::to_string);
-        let output = json!({"server": target.server, "threadId": thread_id, "thread": thread["thread"], "activeTurnId": active_turn_id, "truncated": turns["nextCursor"].is_string()});
+        let output = thread_status(
+            &target,
+            &mut client,
+            ThreadStatusRequest {
+                thread_id: thread_id.clone(),
+                load: command.load,
+                turn_scan_limit: TURN_SCAN_LIMIT,
+            },
+        )
+        .await?;
         if command.json {
             print_json(&output)?;
         } else {
@@ -1380,7 +1203,7 @@ async fn status_command(
                 ("threadId", thread_id.as_str()),
                 (
                     "status",
-                    thread["thread"]["status"]["type"].as_str().unwrap_or(""),
+                    output["thread"]["status"]["type"].as_str().unwrap_or(""),
                 ),
                 (
                     "activeTurnId",
@@ -1389,14 +1212,14 @@ async fn status_command(
             ]);
         }
     } else {
-        let loaded = client
-            .request(
-                "thread/loaded/list",
-                json!({"limit": DEFAULT_LIST_LIMIT}),
-                |_| {},
-            )
-            .await?;
-        let output = json!({"server": target.server, "reachable": true, "loadedThreadIds": loaded["data"], "nextCursor": loaded["nextCursor"]});
+        let output = loaded_status(
+            &target,
+            &mut client,
+            LoadedStatusRequest {
+                limit: DEFAULT_LIST_LIMIT,
+            },
+        )
+        .await?;
         if command.json {
             print_json(&output)?;
         } else {
@@ -1800,31 +1623,6 @@ fn print_human_event(event: &Value) {
     {
         println!("{text}");
     }
-}
-
-fn flatten_messages(turns: &Value) -> Vec<Value> {
-    let mut out = Vec::new();
-    for turn in turns["data"].as_array().unwrap_or(&Vec::new()).iter().rev() {
-        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
-            match item["type"].as_str() {
-                Some("userMessage") => {
-                    let text = item["content"]
-                        .as_array()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .filter_map(|input| input["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    out.push(json!({"role": "user", "text": text, "turnId": turn["id"], "itemId": item["id"], "turnStartedAt": turn["startedAt"], "turnCompletedAt": turn["completedAt"]}));
-                }
-                Some("agentMessage") => {
-                    out.push(json!({"role": "assistant", "text": item["text"], "turnId": turn["id"], "itemId": item["id"], "turnStartedAt": turn["startedAt"], "turnCompletedAt": turn["completedAt"]}));
-                }
-                _ => {}
-            }
-        }
-    }
-    out
 }
 
 fn print_messages(messages: &[Value], filtered_role: Option<&str>) {
@@ -2323,30 +2121,6 @@ fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
         "sandboxPolicy".to_string(),
         json!({"type": "dangerFullAccess"}),
     );
-}
-
-fn sort_key(sort: SortKey) -> &'static str {
-    match sort {
-        SortKey::Updated => "updated_at",
-        SortKey::Created => "created_at",
-    }
-}
-
-fn direction(asc: bool, desc: bool) -> &'static str {
-    if asc {
-        "asc"
-    } else {
-        let _desc_requested = desc;
-        "desc"
-    }
-}
-
-fn items_view(view: ItemsView) -> &'static str {
-    match view {
-        ItemsView::Summary => "summary",
-        ItemsView::Full => "full",
-        ItemsView::None => "notLoaded",
-    }
 }
 
 fn turn_status(turn: &Value) -> &'static str {
