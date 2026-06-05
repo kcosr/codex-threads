@@ -304,10 +304,11 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     };
     let chunks = detail_chunks(area);
+    let detail_status = detail_header_status(state);
     let metadata = vec![Line::from(vec![
         Span::styled(detail.thread_id.clone(), Style::default().fg(Color::Cyan)),
         Span::raw("  "),
-        Span::raw(detail.status.clone()),
+        Span::raw(detail_status),
         Span::raw("  "),
         Span::raw(
             detail
@@ -382,6 +383,18 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .style(Style::default()),
         chunks[1],
     );
+}
+
+fn detail_header_status(state: &TuiState) -> String {
+    let Some(detail) = &state.detail else {
+        return String::new();
+    };
+    if let Some(stream) = &state.stream
+        && stream.thread_id == detail.thread_id
+    {
+        return format!("stream={}", format_stream_state_label(stream));
+    }
+    detail.status.clone()
 }
 
 fn message_header(message: &crate::tui::state::MessageBlock) -> String {
@@ -677,19 +690,22 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
 }
 
 fn format_stream(state: &crate::tui::state::StreamState) -> String {
-    let status = if state.detached {
-        "detached"
-    } else if state.attached {
-        "attached"
-    } else {
-        format_stream_status(state.status)
-    };
     let error = state
         .last_error
         .as_ref()
         .map(|error| format!(" error={error}"))
         .unwrap_or_default();
-    format!(" stream={status}{error}")
+    format!(" stream={}{}", format_stream_state_label(state), error)
+}
+
+fn format_stream_state_label(state: &crate::tui::state::StreamState) -> &'static str {
+    if state.detached {
+        "detached"
+    } else if state.attached {
+        "attached"
+    } else {
+        format_stream_status(state.status)
+    }
 }
 
 fn format_stream_status(status: StreamStatus) -> &'static str {
@@ -929,5 +945,58 @@ mod tests {
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("detail stays visible"));
         assert!(text.contains("Active Turn"));
+    }
+
+    #[test]
+    fn detail_header_uses_matching_stream_status() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(DetailState {
+            thread_id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            annotation: None,
+            messages: Vec::new(),
+            scroll: 0,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: None,
+            active_turn_id: Some("turn-1".to_string()),
+            loading: false,
+            epoch: 1,
+            last_refresh_at: None,
+            viewport_height: None,
+            last_error: None,
+        });
+        state.stream = Some(StreamState {
+            thread_id: "thread-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            status: StreamStatus::Running,
+            accumulated_text: String::new(),
+            events: Vec::new(),
+            attached: false,
+            detached: false,
+            last_error: None,
+            last_poll_at: None,
+        });
+
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("stream=running"));
     }
 }
