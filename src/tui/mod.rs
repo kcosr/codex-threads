@@ -697,6 +697,15 @@ async fn handle_terminal_event(
         other => state.mode = other,
     }
 
+    if matches!(
+        key.code,
+        KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Home | KeyCode::End
+    ) {
+        handle_goto_key(key.code, state);
+        return Ok(());
+    }
+    state.pending_goto_top = false;
+
     match key.code {
         KeyCode::Char('q') => {
             detach_stream(state);
@@ -919,7 +928,63 @@ async fn handle_terminal_event(
     Ok(())
 }
 
+fn handle_goto_key(code: KeyCode, state: &mut TuiState) -> bool {
+    match code {
+        KeyCode::Char('g') => {
+            if state.pending_goto_top {
+                jump_to_top(state);
+                state.pending_goto_top = false;
+            } else {
+                state.pending_goto_top = true;
+            }
+            true
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            jump_to_bottom(state);
+            state.pending_goto_top = false;
+            true
+        }
+        KeyCode::Home => {
+            jump_to_top(state);
+            state.pending_goto_top = false;
+            true
+        }
+        _ => {
+            state.pending_goto_top = false;
+            false
+        }
+    }
+}
+
+fn jump_to_top(state: &mut TuiState) {
+    match state.mode {
+        Mode::Detail => {
+            if let Some(detail) = &mut state.detail {
+                detail.scroll = 0;
+            }
+        }
+        _ => state.browser.selected = 0,
+    }
+}
+
+fn jump_to_bottom(state: &mut TuiState) {
+    match state.mode {
+        Mode::Detail => {
+            if let Some(detail) = &mut state.detail {
+                detail.scroll = detail
+                    .transcript_line_count()
+                    .saturating_sub(1)
+                    .min(u16::MAX as usize) as u16;
+            }
+        }
+        _ => {
+            state.browser.selected = state.browser.rows.len().saturating_sub(1);
+        }
+    }
+}
+
 fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+    state.pending_goto_top = false;
     let delta: isize = match mouse.kind {
         MouseEventKind::ScrollUp => -3,
         MouseEventKind::ScrollDown => 3,
@@ -1854,6 +1919,9 @@ fn markdown_lines(text: &str, width: usize) -> Vec<MessageLine> {
                     width,
                     code_language.as_deref(),
                 );
+                if list_depth == 0 {
+                    push_blank_line(&mut lines, kind);
+                }
             }
             _ => {}
         }
@@ -1871,6 +1939,9 @@ fn markdown_lines(text: &str, width: usize) -> Vec<MessageLine> {
             text: String::new(),
             spans: Vec::new(),
         });
+    }
+    while lines.len() > 1 && lines.last().is_some_and(|line| line.text.is_empty()) {
+        lines.pop();
     }
     lines
 }
@@ -1890,6 +1961,10 @@ fn flush_markdown_buffer(
         return;
     }
     for raw_line in buffer.lines() {
+        if raw_line.is_empty() {
+            push_blank_line(lines, kind);
+            continue;
+        }
         for wrapped in textwrap::wrap(raw_line, width) {
             lines.push(MessageLine {
                 kind,
@@ -1923,6 +1998,10 @@ fn flush_code_buffer(
         return;
     }
     for raw_line in buffer.lines() {
+        if raw_line.is_empty() {
+            push_blank_line(lines, MessageLineKind::Code);
+            continue;
+        }
         for wrapped in textwrap::wrap(raw_line, width) {
             lines.push(MessageLine {
                 kind: MessageLineKind::Code,
@@ -1932,6 +2011,17 @@ fn flush_code_buffer(
         }
     }
     buffer.clear();
+}
+
+fn push_blank_line(lines: &mut Vec<MessageLine>, kind: MessageLineKind) {
+    if lines.last().is_some_and(|line| line.text.is_empty()) {
+        return;
+    }
+    lines.push(MessageLine {
+        kind,
+        text: String::new(),
+        spans: Vec::new(),
+    });
 }
 
 #[cfg(feature = "tui-syntax-highlighting")]
@@ -2094,12 +2184,38 @@ mod tests {
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("item-user"));
         assert_eq!(detail.messages[0].lines[0].text, "hello");
         assert_eq!(detail.messages[1].role, "assistant");
-        assert_eq!(detail.messages[1].lines.len(), 4);
+        assert_eq!(detail.messages[1].lines.len(), 5);
         assert_eq!(detail.messages[1].lines[0].kind, MessageLineKind::Heading);
         assert_eq!(detail.messages[1].lines[1].kind, MessageLineKind::Quote);
-        assert_eq!(detail.messages[1].lines[2].kind, MessageLineKind::Code);
+        assert_eq!(detail.messages[1].lines[2].text, "");
         assert_eq!(detail.messages[1].lines[3].kind, MessageLineKind::Code);
-        assert_eq!(detail.messages[1].lines[2].text, "code rust");
+        assert_eq!(detail.messages[1].lines[4].kind, MessageLineKind::Code);
+        assert_eq!(detail.messages[1].lines[3].text, "code rust");
+    }
+
+    #[test]
+    fn markdown_lines_preserve_paragraph_and_code_gaps() {
+        let lines = markdown_lines(
+            "first paragraph\n\nsecond paragraph\n\n```text\none\n\ntwo\n```",
+            100,
+        );
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "first paragraph",
+                "",
+                "second paragraph",
+                "",
+                "code text",
+                "one",
+                "",
+                "two"
+            ]
+        );
     }
 
     #[cfg(feature = "tui-syntax-highlighting")]
@@ -2473,6 +2589,59 @@ mod tests {
         handle_mouse_event(mouse_wheel(MouseEventKind::ScrollDown), &mut state);
         assert_eq!(state.detail.as_ref().unwrap().scroll, 3);
         handle_mouse_event(mouse_wheel(MouseEventKind::ScrollUp), &mut state);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn vim_goto_shortcuts_jump_browser_and_detail() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        for index in 0..4 {
+            state.browser.rows.push(ThreadRow {
+                id: format!("t{index}"),
+                title: format!("Thread {index}"),
+                status: String::new(),
+                updated: String::new(),
+                cwd: String::new(),
+                annotation: None,
+                snippet: None,
+                raw: serde_json::json!({}),
+            });
+        }
+        handle_goto_key(KeyCode::Char('G'), &mut state);
+        assert_eq!(state.browser.selected, 3);
+        handle_goto_key(KeyCode::Char('g'), &mut state);
+        assert!(state.pending_goto_top);
+        handle_goto_key(KeyCode::Char('g'), &mut state);
+        assert_eq!(state.browser.selected, 0);
+        assert!(!state.pending_goto_top);
+
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        handle_goto_key(KeyCode::Char('G'), &mut state);
+        assert!(state.detail.as_ref().unwrap().scroll > 0);
+        handle_goto_key(KeyCode::Home, &mut state);
         assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
     }
 

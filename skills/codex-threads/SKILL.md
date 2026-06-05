@@ -94,6 +94,7 @@ Useful TUI keys:
 
 - `j/k`, arrow keys, or mouse wheel scrolling move through the browser and
   detail transcript; `Enter` opens a thread.
+- `gg` jumps to the top and `G` jumps to the bottom in the browser or detail.
 - `/` searches threads in the browser or loaded transcript lines in detail.
 - `]` and `[` page through browser/detail cursors when available.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns.
@@ -108,9 +109,11 @@ In TUI search mode, `--cwd` is a local refinement over the loaded search page.
 Sort controls are disabled in search mode until app-server supports server-side
 search sorting.
 
-TUI transcript rendering is markdown-aware. Syntax highlighting for fenced code
-blocks is behind the default-off Cargo feature `tui-syntax-highlighting`; normal
-release builds still show readable plain code blocks.
+TUI transcript rendering is markdown-aware and preserves paragraph spacing.
+Message headings show role and timestamp without repeating turn IDs. Syntax
+highlighting for fenced code blocks is behind the default-off Cargo feature
+`tui-syntax-highlighting`; normal release builds still show readable plain code
+blocks.
 
 ## Local Annotations
 

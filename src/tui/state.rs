@@ -187,6 +187,7 @@ pub struct TuiState {
     pub prefs: TuiPrefs,
     pub stream: Option<StreamState>,
     pub stream_control: Option<mpsc::UnboundedSender<TurnControl>>,
+    pub pending_goto_top: bool,
     pub should_quit: bool,
 }
 
@@ -240,6 +241,7 @@ impl TuiState {
             prefs: init.prefs,
             stream: None,
             stream_control: None,
+            pending_goto_top: false,
             should_quit: false,
         }
     }
@@ -457,6 +459,13 @@ impl DetailState {
         self.messages
             .iter()
             .take(message_index)
+            .map(|message| 2 + message.lines.len())
+            .sum()
+    }
+
+    pub fn transcript_line_count(&self) -> usize {
+        self.messages
+            .iter()
             .map(|message| 2 + message.lines.len())
             .sum()
     }

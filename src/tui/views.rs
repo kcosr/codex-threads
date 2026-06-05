@@ -279,15 +279,15 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             }
             lines.push(render_message_line(line, text_style));
         }
-        lines.push(Line::from(Span::styled(
-            "────────────────────────────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(""));
     }
+    let visible_height = chunks[1].height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = detail.scroll.min(max_scroll.min(u16::MAX as usize) as u16);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(" Transcript ").borders(Borders::ALL))
-            .scroll((detail.scroll, 0))
+            .scroll((scroll, 0))
             .wrap(Wrap { trim: false })
             .style(Style::default()),
         chunks[1],
@@ -297,12 +297,10 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 fn message_header(message: &crate::tui::state::MessageBlock) -> String {
     let role = message.role.to_uppercase();
     let timestamp = message.timestamp.as_deref().unwrap_or("");
-    let turn_id = message.turn_id.as_deref().unwrap_or("");
-    match (timestamp.is_empty(), turn_id.is_empty()) {
-        (true, true) => role,
-        (true, false) => format!("{role} · {turn_id}"),
-        (false, true) => format!("{role} · {timestamp}"),
-        (false, false) => format!("{role} · {timestamp} · {turn_id}"),
+    if timestamp.is_empty() {
+        role
+    } else {
+        format!("{role} · {timestamp}")
     }
 }
 
@@ -707,8 +705,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &state)).unwrap();
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
-        assert!(text.contains("USER · 2026-06-05 09:00 · turn-1"));
-        assert!(text.contains("ASSISTANT · 2026-06-05 09:01 · turn-1"));
+        assert!(text.contains("USER · 2026-06-05 09:00"));
+        assert!(text.contains("ASSISTANT · 2026-06-05 09:01"));
+        assert!(!text.contains("USER · 2026-06-05 09:00 · turn-1"));
+        assert!(!text.contains("ASSISTANT · 2026-06-05 09:01 · turn-1"));
         assert!(text.contains("First response line"));
         assert!(text.contains("Continuation line"));
         assert!(!text.contains("assistant Continuation line"));

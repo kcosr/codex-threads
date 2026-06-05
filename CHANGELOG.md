@@ -15,6 +15,9 @@
   fenced code blocks with plain-text fallback guardrails.
 - Add mouse wheel support for moving through the TUI browser and scrolling
   thread detail transcripts.
+- Add Vim-style `gg`/`G` top/bottom jumps in the TUI browser and detail views.
+- Simplify TUI transcript message headings and preserve paragraph spacing
+  without divider rules between messages.
 
 ### Changed
 
