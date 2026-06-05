@@ -134,71 +134,50 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         (area, None)
     };
     let visible = state.visible_columns();
-    let mut widths = vec![Constraint::Fill(2)];
     let mut header = vec![Cell::from("THREAD")];
     if visible.status {
-        widths.push(Constraint::Length(11));
         header.push(Cell::from("STATUS"));
     }
     if visible.updated {
-        widths.push(Constraint::Length(16));
         header.push(Cell::from("UPDATED"));
     }
     if visible.cwd {
-        widths.push(Constraint::Fill(4));
         header.push(Cell::from("CWD"));
     }
     if visible.annotation {
-        widths.push(Constraint::Fill(2));
         header.push(Cell::from("ANNOTATION"));
     }
+    let widths = browser_column_widths(table_area.width, visible);
 
-    let running_count = state
-        .browser
-        .rows
-        .iter()
-        .take_while(|row| row.is_running())
-        .count();
-    let show_separator = running_count > 0 && running_count < state.browser.rows.len();
-    let column_count = header.len();
-    let rows = state
-        .browser
-        .rows
-        .iter()
-        .enumerate()
-        .flat_map(|(index, row)| {
-            let title = if let Some(snippet) = &row.snippet {
-                format!("{}  {}", row.title, snippet)
-            } else {
-                row.title.clone()
-            };
-            let mut cells = vec![Cell::from(title)];
-            if visible.status {
-                cells.push(Cell::from(row.status.clone()));
-            }
-            if visible.updated {
-                cells.push(Cell::from(row.updated.clone()));
-            }
-            if visible.cwd {
-                cells.push(Cell::from(compact_home_path(&row.cwd)));
-            }
-            if visible.annotation {
-                cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
-            }
-            let style = if index == state.browser.selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let mut rendered = vec![Row::new(cells).style(style)];
-            if show_separator && index + 1 == running_count {
-                rendered.push(Row::new(vec![Cell::from(""); column_count]));
-            }
-            rendered
-        });
+    let rows = state.browser.rows.iter().enumerate().map(|(index, row)| {
+        let title = if let Some(snippet) = &row.snippet {
+            format!("{}  {}", row.title, snippet)
+        } else {
+            row.title.clone()
+        };
+        let mut cells = vec![Cell::from(title)];
+        if visible.status {
+            cells.push(Cell::from(row.status.clone()));
+        }
+        if visible.updated {
+            cells.push(Cell::from(row.updated.clone()));
+        }
+        if visible.cwd {
+            cells.push(Cell::from(compact_home_path(&row.cwd)));
+        }
+        if visible.annotation {
+            cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
+        }
+        let style = if index == state.browser.selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Row::new(cells).style(style)
+    });
 
     let title = match state.browser.source {
         BrowserSource::List => " Threads ",
@@ -218,6 +197,72 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if let Some(area) = preview_area {
         draw_browser_preview(frame, area, state);
     }
+}
+
+fn browser_column_widths(
+    table_width: u16,
+    visible: &crate::tui::prefs::VisibleColumns,
+) -> Vec<Constraint> {
+    const TITLE_MAX: u16 = 44;
+    const CWD_MAX: u16 = 46;
+    const ANNOTATION_MAX: u16 = 40;
+    const STATUS_WIDTH: u16 = 11;
+    const UPDATED_WIDTH: u16 = 16;
+
+    let mut fixed_width = 0;
+    let mut flexible_columns = vec![(0_u16, TITLE_MAX, 4_u16)];
+    if visible.status {
+        fixed_width += STATUS_WIDTH;
+    }
+    if visible.updated {
+        fixed_width += UPDATED_WIDTH;
+    }
+    if visible.cwd {
+        flexible_columns.push((1, CWD_MAX, 4));
+    }
+    if visible.annotation {
+        flexible_columns.push((2, ANNOTATION_MAX, 3));
+    }
+
+    let column_count = 1
+        + usize::from(visible.status)
+        + usize::from(visible.updated)
+        + usize::from(visible.cwd)
+        + usize::from(visible.annotation);
+    let spacing = column_count.saturating_sub(1) as u16;
+    let available = table_width
+        .saturating_sub(2)
+        .saturating_sub(spacing)
+        .saturating_sub(fixed_width);
+    let flexible_widths = allocate_flexible_widths(available, &flexible_columns);
+
+    let mut widths = vec![Constraint::Length(flexible_widths[0])];
+    if visible.status {
+        widths.push(Constraint::Length(STATUS_WIDTH));
+    }
+    if visible.updated {
+        widths.push(Constraint::Length(UPDATED_WIDTH));
+    }
+    if visible.cwd {
+        widths.push(Constraint::Length(flexible_widths[1]));
+    }
+    if visible.annotation {
+        widths.push(Constraint::Length(flexible_widths[2]));
+    }
+    widths
+}
+
+fn allocate_flexible_widths(available: u16, columns: &[(u16, u16, u16)]) -> [u16; 3] {
+    let mut widths = [0_u16; 3];
+    let total_weight = columns.iter().map(|(_, _, weight)| *weight).sum::<u16>();
+    for (index, max, weight) in columns {
+        widths[*index as usize] = available
+            .saturating_mul(*weight)
+            .checked_div(total_weight.max(1))
+            .unwrap_or(0)
+            .min(*max);
+    }
+    widths
 }
 
 fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -630,39 +675,30 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
 }
 
 fn format_stream(state: &crate::tui::state::StreamState) -> String {
-    let status = match state.status {
-        StreamStatus::Starting => "starting",
-        StreamStatus::Running => "running",
-        StreamStatus::Completed => "completed",
-        StreamStatus::Failed => "failed",
-        StreamStatus::Interrupted => "interrupted",
-        StreamStatus::Detached => "detached",
-    };
-    let attached = if state.attached { ":attached" } else { "" };
-    let detached = if state.detached { ":detached" } else { "" };
-    let polled = if state.last_poll_at.is_some() {
-        ":polled"
+    let status = if state.detached {
+        "detached"
+    } else if state.attached {
+        "attached"
     } else {
-        ""
+        format_stream_status(state.status)
     };
     let error = state
         .last_error
         .as_ref()
         .map(|error| format!(" error={error}"))
         .unwrap_or_default();
-    format!(
-        " stream={}{}{}{}{}{}",
-        state.thread_id,
-        state
-            .turn_id
-            .as_ref()
-            .map(|turn_id| format!(":{turn_id}:{status}"))
-            .unwrap_or_else(|| format!(":{status}")),
-        attached,
-        detached,
-        polled,
-        error
-    )
+    format!(" stream={status}{error}")
+}
+
+fn format_stream_status(status: StreamStatus) -> &'static str {
+    match status {
+        StreamStatus::Starting => "starting",
+        StreamStatus::Running => "running",
+        StreamStatus::Completed => "completed",
+        StreamStatus::Failed => "failed",
+        StreamStatus::Interrupted => "interrupted",
+        StreamStatus::Detached => "detached",
+    }
 }
 
 #[cfg(test)]
@@ -672,7 +708,8 @@ mod tests {
 
     use crate::tui::prefs::TuiPrefs;
     use crate::tui::state::{
-        DetailState, MessageBlock, MessageLine, MessageLineKind, Mode, ThreadRow, TuiInit, TuiState,
+        DetailState, MessageBlock, MessageLine, MessageLineKind, Mode, StreamState, ThreadRow,
+        TuiInit, TuiState,
     };
 
     use super::*;
@@ -722,6 +759,39 @@ mod tests {
             compact_path_with_home("/home/kevin-other/repo", "/home/kevin"),
             "/home/kevin-other/repo"
         );
+    }
+
+    #[test]
+    fn browser_columns_use_capped_widths_on_wide_terminals() {
+        let prefs = TuiPrefs::default();
+
+        assert_eq!(
+            browser_column_widths(250, &prefs.browser.columns),
+            vec![
+                Constraint::Length(44),
+                Constraint::Length(11),
+                Constraint::Length(16),
+                Constraint::Length(46),
+                Constraint::Length(40),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_status_omits_ids_and_duplicate_attachment_flags() {
+        let stream = StreamState {
+            thread_id: "019e95bd-1b12-7c32-81de-89d02e9bcbfc".to_string(),
+            turn_id: Some("019e99e7-decc-7bb2-8c80-0c7f0a54d413".to_string()),
+            status: StreamStatus::Detached,
+            accumulated_text: String::new(),
+            events: Vec::new(),
+            attached: true,
+            detached: true,
+            last_error: None,
+            last_poll_at: Some(std::time::Instant::now()),
+        };
+
+        assert_eq!(format_stream(&stream), " stream=detached");
     }
 
     #[test]

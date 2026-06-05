@@ -7,35 +7,8 @@
 - Add `codex-threads tui`, an interactive thread browser with list/search
   filters, sort/column menus, preview pane, detail viewing, loaded-message
   search, local annotation editing, refresh, send-and-stream, no-wait send,
-  active-turn attach/steer/interrupt, persisted TUI preferences, and a
-  responsive async fetch/stream model.
-- Add TUI cursor paging, active-turn attach, and markdown-aware transcript
-  rendering for common headings, blockquotes, lists, and fenced code blocks.
-- Add default-off `tui-syntax-highlighting` support for syntax-highlighted TUI
-  fenced code blocks with plain-text fallback guardrails.
-- Add mouse wheel support for moving through the TUI browser and scrolling
-  thread detail transcripts.
-- Add Vim-style `gg`/`G` top/bottom jumps in the TUI browser and detail views.
-- Simplify TUI transcript message headings and preserve paragraph spacing
-  without divider rules between messages.
-- Change TUI compose to submit with `Enter`, insert newlines with
-  `Shift-Enter`, and toggle the browser preview pane with `p`.
-- Change TUI detail views to open at the transcript bottom, follow with
-  in-place refreshes while open, use `Enter` for the message action, and unlink
-  the local detail/stream association on `Esc`.
-- Fix TUI detail bottom scrolling so pressing Up after `G` scrolls visibly
-  immediately.
-- Rebalance TUI browser column widths, preserve full updated timestamps, and
-  compact displayed home-directory paths to `~`.
-- Group active/running TUI browser rows first with a visual gap before idle
-  rows.
-- Add `y` in the TUI to copy the active thread id through OSC 52.
-
-### Changed
-
-- Extract reusable session and turn-runner operations from CLI orchestration so
-  the CLI, TUI, and future clients share request construction, annotation
-  projection, turn streaming, polling fallback, and terminal status handling.
+  active-turn attach/steer/interrupt, persisted TUI preferences, mouse support,
+  Vim-style navigation, and OSC 52 thread id copy.
 
 ## [0.1.5] - 2026-06-05
 
