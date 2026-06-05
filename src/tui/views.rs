@@ -620,7 +620,7 @@ fn draw_compose(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, foo
         .len()
         .saturating_sub(content_height)
         .min(u16::MAX as usize) as u16;
-    let area = bottom_centered_rect(area, 80, height);
+    let area = centered_rect(area, 80, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).scroll((scroll, 0)).block(
@@ -793,20 +793,6 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-fn bottom_centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
-    let height = height.min(area.height);
-    let y = area.y.saturating_add(area.height.saturating_sub(height));
-    let vertical = Rect::new(area.x, y, area.width, height);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical)[1]
 }
 
 fn format_stream(state: &crate::tui::state::StreamState) -> String {
