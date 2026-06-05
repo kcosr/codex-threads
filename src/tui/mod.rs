@@ -130,6 +130,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 }
             }
             _ = tick.tick() => {
+                state.clear_expired_notice();
                 if state.browser.auto_refresh
                     && !state.browser.loading
                     && state.browser.last_refresh_at.is_none_or(|last| {
@@ -1729,11 +1730,11 @@ fn active_annotation(state: &TuiState) -> Option<String> {
 
 fn copy_active_thread_id(state: &mut TuiState) -> Result<()> {
     let Some(thread_id) = active_thread_id(state) else {
-        state.notice = Some("no thread selected".to_string());
+        state.set_notice("no thread selected");
         return Ok(());
     };
     write_osc52_clipboard(&thread_id)?;
-    state.notice = Some(format!("copied {thread_id}"));
+    state.set_notice(format!("copied {thread_id}"));
     Ok(())
 }
 
@@ -2275,6 +2276,32 @@ mod tests {
             None,
         );
         assert!(state.browser.rows.is_empty());
+    }
+
+    #[test]
+    fn notices_clear_after_expiry() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        state.set_notice("copied thread-1");
+        assert_eq!(
+            state.notice.as_ref().map(|notice| notice.message.as_str()),
+            Some("copied thread-1")
+        );
+        state.notice.as_mut().expect("notice").expires_at =
+            std::time::Instant::now() - Duration::from_secs(1);
+
+        state.clear_expired_notice();
+
+        assert!(state.notice.is_none());
     }
 
     #[test]

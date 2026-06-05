@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -191,8 +191,14 @@ pub struct TuiState {
     pub stream: Option<StreamState>,
     pub stream_control: Option<mpsc::UnboundedSender<TurnControl>>,
     pub pending_goto_top: bool,
-    pub notice: Option<String>,
+    pub notice: Option<Notice>,
     pub should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub message: String,
+    pub expires_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +259,23 @@ impl TuiState {
 
     pub fn visible_columns(&self) -> &VisibleColumns {
         &self.prefs.browser.columns
+    }
+
+    pub fn set_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice {
+            message: message.into(),
+            expires_at: Instant::now() + Duration::from_secs(2),
+        });
+    }
+
+    pub fn clear_expired_notice(&mut self) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| Instant::now() >= notice.expires_at)
+        {
+            self.notice = None;
+        }
     }
 
     pub fn selected_thread_id(&self) -> Option<&str> {

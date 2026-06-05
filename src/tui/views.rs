@@ -485,7 +485,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let notice = state
         .notice
         .as_ref()
-        .map(|notice| format!(" {notice}"))
+        .map(|notice| format!(" {}", notice.message))
         .unwrap_or_default();
     let status = format!(
         "{} rows={}{}{}{}{}{}{}{}",
