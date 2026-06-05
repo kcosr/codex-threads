@@ -202,11 +202,15 @@ codex-threads tui --since 24h --cwd "$PWD"
 codex-threads tui --query "release process" --limit 20
 ```
 
-Inside the TUI, use `/` to search, `Enter` to open a thread, `]` and `[` to
-page when cursors are available, `A` to annotate, `r` to refresh, and `e` to
-send and stream a follow-up. In detail, `T` attaches to an active turn, `S`
-steers it, `i` interrupts it, and `q` quits. Transcript rendering is
-markdown-aware for common headings, blockquotes, and fenced code blocks.
+Inside the TUI, use `/` to search threads or loaded transcript messages,
+`Enter` to open a thread, `]` and `[` to page when cursors are available, `f`
+for filters, `s` for sort, `c` for visible columns, `A` to annotate, `r` to
+refresh, and `m` to compose. Compose uses `Ctrl-S` to send and `Tab` to toggle
+stream/no-wait for new turns; annotation editing uses `Ctrl-S` to save and
+`Ctrl-D` to clear. In detail, `T` attaches to an active turn, `S` steers it,
+`i` confirms interrupt, and `q` quits. Local detach leaves remote turns running.
+Transcript rendering is markdown-aware for common headings, blockquotes, lists,
+and fenced code blocks.
 
 ## Configuration
 
@@ -471,8 +475,11 @@ TUI preferences are local `codex-threads` state, separate from annotations:
 3. `~/.local/state/codex-threads/tui.json`
 
 The TUI persists disposable UI preferences such as visible columns,
-auto-refresh, and default sort. Corrupt or unsupported preference files fall
-back to defaults instead of blocking launch.
+auto-refresh, preview pane, and default sort. Corrupt or unsupported preference
+files are renamed to `tui.json.corrupt.<epoch>` when possible and fall back to
+defaults instead of blocking launch. In search mode, `--cwd` is a local
+refinement over the loaded search page; sort controls are disabled until the
+app-server search API supports server-side sorting.
 
 Exit codes:
 

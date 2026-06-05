@@ -7,9 +7,11 @@ mod views;
 
 use std::io::{self, IsTerminal};
 use std::panic;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use crossterm::cursor::Show;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -84,6 +86,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     let (fetch_tx, fetch_rx) = mpsc::channel(32);
     let (app_tx, mut app_rx) = mpsc::unbounded_channel();
     tokio::spawn(fetch_worker(target.clone(), fetch_rx, app_tx.clone()));
+    spawn_shutdown_signal_task(app_tx.clone());
     schedule_browser_refresh(&mut state, &fetch_tx).await?;
 
     let mut events = EventStream::new();
@@ -134,7 +137,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
 type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
 struct TerminalGuard {
-    previous_hook: Option<PanicHook>,
+    previous_hook: Arc<Mutex<Option<PanicHook>>>,
 }
 
 impl TerminalGuard {
@@ -142,26 +145,62 @@ impl TerminalGuard {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
         let previous_hook = panic::take_hook();
-        panic::set_hook(Box::new(|info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
-            eprintln!("{info}");
+        let previous_hook = Arc::new(Mutex::new(Some(previous_hook)));
+        let hook_for_panic = Arc::clone(&previous_hook);
+        panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            if let Ok(hook) = hook_for_panic.lock()
+                && let Some(previous) = hook.as_ref()
+            {
+                previous(info);
+            } else {
+                eprintln!("{info}");
+            }
         }));
-        Ok(Self {
-            previous_hook: Some(previous_hook),
-        })
+        Ok(Self { previous_hook })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        if let Some(previous_hook) = self.previous_hook.take() {
+        restore_terminal();
+        let previous_hook = self
+            .previous_hook
+            .lock()
+            .ok()
+            .and_then(|mut hook| hook.take());
+        if let Some(previous_hook) = previous_hook {
             panic::set_hook(previous_hook);
         }
     }
 }
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+}
+
+#[cfg(unix)]
+fn spawn_shutdown_signal_task(app_tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+            return;
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+        let _ = app_tx.send(AppEvent::ShutdownSignal);
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_shutdown_signal_task(_app_tx: mpsc::UnboundedSender<AppEvent>) {}
 
 async fn fetch_worker(
     target: Target,
@@ -511,46 +550,12 @@ async fn handle_terminal_event(
             )
             .await;
         }
-        Mode::AnnotationInput { thread_id, draft } => {
-            return handle_text_input(
-                key,
-                draft,
-                ModeKind::Annotation {
-                    thread_id: thread_id.clone(),
-                },
-                move |value, state| {
-                    if value.trim().is_empty() {
-                        clear_annotation(target, &thread_id)?;
-                    } else {
-                        set_annotation(target, &thread_id, &value)?;
-                    }
-                    if let Some(row) = state
-                        .browser
-                        .rows
-                        .iter_mut()
-                        .find(|row| row.id == thread_id)
-                    {
-                        row.annotation = if value.trim().is_empty() {
-                            None
-                        } else {
-                            Some(value.clone())
-                        };
-                    }
-                    if let Some(detail) = &mut state.detail
-                        && detail.thread_id == thread_id
-                    {
-                        detail.annotation = if value.trim().is_empty() {
-                            None
-                        } else {
-                            Some(value)
-                        };
-                    }
-                    Ok(InputAction::None)
-                },
-                state,
-                fetch_tx,
-            )
-            .await;
+        Mode::AnnotationInput {
+            thread_id,
+            draft,
+            return_to_detail,
+        } => {
+            return handle_annotation_input(key, target, state, thread_id, draft, return_to_detail);
         }
         Mode::Compose(compose) => {
             return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx).await;
@@ -778,7 +783,12 @@ async fn handle_terminal_event(
         KeyCode::Char('A') => {
             if let Some(thread_id) = active_thread_id(state) {
                 let draft = active_annotation(state).unwrap_or_default();
-                state.mode = Mode::AnnotationInput { thread_id, draft };
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::AnnotationInput {
+                    thread_id,
+                    draft,
+                    return_to_detail,
+                };
             }
         }
         KeyCode::Char('m') => {
@@ -947,7 +957,97 @@ fn mode_from_kind(kind: ModeKind, draft: String) -> Mode {
     match kind {
         ModeKind::Search => Mode::SearchInput { draft },
         ModeKind::MessageSearch => Mode::MessageSearchInput { draft },
-        ModeKind::Annotation { thread_id } => Mode::AnnotationInput { thread_id, draft },
+    }
+}
+
+fn handle_annotation_input(
+    key: KeyEvent,
+    target: &Target,
+    state: &mut TuiState,
+    thread_id: String,
+    mut draft: String,
+    return_to_detail: bool,
+) -> Result<()> {
+    let return_mode = if return_to_detail {
+        Mode::Detail
+    } else {
+        Mode::Browser
+    };
+    match key.code {
+        KeyCode::Esc => state.mode = return_mode.clone(),
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            save_annotation_draft(target, state, &thread_id, draft)?;
+            state.mode = return_mode.clone();
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            clear_annotation(target, &thread_id)?;
+            set_annotation_in_state(state, &thread_id, None);
+            state.mode = return_mode.clone();
+        }
+        KeyCode::Backspace => {
+            draft.pop();
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Enter => {
+            draft.push('\n');
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Char(ch) => {
+            draft.push(ch);
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        _ => {
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn save_annotation_draft(
+    target: &Target,
+    state: &mut TuiState,
+    thread_id: &str,
+    value: String,
+) -> Result<()> {
+    if value.trim().is_empty() {
+        clear_annotation(target, thread_id)?;
+        set_annotation_in_state(state, thread_id, None);
+    } else {
+        set_annotation(target, thread_id, &value)?;
+        set_annotation_in_state(state, thread_id, Some(value));
+    }
+    Ok(())
+}
+
+fn set_annotation_in_state(state: &mut TuiState, thread_id: &str, value: Option<String>) {
+    if let Some(row) = state
+        .browser
+        .rows
+        .iter_mut()
+        .find(|row| row.id == thread_id)
+    {
+        row.annotation = value.clone();
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.annotation = value;
     }
 }
 
@@ -959,8 +1059,13 @@ async fn handle_compose_input(
     yolo: bool,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
+    let return_mode = if state.detail.is_some() {
+        Mode::Detail
+    } else {
+        Mode::Browser
+    };
     match key.code {
-        KeyCode::Esc => state.mode = Mode::Detail,
+        KeyCode::Esc => state.mode = return_mode.clone(),
         KeyCode::Tab => {
             if matches!(compose.target, ComposeTarget::NewTurn { .. }) {
                 compose.send_mode = match compose.send_mode {
@@ -981,7 +1086,7 @@ async fn handle_compose_input(
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let prompt = compose.text.trim().to_string();
             if prompt.is_empty() {
-                state.mode = Mode::Detail;
+                state.mode = return_mode.clone();
                 return Ok(());
             }
             match compose.target.clone() {
@@ -1007,7 +1112,7 @@ async fn handle_compose_input(
                         Some("draft sent".to_string()),
                         &prompt,
                     );
-                    state.mode = Mode::Detail;
+                    state.mode = return_mode.clone();
                     spawn_send_task(
                         target.clone(),
                         thread_id,
@@ -1288,6 +1393,10 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 }
             }
             state.stream_control = None;
+        }
+        AppEvent::ShutdownSignal => {
+            detach_stream(state);
+            state.should_quit = true;
         }
     }
 }
@@ -2034,5 +2143,81 @@ mod tests {
             state.stream.as_ref().expect("stream").status,
             StreamStatus::Completed
         );
+    }
+
+    #[test]
+    fn shutdown_signal_detaches_stream_and_quits() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+        state.stream = Some(StreamState {
+            thread_id: "t1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            status: StreamStatus::Running,
+            accumulated_text: String::new(),
+            events: Vec::new(),
+            attached: true,
+            detached: false,
+            last_error: None,
+            last_poll_at: None,
+        });
+
+        handle_app_event(AppEvent::ShutdownSignal, &mut state);
+        assert!(state.should_quit);
+        assert!(state.stream.as_ref().expect("stream").detached);
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+    }
+
+    #[test]
+    fn annotation_state_updates_browser_and_detail() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows.push(ThreadRow {
+            id: "t1".to_string(),
+            title: "Thread".to_string(),
+            status: String::new(),
+            updated: String::new(),
+            cwd: String::new(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        set_annotation_in_state(&mut state, "t1", Some("note".to_string()));
+        assert_eq!(state.browser.rows[0].annotation.as_deref(), Some("note"));
+        assert_eq!(
+            state.detail.as_ref().unwrap().annotation.as_deref(),
+            Some("note")
+        );
+        set_annotation_in_state(&mut state, "t1", None);
+        assert!(state.browser.rows[0].annotation.is_none());
+        assert!(state.detail.as_ref().unwrap().annotation.is_none());
     }
 }

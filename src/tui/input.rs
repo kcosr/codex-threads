@@ -8,5 +8,4 @@ pub(crate) enum InputAction {
 pub(crate) enum ModeKind {
     Search,
     MessageSearch,
-    Annotation { thread_id: String },
 }

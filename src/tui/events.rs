@@ -55,6 +55,7 @@ pub(crate) enum AppEvent {
     StreamEvent(Value),
     StreamFailed(String),
     StreamFinished(StreamStatus),
+    ShutdownSignal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

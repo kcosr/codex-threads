@@ -56,7 +56,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             );
         }
         Mode::AnnotationInput { draft, .. } => {
-            draw_prompt(frame, area, "Annotation", draft, "Enter save, Esc cancel");
+            draw_prompt(
+                frame,
+                area,
+                "Annotation",
+                draft,
+                "Ctrl-S save, Ctrl-D clear, Esc cancel",
+            );
         }
         Mode::FilterMenu => draw_filter_menu(frame, area, state),
         Mode::SortMenu => draw_sort_menu(frame, area, state),
@@ -543,8 +549,13 @@ fn format_stream(state: &crate::tui::state::StreamState) -> String {
     } else {
         ""
     };
+    let error = state
+        .last_error
+        .as_ref()
+        .map(|error| format!(" error={error}"))
+        .unwrap_or_default();
     format!(
-        " stream={}{}{}{}{}",
+        " stream={}{}{}{}{}{}",
         state.thread_id,
         state
             .turn_id
@@ -553,7 +564,8 @@ fn format_stream(state: &crate::tui::state::StreamState) -> String {
             .unwrap_or_else(|| format!(":{status}")),
         attached,
         detached,
-        polled
+        polled,
+        error
     )
 }
 

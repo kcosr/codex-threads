@@ -5,11 +5,12 @@
 ### Added
 
 - Add `codex-threads tui`, an interactive thread browser with list/search
-  filters, detail viewing, local annotation editing, refresh, send-and-stream,
-  no-wait send, active-turn steer, interrupt, persisted TUI preferences, and a
+  filters, sort/column menus, preview pane, detail viewing, loaded-message
+  search, local annotation editing, refresh, send-and-stream, no-wait send,
+  active-turn attach/steer/interrupt, persisted TUI preferences, and a
   responsive async fetch/stream model.
 - Add TUI cursor paging, active-turn attach, and markdown-aware transcript
-  rendering for common headings, blockquotes, and fenced code blocks.
+  rendering for common headings, blockquotes, lists, and fenced code blocks.
 
 ### Changed
 

@@ -11,14 +11,28 @@ use crate::turns::TurnControl;
 pub enum Mode {
     Browser,
     Detail,
-    SearchInput { draft: String },
-    MessageSearchInput { draft: String },
+    SearchInput {
+        draft: String,
+    },
+    MessageSearchInput {
+        draft: String,
+    },
     FilterMenu,
     SortMenu,
     ColumnsMenu,
-    ActiveTurnPrompt { thread_id: String, turn_id: String },
-    ConfirmInterrupt { thread_id: String, turn_id: String },
-    AnnotationInput { thread_id: String, draft: String },
+    ActiveTurnPrompt {
+        thread_id: String,
+        turn_id: String,
+    },
+    ConfirmInterrupt {
+        thread_id: String,
+        turn_id: String,
+    },
+    AnnotationInput {
+        thread_id: String,
+        draft: String,
+        return_to_detail: bool,
+    },
     Compose(ComposeState),
     Help,
 }
