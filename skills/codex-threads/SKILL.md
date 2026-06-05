@@ -97,10 +97,12 @@ Useful TUI keys:
 - `gg` jumps to the top and `G` jumps to the bottom in the browser or detail.
 - `/` searches threads in the browser or loaded transcript lines in detail.
 - `]` and `[` page through browser/detail cursors when available.
+- `p` toggles the browser preview pane.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns.
 - `A` edits the local annotation with `Ctrl-S` save and `Ctrl-D` clear.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
-- `m` composes a follow-up; `Ctrl-S` sends and `Tab` toggles stream/no-wait for new turns.
+- `m` composes a follow-up; `Enter` sends, `Shift-Enter` inserts a newline when
+  supported by the terminal, and `Tab` toggles stream/no-wait for new turns.
 - In detail, `n/N` move between message-search matches.
 - In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms interrupt.
 - `q` quits. Local detach leaves remote turns running unless interrupted.

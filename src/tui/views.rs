@@ -82,8 +82,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 },
             };
             let footer = match compose.target {
-                ComposeTarget::Steer { .. } => "Ctrl-S steer, Esc cancel",
-                ComposeTarget::NewTurn { .. } => "Ctrl-S send, Tab mode, Esc cancel",
+                ComposeTarget::Steer { .. } => "Enter steer, Shift-Enter newline, Esc cancel",
+                ComposeTarget::NewTurn { .. } => {
+                    "Enter send, Shift-Enter newline, Tab mode, Esc cancel"
+                }
             };
             draw_prompt(frame, area, label, &compose.text, footer);
         }
@@ -523,10 +525,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Clear, area);
     let items = [
         "Browser",
-        "  j/k or arrows move; Enter opens a thread; r refreshes; / searches.",
+        "  j/k, arrows, or wheel move; Enter opens; p toggles preview; / searches.",
         "  f filters; s sort; c columns; A edits annotation; t toggles auto-refresh.",
         "Detail",
-        "  Esc returns to the browser; / searches loaded transcript lines.",
+        "  Esc returns to the browser; / searches loaded transcript lines; gg/G jump.",
         "  m opens compose; T attaches; S steers; i opens interrupt confirmation.",
         "Streams",
         "  T attaches to an active turn. Esc or q detaches locally; remote turns keep running unless interrupted.",

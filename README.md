@@ -205,12 +205,13 @@ codex-threads tui --query "release process" --limit 20
 Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `/` to search threads or loaded transcript messages, `Enter` to open a thread,
-`]` and `[` to page when cursors are available, `f` for filters, `s` for sort,
-`c` for visible columns, `A` to annotate, `r` to refresh, and `m` to compose.
-Compose uses `Ctrl-S` to send and `Tab` to toggle stream/no-wait for new turns;
-annotation editing uses `Ctrl-S` to save and `Ctrl-D` to clear. In detail, `T`
-attaches to an active turn, `S` steers it, `i` confirms interrupt, and `q`
-quits. Local detach leaves remote turns running.
+`]` and `[` to page when cursors are available, `p` to toggle the preview pane,
+`f` for filters, `s` for sort, `c` for visible columns, `A` to annotate, `r` to
+refresh, and `m` to compose. Compose uses `Enter` to send and `Shift-Enter` to
+insert a newline where the terminal reports that modifier; `Tab` toggles
+stream/no-wait for new turns. Annotation editing uses `Ctrl-S` to save and
+`Ctrl-D` to clear. In detail, `T` attaches to an active turn, `S` steers it, `i`
+confirms interrupt, and `q` quits. Local detach leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted

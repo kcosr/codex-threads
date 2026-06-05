@@ -891,6 +891,10 @@ async fn handle_terminal_event(
             state.prefs.refresh.auto = state.browser.auto_refresh;
             let _ = save_prefs(&state.prefs);
         }
+        KeyCode::Char('p') if matches!(state.mode, Mode::Browser) => {
+            state.prefs.browser.preview_pane = !state.prefs.browser.preview_pane;
+            let _ = save_prefs(&state.prefs);
+        }
         KeyCode::Char('s') if matches!(state.mode, Mode::Browser) => state.mode = Mode::SortMenu,
         KeyCode::Down | KeyCode::Char('j') => match state.mode {
             Mode::Detail => scroll_detail(state, 1),
@@ -1193,62 +1197,12 @@ async fn handle_compose_input(
             compose.text.pop();
             state.mode = Mode::Compose(compose);
         }
-        KeyCode::Enter => {
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
             compose.text.push('\n');
             state.mode = Mode::Compose(compose);
         }
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let prompt = compose.text.trim().to_string();
-            if prompt.is_empty() {
-                state.mode = return_mode.clone();
-                return Ok(());
-            }
-            match compose.target.clone() {
-                ComposeTarget::NewTurn { thread_id } => {
-                    let (control_tx, control_rx) = mpsc::unbounded_channel();
-                    state.stream = Some(StreamState {
-                        thread_id: thread_id.clone(),
-                        turn_id: None,
-                        status: StreamStatus::Starting,
-                        accumulated_text: String::new(),
-                        events: Vec::new(),
-                        attached: false,
-                        detached: false,
-                        last_error: None,
-                        last_poll_at: None,
-                    });
-                    state.stream_control = Some(control_tx);
-                    append_detail_message(
-                        state,
-                        thread_id.as_str(),
-                        None,
-                        "user",
-                        Some("draft sent".to_string()),
-                        &prompt,
-                    );
-                    state.mode = return_mode.clone();
-                    spawn_send_task(
-                        target.clone(),
-                        thread_id,
-                        prompt,
-                        compose.send_mode,
-                        yolo,
-                        control_rx,
-                        app_tx.clone(),
-                    );
-                }
-                ComposeTarget::Steer { thread_id, turn_id } => {
-                    state.mode = Mode::Detail;
-                    spawn_steer_task(
-                        target.clone(),
-                        thread_id,
-                        turn_id,
-                        prompt,
-                        yolo,
-                        app_tx.clone(),
-                    );
-                }
-            }
+        KeyCode::Enter => {
+            submit_compose(state, compose, target, yolo, app_tx, return_mode);
         }
         KeyCode::Char(ch) => {
             compose.text.push(ch);
@@ -1257,6 +1211,67 @@ async fn handle_compose_input(
         _ => state.mode = Mode::Compose(compose),
     }
     Ok(())
+}
+
+fn submit_compose(
+    state: &mut TuiState,
+    compose: ComposeState,
+    target: &Target,
+    yolo: bool,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+    return_mode: Mode,
+) {
+    let prompt = compose.text.trim().to_string();
+    if prompt.is_empty() {
+        state.mode = return_mode;
+        return;
+    }
+    match compose.target {
+        ComposeTarget::NewTurn { thread_id } => {
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            state.stream = Some(StreamState {
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                status: StreamStatus::Starting,
+                accumulated_text: String::new(),
+                events: Vec::new(),
+                attached: false,
+                detached: false,
+                last_error: None,
+                last_poll_at: None,
+            });
+            state.stream_control = Some(control_tx);
+            append_detail_message(
+                state,
+                thread_id.as_str(),
+                None,
+                "user",
+                Some("draft sent".to_string()),
+                &prompt,
+            );
+            state.mode = return_mode;
+            spawn_send_task(
+                target.clone(),
+                thread_id,
+                prompt,
+                compose.send_mode,
+                yolo,
+                control_rx,
+                app_tx.clone(),
+            );
+        }
+        ComposeTarget::Steer { thread_id, turn_id } => {
+            state.mode = Mode::Detail;
+            spawn_steer_task(
+                target.clone(),
+                thread_id,
+                turn_id,
+                prompt,
+                yolo,
+                app_tx.clone(),
+            );
+        }
+    }
 }
 
 fn spawn_attach_task(
@@ -2643,6 +2658,86 @@ mod tests {
         assert!(state.detail.as_ref().unwrap().scroll > 0);
         handle_goto_key(KeyCode::Home, &mut state);
         assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn compose_enter_submits_and_shift_enter_inserts_newline() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "hello".to_string(),
+                send_mode: SendMode::NoWait,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.text, "hello\n");
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "send me".to_string(),
+                send_mode: SendMode::NoWait,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.stream.is_some());
+    }
+
+    #[test]
+    fn preview_toggle_updates_pref_state() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        assert!(state.prefs.browser.preview_pane);
+        state.prefs.browser.preview_pane = !state.prefs.browser.preview_pane;
+        assert!(!state.prefs.browser.preview_pane);
     }
 
     fn mouse_wheel(kind: MouseEventKind) -> MouseEvent {

@@ -18,6 +18,8 @@
 - Add Vim-style `gg`/`G` top/bottom jumps in the TUI browser and detail views.
 - Simplify TUI transcript message headings and preserve paragraph spacing
   without divider rules between messages.
+- Change TUI compose to submit with `Enter`, insert newlines with
+  `Shift-Enter`, and toggle the browser preview pane with `p`.
 
 ### Changed
 
