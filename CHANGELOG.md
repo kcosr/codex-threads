@@ -35,6 +35,8 @@
   and completion is discovered through polling.
 - Keep TUI detail and browser streaming sends attached to the turn returned by
   `turn/start` instead of a pre-existing active turn.
+- Keep live-updated TUI transcript messages from showing stale turn-start
+  timestamps inherited from active-turn snapshots.
 
 ## [0.1.5] - 2026-06-05
 

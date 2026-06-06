@@ -724,6 +724,23 @@ fn run_cli_json(server: &TuiMockServer, state_dir: &TempDir, args: &[&str]) -> V
     serde_json::from_slice(&output).expect("json output")
 }
 
+fn wait_for_file_contains(path: &PathBuf, expected: &str) {
+    let started = Instant::now();
+    while started.elapsed() < WAIT_TIMEOUT {
+        if fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(expected)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for {path:?} to contain {expected:?}\n--- file ---\n{}",
+        fs::read_to_string(path).unwrap_or_default()
+    );
+}
+
 #[test]
 #[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
 fn tui_detail_compose_stream_updates_screen_and_cli_history() {
@@ -741,6 +758,7 @@ fn tui_detail_compose_stream_updates_screen_and_cli_history() {
     tui.type_text("tui smoke detail");
     tui.write(b"\r");
     tui.wait_for("stream reply for tui smoke detail");
+    wait_for_file_contains(&stream_log, "stream reply for tui smoke detail");
     tui.write(b"\x1b");
     tui.wait_for("Threads");
     tui.quit();
@@ -751,11 +769,6 @@ fn tui_detail_compose_stream_updates_screen_and_cli_history() {
     assert!(
         rendered.contains("stream reply for tui smoke detail"),
         "{rendered}"
-    );
-    assert!(
-        fs::read_to_string(stream_log)
-            .expect("stream log")
-            .contains("stream reply for tui smoke detail")
     );
     assert!(server.method_count("turn/start") >= 1);
     assert!(server.method_count("thread/turns/list") >= 2);
@@ -781,6 +794,7 @@ fn tui_detail_enter_send_on_initial_active_thread_follows_started_turn() {
     tui.type_text("detail active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for detail active followup");
+    wait_for_file_contains(&stream_log, "stream reply for detail active followup");
     tui.quit();
 
     assert!(server.method_count("turn/start") >= 1);
@@ -788,11 +802,6 @@ fn tui_detail_enter_send_on_initial_active_thread_follows_started_turn() {
         server.method_count("turn/steer"),
         0,
         "normal detail send should not use explicit steer"
-    );
-    assert!(
-        fs::read_to_string(stream_log)
-            .expect("stream log")
-            .contains("stream reply for detail active followup")
     );
 }
 
@@ -826,6 +835,7 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
     tui.wait_for_all(&["Active stream", "Beta task"]);
     tui.write(b"T");
     tui.wait_for("attached live update");
+    wait_for_file_contains(&stream_log, "attached live update");
     server.wait_for_method_count("thread/resume", 1);
     tui.write(b"j");
     server.wait_for_method_count("thread/unsubscribe", 1);
@@ -837,11 +847,6 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
 
     let active_status = run_cli_json(&server, &state_dir, &["status", "--json", "thread_active"]);
     assert_eq!(active_status["activeTurnId"], "turn_active");
-    assert!(
-        fs::read_to_string(stream_log)
-            .expect("stream log")
-            .contains("attached live update")
-    );
 }
 
 #[test]
@@ -858,6 +863,7 @@ fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
     tui.type_text("browser active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for browser active followup");
+    wait_for_file_contains(&stream_log, "stream reply for browser active followup");
     tui.quit();
 
     assert!(server.method_count("turn/start") >= 1);
@@ -865,11 +871,6 @@ fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
         server.method_count("turn/steer"),
         0,
         "normal browser send should not use explicit steer"
-    );
-    assert!(
-        fs::read_to_string(stream_log)
-            .expect("stream log")
-            .contains("stream reply for browser active followup")
     );
 }
 

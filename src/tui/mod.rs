@@ -3121,9 +3121,7 @@ fn upsert_streaming_assistant_message(
         if message.item_id.is_none() {
             message.item_id = item_id.clone();
         }
-        if finalized {
-            message.timestamp = Some(format_current_epoch());
-        }
+        update_live_message_timestamp(message, finalized);
     } else {
         detail.messages.push(message_block(
             turn_id,
@@ -3184,9 +3182,7 @@ fn upsert_preview_assistant_message(
         if message.item_id.is_none() {
             message.item_id = item_id.clone();
         }
-        if finalized {
-            message.timestamp = Some(format_current_epoch());
-        }
+        update_live_message_timestamp(message, finalized);
     } else {
         messages.push(message_block(
             turn_id,
@@ -3200,6 +3196,12 @@ fn upsert_preview_assistant_message(
             text,
             100,
         ));
+    }
+}
+
+fn update_live_message_timestamp(message: &mut MessageBlock, finalized: bool) {
+    if finalized || message.timestamp.as_deref() != Some("streaming") {
+        message.timestamp = Some(format_current_epoch());
     }
 }
 
@@ -4636,6 +4638,78 @@ mod tests {
         assert_eq!(detail.messages[1].timestamp.as_deref(), Some("streaming"));
         assert_eq!(detail.messages[1].lines[0].text, "first prune chunk");
         assert_eq!(detail.matches, vec![1]);
+    }
+
+    #[test]
+    fn stream_delta_retimestamps_existing_active_turn_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "startedAt": 1_700_000_000_i64, "items": [
+                        {"id": "assistant-1", "type": "agentMessage", "text": "old text"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let old_timestamp = state
+            .detail
+            .as_ref()
+            .expect("detail")
+            .messages
+            .first()
+            .and_then(|message| message.timestamp.clone())
+            .expect("historical timestamp");
+        state.stream = Some(StreamState::new_with_id(
+            1,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        state
+            .stream
+            .as_mut()
+            .expect("stream")
+            .assistant_items
+            .push(StreamAssistantItem {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("assistant-1".to_string()),
+                text: "old text".to_string(),
+            });
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "delta",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": "\nlive update"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        let message = detail.messages.first().expect("message");
+        assert_eq!(message.lines[0].text, "old text");
+        assert_eq!(message.lines[1].text, "live update");
+        assert_ne!(message.timestamp.as_deref(), Some(old_timestamp.as_str()));
+        assert_ne!(message.timestamp.as_deref(), Some("streaming"));
+        assert!(message.timestamp.is_some());
     }
 
     #[test]
