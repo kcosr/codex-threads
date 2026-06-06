@@ -115,7 +115,7 @@ Useful TUI keys:
   `Enter` opens the message action, `n/N` move between message-search matches,
   and `Esc` unlinks the local detail view and returns to the browser.
 - In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms
-  interrupt. Attach refreshes readable history first, then streams new events.
+  interrupt. Attach resumes with a turn snapshot first, then streams new events.
 - `q` quits. Local detach leaves remote turns running unless interrupted.
 - Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to capture raw stream
   events for transcript debugging.

@@ -712,7 +712,6 @@ async fn handle_terminal_event(
                         control_rx,
                         app_tx.clone(),
                     );
-                    schedule_detail_refresh(state, fetch_tx, thread_id).await?;
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     state.mode = Mode::Compose(ComposeState {
@@ -938,7 +937,6 @@ async fn handle_terminal_event(
                     control_rx,
                     app_tx.clone(),
                 );
-                schedule_detail_refresh(state, fetch_tx, thread_id).await?;
             }
         }
         KeyCode::Char('i') => {
@@ -1692,6 +1690,15 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
             let mut pending_turn_id = None;
             let mut assistant_updates = Vec::new();
+            let initial_event_turn_id =
+                event["turnId"].as_str().map(str::to_string).or_else(|| {
+                    state
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| stream.turn_id.clone())
+                });
+            let snapshot_detail =
+                detail_from_resume_snapshot(state, &event, &initial_event_turn_id);
             if let Some(stream) = &mut state.stream {
                 if let Some(turn_id) = event["turnId"].as_str() {
                     stream.turn_id = Some(turn_id.to_string());
@@ -1701,6 +1708,9 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     .as_str()
                     .map(str::to_string)
                     .or_else(|| stream.turn_id.clone());
+                if snapshot_detail.is_some() {
+                    seed_stream_from_resume_snapshot(stream, event_turn_id.as_deref(), &event);
+                }
                 if let Some(delta) = event["delta"].as_str() {
                     let item_id = event["itemId"].as_str().map(str::to_string);
                     let text = append_stream_assistant_delta(
@@ -1758,6 +1768,9 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
             if let Some(turn_id) = pending_turn_id {
                 fill_pending_turn_ids(state, &turn_id);
+            }
+            if let Some(detail) = snapshot_detail {
+                state.replace_detail(detail.epoch, detail);
             }
             for (turn_id, item_id, text, finalized) in assistant_updates {
                 upsert_streaming_assistant_message(state, turn_id, item_id, &text, finalized);
@@ -1854,6 +1867,75 @@ fn log_stream_event(event: &Value) {
         .open(path)
     {
         let _ = writeln!(file, "{line}");
+    }
+}
+
+fn detail_from_resume_snapshot(
+    state: &TuiState,
+    event: &Value,
+    active_turn_id: &Option<String>,
+) -> Option<DetailState> {
+    let current = state.detail.as_ref()?;
+    let thread = event.get("thread")?;
+    let thread_id = thread["id"]
+        .as_str()
+        .or_else(|| event["threadId"].as_str())?;
+    if current.thread_id != thread_id {
+        return None;
+    }
+    let turns = thread["turns"].as_array()?;
+    if turns.is_empty() {
+        return None;
+    }
+    let output = json!({
+        "thread": thread,
+        "turns": {
+            "data": turns,
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null
+        }
+    });
+    let status_output = active_turn_id
+        .as_ref()
+        .map(|turn_id| json!({"activeTurnId": turn_id}));
+    Some(detail_state(
+        output,
+        status_output,
+        thread_id.to_string(),
+        current.epoch,
+        current.current_cursor.clone(),
+    ))
+}
+
+fn seed_stream_from_resume_snapshot(
+    stream: &mut StreamState,
+    active_turn_id: Option<&str>,
+    event: &Value,
+) {
+    let Some(turns) = event["thread"]["turns"].as_array() else {
+        return;
+    };
+    for turn in turns {
+        let Some(turn_id) = turn["id"].as_str() else {
+            continue;
+        };
+        if active_turn_id.is_some_and(|active| active != turn_id) {
+            continue;
+        }
+        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
+            if item["type"].as_str() != Some("agentMessage") {
+                continue;
+            }
+            let Some(text) = item["text"].as_str() else {
+                continue;
+            };
+            set_stream_assistant_text(
+                stream,
+                Some(turn_id.to_string()),
+                item["id"].as_str().map(str::to_string),
+                text,
+            );
+        }
     }
 }
 
@@ -3879,18 +3961,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn attach_active_turn_schedules_detail_refresh() {
-        let target = Target {
-            server: "work".to_string(),
-            endpoint: crate::config::Endpoint::Unix {
-                path: "/tmp/missing.sock".into(),
-            },
-            model: None,
-            model_reasoning_effort: None,
-        };
-        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
-        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+    #[test]
+    fn attached_resume_snapshot_seeds_active_turn_text_for_future_deltas() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -3913,25 +3985,64 @@ mod tests {
             None,
         ));
 
-        handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::empty())),
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "type": "attached",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "attached",
+                "thread": {
+                    "id": "t1",
+                    "name": "Thread",
+                    "status": {"type": "active"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "completedAt": null,
+                            "items": [
+                                {
+                                    "id": "user-1",
+                                    "type": "userMessage",
+                                    "content": [{"type": "input_text", "text": "continue"}]
+                                },
+                                {
+                                    "id": "assistant-1",
+                                    "type": "agentMessage",
+                                    "text": "Already streamed"
+                                }
+                            ],
+                            "itemsView": "full"
+                        }
+                    ]
+                }
+            })),
             &mut state,
-            &target,
-            false,
-            &fetch_tx,
-            &app_tx,
-        )
-        .await
-        .unwrap();
+        );
 
-        assert!(matches!(
-            fetch_rx.try_recv().unwrap(),
-            FetchRequest::Detail {
-                thread_id,
-                page_direction: DetailPageDirection::Replace,
-                ..
-            } if thread_id == "t1"
-        ));
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[1].lines[0].text, "Already streamed");
+
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": " plus new"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(
+            detail.messages[1].lines[0].text,
+            "Already streamed plus new"
+        );
     }
 
     #[test]

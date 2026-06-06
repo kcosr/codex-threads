@@ -15,9 +15,10 @@
 
 - Make the TUI shortcut footer and help modal cover the current keymap, and use
   `Ctrl-J` for compose newlines.
-- Mark completed TUI stream messages as finalized, refresh detail immediately
-  when attaching to active turns, and support `Ctrl-D` clear behavior in search
-  and rename prompts.
+- Mark completed TUI stream messages as finalized and support `Ctrl-D` clear
+  behavior in search and rename prompts.
+- Seed TUI attach from the `thread/resume` turn snapshot so already-streamed
+  active-turn output appears before new stream deltas.
 - Preserve streamed assistant message item ids so the TUI and JSON output keep
   separate assistant messages distinct within a turn.
 

@@ -209,15 +209,29 @@ pub async fn attach_turn<F, G>(
     client: &mut RpcClient,
     options: AttachTurnOptions,
     control_rx: mpsc::UnboundedReceiver<TurnControl>,
-    on_event: F,
+    mut on_event: F,
     on_assistant_text_from_poll: G,
 ) -> Result<TurnWaitOutcome>
 where
     F: FnMut(&Value) -> Result<()>,
     G: FnMut(&str) -> Result<()>,
 {
-    resume_thread_for_action(client, &options.thread_id, options.yolo).await?;
-    let attached = json!({"type": "attached", "server": target.server, "threadId": options.thread_id, "turnId": options.turn_id, "status": "attached"});
+    let resume = resume_thread_for_action(
+        client,
+        &options.thread_id,
+        options.yolo,
+        /*exclude_turns*/ false,
+    )
+    .await?;
+    let attached = json!({
+        "type": "attached",
+        "server": target.server,
+        "threadId": options.thread_id,
+        "turnId": options.turn_id,
+        "status": "attached",
+        "thread": resume["thread"].clone()
+    });
+    on_event(&attached)?;
     wait_for_turn_controlled(
         target,
         client,
@@ -528,17 +542,18 @@ async fn resume_thread_for_action(
     client: &mut RpcClient,
     thread_id: &str,
     yolo: bool,
-) -> Result<()> {
+    exclude_turns: bool,
+) -> Result<Value> {
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
-    params.insert("excludeTurns".to_string(), json!(true));
+    params.insert("excludeTurns".to_string(), json!(exclude_turns));
     if yolo {
         insert_thread_yolo_permissions(&mut params);
     }
-    client
+    let result = client
         .request("thread/resume", Value::Object(params), |_| {})
         .await?;
-    Ok(())
+    Ok(result)
 }
 
 async fn request_with_resume_retry<F>(
@@ -562,7 +577,7 @@ where
         Ok(result) => Ok(result),
         Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
             before_retry();
-            resume_thread_for_action(client, thread_id, yolo).await?;
+            resume_thread_for_action(client, thread_id, yolo, /*exclude_turns*/ true).await?;
             client
                 .request(method, params, |notification| {
                     on_notification(notification);
