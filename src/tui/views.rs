@@ -89,10 +89,8 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 },
             };
             let footer = match compose.target {
-                ComposeTarget::Steer { .. } => "Enter steer, Shift-J newline, Esc cancel",
-                ComposeTarget::NewTurn { .. } => {
-                    "Enter send, Shift-J newline, Tab mode, Esc cancel"
-                }
+                ComposeTarget::Steer { .. } => "Enter steer, Ctrl-J newline, Esc cancel",
+                ComposeTarget::NewTurn { .. } => "Enter send, Ctrl-J newline, Tab mode, Esc cancel",
             };
             draw_compose(frame, area, label, &compose.text, footer);
         }
@@ -773,20 +771,36 @@ fn on_off(value: bool) -> &'static str {
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let area = centered_rect(area, 76, 16);
+    let height = area.height.saturating_sub(2).clamp(18, 30);
+    let area = centered_rect(area, 86, height);
     frame.render_widget(Clear, area);
     let items = [
+        "Global",
+        "  ? help  q quit  Ctrl-C quit or interrupt active stream",
+        "  r refresh or poll active stream  R reload/reset  y copy thread id",
+        "  j/k, arrows, or mouse wheel move/scroll  gg/Home top  G/End bottom",
+        "  [ newer page  ] older page",
+        "",
         "Browser",
-        "  j/k, arrows, or wheel move; Enter opens; p toggles preview; / searches.",
-        "  a edits annotation; e renames; A toggles archive/unarchive.",
-        "  f filters; s sort; c columns.",
-        "  In Filters, a toggles the archived-thread filter; t toggles auto-refresh.",
+        "  Enter open detail  m compose message  / search threads",
+        "  a annotate  e rename  A archive/unarchive",
+        "  f filters  s sort  c columns/time format  p preview  t auto-refresh",
+        "",
         "Detail",
-        "  Esc returns to the browser; / searches loaded transcript lines; gg/G jump.",
-        "  a edits annotation; e renames; A toggles archive/unarchive; m opens compose.",
-        "  T attaches; S steers; i opens interrupt confirmation.",
-        "Streams",
-        "  T attaches to an active turn. Esc or q detaches locally; remote turns keep running unless interrupted.",
+        "  Esc browser/detach detail session  Enter or m compose/message action",
+        "  / search loaded transcript  n/N next/previous match",
+        "  a annotate  e rename  A archive/unarchive  T attach  S steer  i interrupt",
+        "",
+        "Compose and Text Inputs",
+        "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
+        "  Search/rename: Enter apply/save  Esc cancel",
+        "  Annotation: Enter save  Ctrl-D clear  Esc cancel",
+        "",
+        "Menus and Prompts",
+        "  Filters: a toggle archived filter  Sort: u updated, c created, d direction",
+        "  Columns: 1 status, 2 updated, 3 cwd, 4 annotation, 5 relative time",
+        "  Active turn: Enter/T attach, s steer, i interrupt, Esc cancel",
+        "  Interrupt confirmation: Enter interrupt, Esc cancel",
     ];
     frame.render_widget(
         Paragraph::new(items.join("\n"))
@@ -892,6 +906,72 @@ mod tests {
     }
 
     #[test]
+    fn footer_exposes_help_and_refresh_shortcuts() {
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let backend = TestBackend::new(140, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("? help"));
+        assert!(text.contains("r/R refresh/reload"));
+        assert!(text.contains("[] page"));
+    }
+
+    #[test]
+    fn help_modal_lists_core_shortcuts_by_context() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Help;
+
+        let backend = TestBackend::new(140, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Global"));
+        assert!(text.contains("r refresh or poll active stream"));
+        assert!(text.contains("[ newer page"));
+        assert!(text.contains("Browser"));
+        assert!(text.contains("a annotate"));
+        assert!(text.contains("Detail"));
+        assert!(text.contains("n/N next/previous match"));
+        assert!(text.contains("Compose and Text Inputs"));
+        assert!(text.contains("Ctrl-J newline"));
+        assert!(text.contains("Menus and Prompts"));
+        assert!(text.contains("Columns: 1 status"));
+    }
+
+    #[test]
     fn compact_path_with_home_only_rewrites_matching_home_prefix() {
         assert_eq!(
             compact_path_with_home("/home/kevin/repo", "/home/kevin"),
@@ -962,7 +1042,7 @@ mod tests {
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("first line"));
         assert!(text.contains("second line"));
-        assert!(text.contains("Enter send, Shift-J newline, Tab mode, Esc cancel"));
+        assert!(text.contains("Enter send, Ctrl-J newline, Tab mode, Esc cancel"));
     }
 
     #[test]

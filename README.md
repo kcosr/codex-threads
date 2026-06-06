@@ -204,12 +204,13 @@ codex-threads tui --query "release process" --limit 20
 
 Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
-`/` to search threads or loaded transcript messages, `Enter` to open a thread,
-`]` and `[` to page when cursors are available, `p` to toggle the preview pane,
-`f` for filters, `s` for sort, `c` for visible columns and updated-time display,
-`a` to annotate, `e` to rename, `A` to archive or unarchive, `r` to refresh,
-`y` to copy the active thread id with OSC 52, and `m` to compose.
-Compose uses `Enter` to send and `Shift-J` to insert a newline; `Tab` toggles
+`?` for keyboard help, `/` to search threads or loaded transcript messages,
+`Enter` to open a thread, `]` and `[` to page when cursors are available, `p`
+to toggle the preview pane, `f` for filters, `s` for sort, `c` for visible
+columns and updated-time display, `a` to annotate, `e` to rename, `A` to archive
+or unarchive, `r` to refresh, `y` to copy the active thread id with OSC 52, and
+`m` to compose.
+Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns.
 Annotation editing uses `Enter` to save and `Ctrl-D` to clear. In detail, `T`
 attaches to an active turn, `S` steers it, `i` confirms interrupt, `Enter` opens

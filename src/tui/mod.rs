@@ -1340,7 +1340,7 @@ async fn handle_compose_input(
             compose.text.pop();
             state.mode = Mode::Compose(compose);
         }
-        KeyCode::Char('J') => {
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             compose.text.push('\n');
             state.mode = Mode::Compose(compose);
         }
@@ -4189,7 +4189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compose_enter_submits_and_shift_j_inserts_newline() {
+    async fn compose_enter_submits_and_ctrl_j_inserts_newline() {
         let target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
@@ -4211,7 +4211,7 @@ mod tests {
         });
 
         handle_compose_input(
-            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {

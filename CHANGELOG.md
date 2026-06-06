@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- Make the TUI shortcut footer and help modal cover the current keymap, and use
+  `Ctrl-J` for compose newlines.
 - Preserve streamed assistant message item ids so the TUI and JSON output keep
   separate assistant messages distinct within a turn.
 

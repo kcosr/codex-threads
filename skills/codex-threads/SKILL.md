@@ -92,6 +92,7 @@ instead.
 
 Useful TUI keys:
 
+- `?` opens the comprehensive keyboard help modal.
 - `j/k`, arrow keys, or mouse wheel scrolling move through the browser and
   detail transcript; `Enter` opens a thread.
 - `gg` jumps to the top and `G` jumps to the bottom in the browser or detail.
@@ -106,7 +107,7 @@ Useful TUI keys:
 - `A` archives or unarchives the active thread.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
-- `m` composes a follow-up; `Enter` sends, `Shift-J` inserts a newline, and
+- `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
   `Tab` toggles stream/no-wait for new turns.
 - Opening a detail view starts at the transcript bottom; while in detail,
   `Enter` opens the message action, `n/N` move between message-search matches,
