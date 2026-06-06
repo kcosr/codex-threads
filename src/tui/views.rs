@@ -177,7 +177,7 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         };
         let mut cells = vec![Cell::from(title)];
         if visible.status {
-            cells.push(Cell::from(row.status.clone()));
+            cells.push(Cell::from(browser_row_status(state, &row.id, &row.status)));
         }
         if visible.updated {
             cells.push(Cell::from(row.updated.clone()));
@@ -216,6 +216,24 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(table, table_area);
     if let Some(area) = preview_area {
         draw_browser_preview(frame, area, state);
+    }
+}
+
+fn browser_row_status(state: &TuiState, thread_id: &str, fallback: &str) -> String {
+    let Some(stream) = &state.stream else {
+        return fallback.to_string();
+    };
+    if stream.thread_id != thread_id {
+        return fallback.to_string();
+    }
+    match stream.status {
+        StreamStatus::Starting | StreamStatus::Running => {
+            format_stream_status(stream.status).to_string()
+        }
+        StreamStatus::Failed | StreamStatus::Interrupted => {
+            format_stream_status(stream.status).to_string()
+        }
+        StreamStatus::Completed | StreamStatus::Detached => fallback.to_string(),
     }
 }
 
@@ -984,6 +1002,51 @@ mod tests {
         assert!(text.contains("recent user message"));
         assert!(text.contains("ASSISTANT"));
         assert!(text.contains("recent assistant message"));
+    }
+
+    #[test]
+    fn browser_render_overlays_matching_stream_status() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows.push(ThreadRow {
+            id: "thread-1".to_string(),
+            title: "Running task".to_string(),
+            status: "idle".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "~/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        });
+        state.stream = Some(StreamState::new_with_id(
+            1,
+            "thread-1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
+
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Running task"));
+        assert!(text.contains("running"));
     }
 
     #[test]
