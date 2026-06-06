@@ -170,6 +170,28 @@ impl ServerState {
                 }
             ]
         });
+        let long_turns = (1..=12)
+            .map(|index| {
+                json!({
+                    "id": format!("turn_long_{index:02}"),
+                    "status": "completed",
+                    "startedAt": 1_700_000_000_i64 + index,
+                    "completedAt": 1_700_000_010_i64 + index,
+                    "items": [
+                        {
+                            "id": format!("item_long_user_{index:02}"),
+                            "type": "userMessage",
+                            "content": [{ "type": "text", "text": format!("long prompt {index:02}") }]
+                        },
+                        {
+                            "id": format!("item_long_agent_{index:02}"),
+                            "type": "agentMessage",
+                            "text": format!("long response {index:02}")
+                        }
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
         let mut threads = HashMap::new();
         threads.insert(
             "thread_active".to_string(),
@@ -197,9 +219,26 @@ impl ServerState {
                 turns: vec![beta_turn],
             },
         );
+        threads.insert(
+            "thread_long".to_string(),
+            ThreadRecord {
+                id: "thread_long".to_string(),
+                name: "Long history".to_string(),
+                preview: "long prompt 12".to_string(),
+                cwd: "/tmp/tui-long".to_string(),
+                status: "idle".to_string(),
+                updated_at: 1_700_000_090,
+                active_turn_id: None,
+                turns: long_turns,
+            },
+        );
         Self {
             threads,
-            order: vec!["thread_active".to_string(), "thread_beta".to_string()],
+            order: vec![
+                "thread_active".to_string(),
+                "thread_beta".to_string(),
+                "thread_long".to_string(),
+            ],
             next_turn: 2,
         }
     }
@@ -226,16 +265,56 @@ impl ServerState {
         page(json!(threads))
     }
 
-    fn turns_page(&self, thread_id: &str, direction: &str) -> Value {
-        let mut turns = self
+    fn turns_page(
+        &self,
+        thread_id: &str,
+        direction: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Value {
+        let mut ordered = self
             .threads
             .get(thread_id)
             .map(|thread| thread.turns.clone())
             .unwrap_or_default();
         if direction == "desc" {
-            turns.reverse();
+            ordered.reverse();
         }
-        page(json!(turns))
+        let start = cursor
+            .and_then(|cursor| {
+                ordered
+                    .iter()
+                    .position(|turn| turn["id"].as_str() == Some(cursor))
+            })
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let page_turns = ordered
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_cursor = if start + page_turns.len() < ordered.len() {
+            page_turns
+                .last()
+                .and_then(|turn| turn["id"].as_str())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let backwards_cursor = if start > 0 {
+            page_turns
+                .first()
+                .and_then(|turn| turn["id"].as_str())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        json!({
+            "data": page_turns,
+            "nextCursor": next_cursor,
+            "backwardsCursor": backwards_cursor
+        })
     }
 
     fn status_for(&self, thread_id: &str) -> Value {
@@ -515,7 +594,9 @@ fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -
             let direction = request["params"]["sortDirection"]
                 .as_str()
                 .unwrap_or("desc");
-            state.turns_page(thread_id(request), direction)
+            let cursor = request["params"]["cursor"].as_str();
+            let limit = request["params"]["limit"].as_u64().unwrap_or(50) as usize;
+            state.turns_page(thread_id(request), direction, cursor, limit)
         }
         "thread/resume" => {
             let thread_id = thread_id(request);
@@ -690,6 +771,30 @@ fn tui_detail_compose_stream_updates_screen_and_cli_history() {
     );
     assert!(server.method_count("turn/start") >= 1);
     assert!(server.method_count("thread/turns/list") >= 2);
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_detail_loads_older_history_above_transcript() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task", "Long history"]);
+    tui.write(b"jj");
+    tui.write(b"\r");
+    tui.wait_for_all(&[
+        "Transcript - older above",
+        "long prompt 12",
+        "long response 12",
+    ]);
+    let before_older_load = server.method_count("thread/turns/list");
+    tui.write(b"[");
+    server.wait_for_method_count("thread/turns/list", before_older_load + 1);
+    tui.write(b"gg");
+    tui.wait_for_all(&["long prompt 01", "long response 01"]);
+    tui.quit();
 }
 
 #[test]

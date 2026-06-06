@@ -723,7 +723,9 @@ async fn handle_terminal_event(
     let key = match event {
         Event::Key(key) => key,
         Event::Mouse(mouse) => {
-            handle_mouse_event(mouse, state);
+            if handle_mouse_event(mouse, state) {
+                schedule_detail_older_if_available(state, fetch_tx).await?;
+            }
             return Ok(());
         }
         _ => return Ok(()),
@@ -1000,7 +1002,7 @@ async fn handle_terminal_event(
             Mode::Detail => {
                 if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
                     detail
-                        .next_cursor
+                        .backwards_cursor
                         .clone()
                         .map(|cursor| (detail.thread_id.clone(), cursor))
                 }) {
@@ -1009,7 +1011,7 @@ async fn handle_terminal_event(
                         fetch_tx,
                         thread_id,
                         Some(cursor),
-                        DetailPageDirection::Older,
+                        DetailPageDirection::Newer,
                     )
                     .await?;
                 }
@@ -1024,7 +1026,7 @@ async fn handle_terminal_event(
             Mode::Detail => {
                 if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
                     detail
-                        .backwards_cursor
+                        .next_cursor
                         .clone()
                         .map(|cursor| (detail.thread_id.clone(), cursor))
                 }) {
@@ -1033,7 +1035,7 @@ async fn handle_terminal_event(
                         fetch_tx,
                         thread_id,
                         Some(cursor),
-                        DetailPageDirection::Newer,
+                        DetailPageDirection::Older,
                     )
                     .await?;
                 }
@@ -1236,11 +1238,17 @@ async fn handle_terminal_event(
         }
         KeyCode::Char('s') if matches!(state.mode, Mode::Browser) => state.mode = Mode::SortMenu,
         KeyCode::Down | KeyCode::Char('j') => match state.mode {
-            Mode::Detail => scroll_detail(state, 1),
+            Mode::Detail => {
+                scroll_detail(state, 1);
+            }
             _ => state.move_selection(1),
         },
         KeyCode::Up | KeyCode::Char('k') => match state.mode {
-            Mode::Detail => scroll_detail(state, -1),
+            Mode::Detail => {
+                if scroll_detail(state, -1) {
+                    schedule_detail_older_if_available(state, fetch_tx).await?;
+                }
+            }
             _ => state.move_selection(-1),
         },
         KeyCode::Enter => match state.mode {
@@ -1329,12 +1337,37 @@ fn open_message_action(state: &mut TuiState, thread_id: String) {
     });
 }
 
-fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+async fn schedule_detail_older_if_available(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+) -> Result<()> {
+    let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
+        if detail.loading {
+            return None;
+        }
+        detail
+            .next_cursor
+            .clone()
+            .map(|cursor| (detail.thread_id.clone(), cursor))
+    }) else {
+        return Ok(());
+    };
+    schedule_detail_page(
+        state,
+        fetch_tx,
+        thread_id,
+        Some(cursor),
+        DetailPageDirection::Older,
+    )
+    .await
+}
+
+fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
     state.pending_goto_top = false;
     let delta: isize = match mouse.kind {
         MouseEventKind::ScrollUp => -3,
         MouseEventKind::ScrollDown => 3,
-        _ => return,
+        _ => return false,
     };
     match state.mode {
         Mode::Detail
@@ -1361,7 +1394,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         | Mode::ConfirmInterrupt {
             return_to_detail: false,
             ..
-        } => state.move_selection(delta),
+        } => {
+            state.move_selection(delta);
+            false
+        }
         Mode::AnnotationInput {
             return_to_detail: true,
             ..
@@ -1377,13 +1413,16 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         | Mode::RenameInput {
             return_to_detail: false,
             ..
-        } => state.move_selection(delta),
+        } => {
+            state.move_selection(delta);
+            false
+        }
     }
 }
 
-fn scroll_detail(state: &mut TuiState, delta: isize) {
+fn scroll_detail(state: &mut TuiState, delta: isize) -> bool {
     let Some(detail) = &mut state.detail else {
-        return;
+        return false;
     };
     if delta.is_negative() {
         detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs() as u16);
@@ -1393,6 +1432,7 @@ fn scroll_detail(state: &mut TuiState, delta: isize) {
             .saturating_add(delta as u16)
             .min(detail.max_scroll());
     }
+    delta.is_negative() && detail.scroll == 0 && detail.next_cursor.is_some() && !detail.loading
 }
 
 async fn handle_text_input<F>(
@@ -4076,6 +4116,17 @@ mod tests {
         }
     }
 
+    fn test_target() -> Target {
+        Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        }
+    }
+
     #[test]
     fn search_clearing_switches_back_to_list_mode() {
         let mut state = TuiState::new(TuiInit {
@@ -5170,6 +5221,118 @@ mod tests {
         assert_eq!(thread_id, "t1");
         assert_eq!(cursor.as_deref(), Some("current"));
         assert_eq!(page_direction, DetailPageDirection::Replace);
+    }
+
+    #[tokio::test]
+    async fn detail_left_bracket_schedules_older_page() {
+        let target = test_target();
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": "older", "backwardsCursor": "newer", "data": [
+                    {"id": "turn-2", "items": [
+                        {"id": "middle", "type": "agentMessage", "text": "middle"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::Detail {
+            thread_id,
+            cursor,
+            page_direction,
+            ..
+        } = fetch_rx.recv().await.expect("detail request")
+        else {
+            panic!("expected detail request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert_eq!(cursor.as_deref(), Some("older"));
+        assert_eq!(page_direction, DetailPageDirection::Older);
+    }
+
+    #[tokio::test]
+    async fn scrolling_up_at_detail_top_schedules_older_page() {
+        let target = test_target();
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": "older", "backwardsCursor": null, "data": [
+                    {"id": "turn-2", "items": [
+                        {"id": "middle", "type": "agentMessage", "text": "middle"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::Detail {
+            thread_id,
+            cursor,
+            page_direction,
+            ..
+        } = fetch_rx.recv().await.expect("detail request")
+        else {
+            panic!("expected detail request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert_eq!(cursor.as_deref(), Some("older"));
+        assert_eq!(page_direction, DetailPageDirection::Older);
     }
 
     #[test]

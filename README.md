@@ -205,14 +205,14 @@ codex-threads tui --query "release process" --limit 20
 Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `?` for keyboard help, `/` to search threads or loaded transcript messages,
-`Enter` to open a thread, `]` and `[` to page when cursors are available, `p`
-to toggle the lazy recent-message preview pane, `f` for filters, `s` for sort,
-`c` for visible columns and updated-time display, `a` to annotate, `e` to
-rename, `A` to confirm archive or unarchive, `T` to attach to the selected
-active thread, `S` to steer the selected active thread, `i` to confirm
-interrupting it, `r` to refresh, `y` to copy the active thread id with OSC 52,
-and `m` to compose. Use `l` to explicitly load the selected or open thread,
-matching `status THREAD_ID --load`, then refresh visible metadata and history.
+`Enter` to open a thread, `p` to toggle the lazy recent-message preview pane,
+`f` for filters, `s` for sort, `c` for visible columns and updated-time
+display, `a` to annotate, `e` to rename, `A` to confirm archive or unarchive,
+`T` to attach to the selected active thread, `S` to steer the selected active
+thread, `i` to confirm interrupting it, `r` to refresh, `y` to copy the active
+thread id with OSC 52, and `m` to compose. Use `l` to explicitly load the
+selected or open thread, matching `status THREAD_ID --load`, then refresh
+visible metadata and history.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns. Browser compose streams into the preview while the
 thread remains selected, and detaches locally when selection moves away. If the
@@ -227,11 +227,14 @@ confirms interrupt, `Enter` or `m` composes a normal message, and `q` quits.
 Normal compose uses Codex app-server's `turn/start` path, including for active
 threads; explicit steer remains on `S`. Attaching resumes the thread with turns
 included so the active-turn snapshot appears before new stream notifications.
-Opening a thread loads a small recent turn
-window, orders it chronologically, and starts at the bottom of the transcript;
-detail views refresh in place while open, and `Esc` returns to the browser after
-unlinking the local detail view and detaching any local stream. Local detach
-leaves remote turns running.
+Opening a thread loads a small recent turn window, orders it chronologically,
+and starts at the bottom of the transcript. When older history is available, the
+detail header marks it as older above; scrolling up at the top loads the next
+older chunk above the current transcript and preserves the current view. In
+detail, `[` manually loads older messages above and `]` loads newer messages
+below when cursors are available. Detail views refresh in place while open, and
+`Esc` returns to the browser after unlinking the local detail view and detaching
+any local stream. Local detach leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
