@@ -205,7 +205,7 @@ pub async fn steer_turn(
     )
     .await?;
     Ok(
-        json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": result["turnId"].as_str().unwrap_or(&turn_id), "status": "accepted"}),
+        json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": result["turnId"].as_str().unwrap_or(&turn_id), "status": "accepted", "prompt": prompt}),
     )
 }
 

@@ -209,26 +209,31 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
 visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
 to confirm archive or unarchive, `T` to attach to the selected active thread,
-`S` to steer the selected active thread, `i` to confirm interrupting it, `r` to
-refresh, `y` to copy the active thread id with OSC 52, `o` to confirm opening
-the active thread in Codex's own TUI, and `m` to compose. Use
+`i` to confirm interrupting it, `r` to refresh, `y` to copy the active thread id
+with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
+`m` to compose. Use
 `l` to explicitly load the selected or open thread, matching
 `status THREAD_ID --load`, then refresh visible metadata and history.
-Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
-stream/no-wait for new turns. Browser compose streams into the preview while the
-thread remains selected, follows queued turns on that thread, and detaches
-locally when selection moves away. If the initial selected browser row is
-active, the TUI attaches to it automatically.
+Compose uses `Enter` to submit and `Ctrl-J` to insert a newline. On active
+threads, compose defaults to steering the active turn; `Tab` switches to a
+normal new-turn send, and `Tab` switches back to steer while the thread remains
+active. On inactive threads, `Tab` toggles stream/no-wait for new turns. Browser
+compose streams into the preview while the thread remains selected, follows
+queued turns on that thread, and detaches locally when selection moves away. If
+the initial selected browser row is active, or if an active thread is opened in
+detail, the TUI attaches to it automatically.
 Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
 refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
 operation. In detail, `T` attaches to an active turn, `S` steers it, `i`
-confirms interrupt, `Enter` or `m` composes a normal message, and `q` quits.
-Normal compose uses Codex app-server's `turn/start` path, including for active
-threads; explicit steer remains on `S`. Attaching resumes the thread with turns
-included so the active-turn snapshot appears before new stream notifications.
+operation. In detail, `T` attaches to an active turn, `i` confirms interrupt,
+`Enter` or `m` composes a message or steer action based on whether the thread is
+active, and `q` quits. Normal send uses Codex app-server's `turn/start` path;
+steer uses `turn/steer` when the thread is active and the composer is in steer
+mode. Attaching resumes the thread with turns included so the active-turn
+snapshot appears before new stream notifications.
 Opening a thread loads a small recent turn window, orders it chronologically,
 and starts at the bottom of the transcript. Scrolling up at the top loads the
 next older chunk above the current transcript and preserves the current view. In

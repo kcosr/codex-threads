@@ -8,8 +8,8 @@ use crate::tui::keymap::{
     BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
 };
 use crate::tui::state::{
-    BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState, message_header_visible,
-    transcript_rendered_line_count,
+    BrowserSource, ComposeState, ComposeTarget, Mode, SendMode, StreamStatus, TuiState,
+    message_header_visible, transcript_rendered_line_count,
 };
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
@@ -114,13 +114,19 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                     "Steer active turn"
                 }
                 ComposeTarget::NewTurn { .. } => match compose.send_mode {
+                    SendMode::Stream if compose_new_turn_can_steer(state, compose) => {
+                        "Send new turn"
+                    }
                     SendMode::Stream => "Compose stream",
                     SendMode::NoWait => "Compose no-wait",
                 },
             };
             let footer = match compose.target {
                 ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
-                    "Enter steer, Ctrl-J newline, Esc cancel"
+                    "Enter steer, Ctrl-J newline, Tab send, Esc cancel"
+                }
+                ComposeTarget::NewTurn { .. } if compose_new_turn_can_steer(state, compose) => {
+                    "Enter send, Ctrl-J newline, Tab steer, Esc cancel"
                 }
                 ComposeTarget::NewTurn { .. } => "Enter send, Ctrl-J newline, Tab mode, Esc cancel",
             };
@@ -129,6 +135,25 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         Mode::Help => draw_help(frame, area),
         _ => {}
     }
+}
+
+fn compose_new_turn_can_steer(state: &TuiState, compose: &ComposeState) -> bool {
+    let ComposeTarget::NewTurn { thread_id } = &compose.target else {
+        return false;
+    };
+    state.stream.as_ref().is_some_and(|stream| {
+        stream.thread_id.as_str() == thread_id.as_str()
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+    }) || state.detail.as_ref().is_some_and(|detail| {
+        detail.thread_id.as_str() == thread_id.as_str() && detail.active_turn_id.is_some()
+    }) || state
+        .browser
+        .rows
+        .iter()
+        .any(|row| row.id.as_str() == thread_id.as_str() && row.is_running())
 }
 
 pub fn sync_viewport_state(state: &mut TuiState, area: Rect) {
@@ -373,15 +398,10 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let chunks = detail_chunks(area);
     let detail_status = detail_header_status(state);
     let connection = detail_connection_label(state);
-    let annotation = detail.annotation.clone().unwrap_or_default();
     let mut metadata_spans = vec![Span::raw(detail_status)];
     if let Some(connection) = connection {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(connection));
-    }
-    if !annotation.is_empty() {
-        metadata_spans.push(Span::raw("  "));
-        metadata_spans.push(Span::raw(annotation));
     }
     let metadata = vec![Line::from(metadata_spans)];
     frame.render_widget(
@@ -907,21 +927,22 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Browser: [ previous page  ] next page",
         "",
         "Browser",
-        "  Enter open detail  m compose message  o open in Codex TUI  / search threads",
+        "  Enter open detail  m compose message or steer active turn  o open in Codex TUI",
+        "  / search threads",
         "  l load selected thread  T attach/watch active turn",
-        "  S steer selected active turn  i interrupt selected active turn",
+        "  i interrupt selected active turn",
         "  a annotate  e rename  A confirm archive/unarchive",
         "  f filters  s sort  c columns/time/refresh  p preview  t auto-refresh",
         "",
         "Detail",
-        "  Esc browser/detach detail session  Enter or m compose/message action",
+        "  Esc browser/detach detail session  Enter or m compose message or steer",
         "  gg/Home real transcript start  G/End real transcript end",
         "  / search loaded transcript  n/N next/previous match",
         "  l load thread  o open in Codex TUI  a annotate  e rename  A confirm archive/unarchive",
-        "  T attach  S steer  i interrupt",
+        "  T attach  i interrupt",
         "",
         "Compose and Text Inputs",
-        "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
+        "  Compose: Enter submit  Ctrl-J newline  Tab steer/send or stream/no-wait  Esc cancel",
         "  Search: Enter apply  Ctrl-D clear  Esc cancel",
         "  Rename: Enter save  Ctrl-D clear draft  Esc cancel",
         "  Annotation: Enter save  Ctrl-D clear  Esc cancel",
@@ -1142,7 +1163,7 @@ mod tests {
         assert!(text.contains("? help"));
         assert!(text.contains("r/R refresh"));
         assert!(text.contains("l load"));
-        assert!(text.contains("S steer"));
+        assert!(text.contains("m msg/steer"));
         assert!(text.contains("i int"));
         assert!(text.contains("[] page"));
     }
@@ -1612,6 +1633,62 @@ mod tests {
         assert!(text.contains("Second assistant item"));
         assert!(text.contains("Next turn"));
         assert!(!text.contains("assistant Continuation line"));
+    }
+
+    #[test]
+    fn detail_header_does_not_render_annotation_text() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(DetailState {
+            thread_id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            annotation: Some("unexpected message-like annotation".to_string()),
+            messages: vec![MessageBlock {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("item-1".to_string()),
+                role: "user".to_string(),
+                timestamp: None,
+                lines: vec![MessageLine {
+                    kind: MessageLineKind::Text,
+                    text: "transcript content".to_string(),
+                    spans: Vec::new(),
+                }],
+                is_match: false,
+            }],
+            scroll: 0,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: None,
+            active_turn_id: None,
+            loading: false,
+            epoch: 1,
+            last_refresh_at: None,
+            viewport_height: None,
+            viewport_width: None,
+            last_error: None,
+        });
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("Thread"));
+        assert!(text.contains("idle"));
+        assert!(text.contains("transcript content"));
+        assert!(!text.contains("unexpected message-like annotation"));
     }
 
     #[test]

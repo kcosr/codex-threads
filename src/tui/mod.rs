@@ -15,14 +15,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::cursor::Show;
+use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
@@ -147,9 +147,24 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 let refresh_after_load = loaded_thread(&event);
                 let follow_after_stream = stream_finish_follow_thread(&event, &state);
                 let detail_loaded = matches!(event, AppEvent::DetailLoaded { .. });
+                let detail_replace_loaded = matches!(
+                    event,
+                    AppEvent::DetailLoaded {
+                        page_direction: DetailPageDirection::Replace,
+                        ..
+                    }
+                );
                 handle_app_event(event, &mut state);
                 if detail_loaded && !state.should_quit {
                     schedule_pending_detail_jump(&mut state, &fetch_tx).await?;
+                }
+                if detail_replace_loaded && !state.should_quit {
+                    auto_attach_open_detail_thread_if_active(
+                        &mut state,
+                        target.clone(),
+                        yolo,
+                        app_tx.clone(),
+                    );
                 }
                 if auto_attach_initial_active && !state.should_quit {
                     auto_attach_selected_browser_thread_if_active(
@@ -278,6 +293,11 @@ fn enter_terminal() -> Result<()> {
     Ok(())
 }
 
+fn force_terminal_redraw() {
+    let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
+    let _ = io::stdout().flush();
+}
+
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -341,6 +361,7 @@ fn launch_codex_resume(launch: &CodexResumeLaunch) -> Result<ExitStatus> {
         .status()
         .with_context(|| format!("failed to launch `{}`", launch.program.to_string_lossy()));
     enter_terminal().context("failed to restore tui terminal after codex exited")?;
+    force_terminal_redraw();
     status
 }
 
@@ -1253,36 +1274,6 @@ async fn handle_terminal_event(
                 schedule_thread_load(state, fetch_tx, thread_id).await?;
             }
         }
-        KeyCode::Char('S') => match state.mode {
-            Mode::Detail => {
-                if let Some(detail) = &state.detail
-                    && let Some(turn_id) = detail.active_turn_id.clone()
-                {
-                    state.mode = Mode::Compose(ComposeState {
-                        target: ComposeTarget::Steer {
-                            thread_id: detail.thread_id.clone(),
-                            turn_id,
-                        },
-                        text: String::new(),
-                        send_mode: SendMode::NoWait,
-                        return_to_detail: true,
-                    });
-                }
-            }
-            Mode::Browser => {
-                if let Some(thread_id) = state.selected_thread_id().map(str::to_string)
-                    && selected_thread_is_running(state, &thread_id)
-                {
-                    state.mode = Mode::Compose(ComposeState {
-                        target: ComposeTarget::SteerSelected { thread_id },
-                        text: String::new(),
-                        send_mode: SendMode::NoWait,
-                        return_to_detail: false,
-                    });
-                }
-            }
-            _ => {}
-        },
         KeyCode::Char('T') => {
             if matches!(state.mode, Mode::Detail)
                 && let Some(detail) = &state.detail
@@ -1546,12 +1537,95 @@ fn jump_to_bottom(state: &mut TuiState) {
 
 fn open_message_action(state: &mut TuiState, thread_id: String) {
     let return_to_detail = matches!(state.mode, Mode::Detail);
+    let (target, send_mode) = default_compose_target(state, thread_id, return_to_detail);
     state.mode = Mode::Compose(ComposeState {
-        target: ComposeTarget::NewTurn { thread_id },
+        target,
         text: String::new(),
-        send_mode: SendMode::Stream,
+        send_mode,
         return_to_detail,
     });
+}
+
+fn default_compose_target(
+    state: &TuiState,
+    thread_id: String,
+    return_to_detail: bool,
+) -> (ComposeTarget, SendMode) {
+    if let Some(target) = steer_target_for_thread(state, &thread_id, return_to_detail) {
+        (target, SendMode::Stream)
+    } else {
+        (ComposeTarget::NewTurn { thread_id }, SendMode::Stream)
+    }
+}
+
+fn toggle_compose_target_or_mode(state: &TuiState, mut compose: ComposeState) -> ComposeState {
+    match &compose.target {
+        ComposeTarget::Steer { thread_id, .. } | ComposeTarget::SteerSelected { thread_id } => {
+            compose.target = ComposeTarget::NewTurn {
+                thread_id: thread_id.clone(),
+            };
+            compose.send_mode = SendMode::Stream;
+        }
+        ComposeTarget::NewTurn { thread_id } => {
+            if let Some(target) =
+                steer_target_for_thread(state, thread_id, compose.return_to_detail)
+            {
+                compose.target = target;
+                compose.send_mode = SendMode::Stream;
+            } else {
+                compose.send_mode = match compose.send_mode {
+                    SendMode::Stream => SendMode::NoWait,
+                    SendMode::NoWait => SendMode::Stream,
+                };
+            }
+        }
+    }
+    compose
+}
+
+fn steer_target_for_thread(
+    state: &TuiState,
+    thread_id: &str,
+    return_to_detail: bool,
+) -> Option<ComposeTarget> {
+    if return_to_detail
+        && let Some(detail) = &state.detail
+        && detail.thread_id == thread_id
+        && let Some(turn_id) = detail.active_turn_id.clone()
+    {
+        return Some(ComposeTarget::Steer {
+            thread_id: thread_id.to_string(),
+            turn_id,
+        });
+    }
+    if let Some(stream) = &state.stream
+        && stream.thread_id == thread_id
+        && matches!(
+            stream.status,
+            StreamStatus::Starting | StreamStatus::Running
+        )
+    {
+        if let Some(turn_id) = stream.turn_id.clone() {
+            return Some(ComposeTarget::Steer {
+                thread_id: thread_id.to_string(),
+                turn_id,
+            });
+        }
+        return Some(ComposeTarget::SteerSelected {
+            thread_id: thread_id.to_string(),
+        });
+    }
+    if state
+        .browser
+        .rows
+        .iter()
+        .any(|row| row.id == thread_id && row.is_running())
+    {
+        return Some(ComposeTarget::SteerSelected {
+            thread_id: thread_id.to_string(),
+        });
+    }
+    None
 }
 
 async fn schedule_detail_older_if_available(
@@ -1899,12 +1973,7 @@ async fn handle_compose_input(
     match key.code {
         KeyCode::Esc => state.mode = return_mode.clone(),
         KeyCode::Tab => {
-            if matches!(compose.target, ComposeTarget::NewTurn { .. }) {
-                compose.send_mode = match compose.send_mode {
-                    SendMode::Stream => SendMode::NoWait,
-                    SendMode::NoWait => SendMode::Stream,
-                };
-            }
+            compose = toggle_compose_target_or_mode(state, compose);
             state.mode = Mode::Compose(compose);
         }
         KeyCode::Backspace => {
@@ -2010,6 +2079,24 @@ fn submit_compose(
             }
         }
         ComposeTarget::Steer { thread_id, turn_id } => {
+            let sent_at = format_current_epoch();
+            append_detail_message(
+                state,
+                thread_id.as_str(),
+                Some(turn_id.clone()),
+                "user",
+                Some(sent_at.clone()),
+                &prompt,
+            );
+            append_preview_message(
+                state,
+                thread_id.as_str(),
+                Some(turn_id.clone()),
+                "user",
+                Some(sent_at),
+                &prompt,
+            );
+            touch_browser_thread_updated(state, &thread_id);
             state.mode = return_mode;
             spawn_steer_task(
                 target.clone(),
@@ -2021,6 +2108,24 @@ fn submit_compose(
             );
         }
         ComposeTarget::SteerSelected { thread_id } => {
+            let sent_at = format_current_epoch();
+            append_detail_message(
+                state,
+                thread_id.as_str(),
+                None,
+                "user",
+                Some(sent_at.clone()),
+                &prompt,
+            );
+            append_preview_message(
+                state,
+                thread_id.as_str(),
+                None,
+                "user",
+                Some(sent_at),
+                &prompt,
+            );
+            touch_browser_thread_updated(state, &thread_id);
             state.mode = return_mode;
             spawn_steer_task(
                 target.clone(),
@@ -3248,6 +3353,49 @@ fn auto_attach_selected_browser_thread_if_active(
     spawn_browser_attach_task(target, thread_id, yolo, control_rx, stream_id, app_tx);
 }
 
+fn auto_attach_open_detail_thread_if_active(
+    state: &mut TuiState,
+    target: Target,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !matches!(state.mode, Mode::Detail) {
+        return;
+    }
+    let Some(detail) = state.detail.as_ref() else {
+        return;
+    };
+    if detail.loading {
+        return;
+    }
+    let Some(turn_id) = detail.active_turn_id.clone() else {
+        return;
+    };
+    let thread_id = detail.thread_id.clone();
+    if state
+        .stream
+        .as_ref()
+        .is_some_and(|stream| stream.thread_id == thread_id && stream_is_running_status(stream))
+    {
+        return;
+    }
+    detach_stream(state);
+    state.stream = None;
+    let stream_id = state.allocate_stream_id();
+    state.stream = Some(StreamState::new_with_id(
+        stream_id,
+        thread_id.clone(),
+        Some(turn_id.clone()),
+        StreamStatus::Running,
+        true,
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    state.stream_control = Some(control_tx);
+    spawn_attach_task(
+        target, thread_id, turn_id, yolo, control_rx, stream_id, app_tx,
+    );
+}
+
 fn stream_finish_detail_thread(event: &AppEvent, state: &TuiState) -> Option<String> {
     if !matches!(event, AppEvent::StreamFinished { .. }) {
         return None;
@@ -3719,22 +3867,17 @@ fn upsert_streaming_assistant_message(
         return;
     }
     let was_at_bottom = detail.is_at_bottom();
-    let match_index = detail.messages.iter().rposition(|message| {
-        streaming_message_exact_match(message, turn_id.as_deref(), item_id.as_deref())
-    });
-    let provisional_index = if item_id.is_some() && match_index.is_none() {
-        detail
-            .messages
-            .iter()
-            .rposition(|message| streaming_message_provisional_match(message, turn_id.as_deref()))
-    } else {
-        None
-    };
-    if let Some(message) = match_index
-        .or(provisional_index)
-        .and_then(|index| detail.messages.get_mut(index))
-    {
-        message.lines = markdown_lines(text, 100);
+    let (message_index, display_text) = streaming_message_update_target(
+        &detail.messages,
+        turn_id.as_deref(),
+        item_id.as_deref(),
+        text,
+    );
+    if display_text.is_empty() {
+        return;
+    }
+    if let Some(message) = message_index.and_then(|index| detail.messages.get_mut(index)) {
+        message.lines = markdown_lines(&display_text, 100);
         if message.turn_id.is_none() {
             message.turn_id = turn_id.clone();
         }
@@ -3747,7 +3890,7 @@ fn upsert_streaming_assistant_message(
             item_id,
             "assistant",
             None,
-            text,
+            &display_text,
             100,
         ));
     }
@@ -3776,21 +3919,13 @@ fn upsert_preview_assistant_message(
     let thread_id = stream.thread_id.clone();
     ensure_preview_thread(state, &thread_id);
     let messages = &mut state.browser.preview.messages;
-    let match_index = messages.iter().rposition(|message| {
-        streaming_message_exact_match(message, turn_id.as_deref(), item_id.as_deref())
-    });
-    let provisional_index = if item_id.is_some() && match_index.is_none() {
-        messages
-            .iter()
-            .rposition(|message| streaming_message_provisional_match(message, turn_id.as_deref()))
-    } else {
-        None
-    };
-    if let Some(message) = match_index
-        .or(provisional_index)
-        .and_then(|index| messages.get_mut(index))
-    {
-        message.lines = markdown_lines(text, 100);
+    let (message_index, display_text) =
+        streaming_message_update_target(messages, turn_id.as_deref(), item_id.as_deref(), text);
+    if display_text.is_empty() {
+        return;
+    }
+    if let Some(message) = message_index.and_then(|index| messages.get_mut(index)) {
+        message.lines = markdown_lines(&display_text, 100);
         if message.turn_id.is_none() {
             message.turn_id = turn_id.clone();
         }
@@ -3803,10 +3938,86 @@ fn upsert_preview_assistant_message(
             item_id,
             "assistant",
             None,
-            text,
+            &display_text,
             100,
         ));
     }
+}
+
+fn streaming_message_update_target(
+    messages: &[MessageBlock],
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+    text: &str,
+) -> (Option<usize>, String) {
+    if let Some(user_index) = latest_user_index_for_turn(messages, turn_id)
+        && let Some(prior_index) =
+            latest_assistant_match_before(messages, user_index, turn_id, item_id)
+    {
+        let display_text = suffix_after_message_text(&messages[prior_index], text);
+        let match_index = latest_assistant_match_after(messages, user_index, turn_id, item_id);
+        return (match_index, display_text);
+    }
+
+    let match_index = messages
+        .iter()
+        .rposition(|message| streaming_message_exact_match(message, turn_id, item_id));
+    let provisional_index = if item_id.is_some() && match_index.is_none() {
+        messages
+            .iter()
+            .rposition(|message| streaming_message_provisional_match(message, turn_id))
+    } else {
+        None
+    };
+    (match_index.or(provisional_index), text.to_string())
+}
+
+fn latest_user_index_for_turn(messages: &[MessageBlock], turn_id: Option<&str>) -> Option<usize> {
+    let turn_id = turn_id?;
+    messages
+        .iter()
+        .rposition(|message| message.role == "user" && message.turn_id.as_deref() == Some(turn_id))
+}
+
+fn latest_assistant_match_before(
+    messages: &[MessageBlock],
+    before_index: usize,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> Option<usize> {
+    messages[..before_index]
+        .iter()
+        .rposition(|message| streaming_message_exact_match(message, turn_id, item_id))
+}
+
+fn latest_assistant_match_after(
+    messages: &[MessageBlock],
+    after_index: usize,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .skip(after_index + 1)
+        .filter(|(_, message)| streaming_message_exact_match(message, turn_id, item_id))
+        .map(|(index, _)| index)
+        .next_back()
+}
+
+fn suffix_after_message_text(message: &MessageBlock, text: &str) -> String {
+    let prefix = message_text(message);
+    text.strip_prefix(&prefix)
+        .map(trim_stream_segment_boundary)
+        .unwrap_or(text)
+        .to_string()
+}
+
+fn trim_stream_segment_boundary(text: &str) -> &str {
+    text.strip_prefix("\r\n")
+        .or_else(|| text.strip_prefix('\n'))
+        .or_else(|| text.strip_prefix(' '))
+        .unwrap_or(text)
 }
 
 fn streaming_message_exact_match(
@@ -5333,6 +5544,59 @@ mod tests {
         assert_eq!(message_text(pending), "test 2");
     }
 
+    #[tokio::test]
+    async fn steer_compose_appends_user_message_in_active_turn() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "test 1"}]}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        submit_compose(
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::Steer {
+                    thread_id: "t1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                },
+                text: "steer here".to_string(),
+                send_mode: SendMode::Stream,
+                return_to_detail: true,
+            },
+            &test_target(),
+            false,
+            &app_tx,
+            Mode::Detail,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        let steer = detail.messages.last().expect("steer message");
+        assert_eq!(steer.role, "user");
+        assert_eq!(steer.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(message_text(steer), "steer here");
+    }
+
     #[test]
     fn queued_stream_event_assigns_one_pending_message_without_stealing_active_turn() {
         let mut state = TuiState::new(TuiInit {
@@ -5624,6 +5888,92 @@ mod tests {
         assert_eq!(message.lines[0].text, "old text");
         assert_eq!(message.lines[1].text, "live update");
         assert_eq!(message.timestamp.as_deref(), Some(old_timestamp.as_str()));
+    }
+
+    #[test]
+    fn same_item_delta_after_steer_renders_below_steer_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "start"}]},
+                        {"id": "assistant-1", "type": "agentMessage", "text": "before steer"}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        append_detail_message(
+            &mut state,
+            "t1",
+            Some("turn-1".to_string()),
+            "user",
+            None,
+            "steer here",
+        );
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        state
+            .stream
+            .as_mut()
+            .expect("stream")
+            .assistant_items
+            .push(StreamAssistantItem {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("assistant-1".to_string()),
+                text: "before steer".to_string(),
+                from_snapshot: true,
+                replay_prefix_len: None,
+            });
+
+        handle_app_event(
+            stream_event_for(
+                7,
+                serde_json::json!({
+                    "type": "delta",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-1",
+                    "delta": " after steer"
+                }),
+            ),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        let rendered = detail
+            .messages
+            .iter()
+            .map(|message| format!("{}:{}", message.role, message_text(message)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            vec![
+                "user:start",
+                "assistant:before steer",
+                "user:steer here",
+                "assistant:after steer"
+            ]
+        );
     }
 
     #[test]
@@ -6576,7 +6926,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_message_action_opens_normal_compose_even_when_active() {
+    fn detail_message_action_defaults_to_steer_when_active() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -6604,11 +6954,14 @@ mod tests {
         assert!(matches!(
             state.mode,
             Mode::Compose(ComposeState {
-                target: ComposeTarget::NewTurn { ref thread_id },
+                target: ComposeTarget::Steer {
+                    ref thread_id,
+                    ref turn_id,
+                },
                 send_mode: SendMode::Stream,
                 return_to_detail: true,
                 ..
-            }) if thread_id == "t1"
+            }) if thread_id == "t1" && turn_id == "turn-1"
         ));
 
         state.mode = Mode::Detail;
@@ -7751,7 +8104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_steer_shortcut_targets_selected_active_thread() {
+    async fn browser_message_action_targets_selected_active_thread_as_steer() {
         let target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
@@ -7775,7 +8128,7 @@ mod tests {
         let (app_tx, _app_rx) = mpsc::unbounded_channel();
 
         handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())),
             &mut state,
             &target,
             false,
@@ -7789,10 +8142,81 @@ mod tests {
             state.mode,
             Mode::Compose(ComposeState {
                 target: ComposeTarget::SteerSelected { ref thread_id },
-                send_mode: SendMode::NoWait,
+                send_mode: SendMode::Stream,
                 return_to_detail: false,
                 ..
             }) if thread_id == "t1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_compose_tab_switches_between_steer_and_send() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        open_message_action(&mut state, "t1".to_string());
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert!(matches!(
+            compose.target,
+            ComposeTarget::SteerSelected { ref thread_id } if thread_id == "t1"
+        ));
+        let compose = compose.clone();
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            compose,
+            &target,
+            false,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert!(matches!(
+            compose.target,
+            ComposeTarget::NewTurn { ref thread_id } if thread_id == "t1"
+        ));
+        let compose = compose.clone();
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            compose,
+            &target,
+            false,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert!(matches!(
+            compose.target,
+            ComposeTarget::SteerSelected { ref thread_id } if thread_id == "t1"
         ));
     }
 
@@ -8374,6 +8798,88 @@ mod tests {
         assert_eq!(stream.status, StreamStatus::Starting);
         assert!(stream.attached);
         assert!(state.stream_control.is_some());
+    }
+
+    #[tokio::test]
+    async fn opening_active_detail_auto_attaches() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "active-thread", "name": "Active", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-active"})),
+            "active-thread".to_string(),
+            1,
+            None,
+        ));
+
+        auto_attach_open_detail_thread_if_active(&mut state, target, true, app_tx);
+
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.thread_id, "active-thread");
+        assert_eq!(stream.turn_id.as_deref(), Some("turn-active"));
+        assert_eq!(stream.status, StreamStatus::Running);
+        assert!(stream.attached);
+        assert!(state.stream_control.is_some());
+    }
+
+    #[test]
+    fn opening_idle_detail_does_not_auto_attach() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "idle-thread", "name": "Idle", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "idle-thread".to_string(),
+            1,
+            None,
+        ));
+
+        auto_attach_open_detail_thread_if_active(&mut state, target, true, app_tx);
+
+        assert!(state.stream.is_none());
+        assert!(state.stream_control.is_none());
     }
 
     #[test]
