@@ -448,6 +448,20 @@ pub async fn resume_thread_for_action(
     yolo: bool,
     exclude_turns: bool,
 ) -> Result<Value> {
+    resume_thread_for_action_with_notifications(client, thread_id, yolo, exclude_turns, |_| {})
+        .await
+}
+
+pub async fn resume_thread_for_action_with_notifications<F>(
+    client: &mut RpcClient,
+    thread_id: &str,
+    yolo: bool,
+    exclude_turns: bool,
+    mut on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
     params.insert("excludeTurns".to_string(), json!(exclude_turns));
@@ -455,7 +469,9 @@ pub async fn resume_thread_for_action(
         insert_thread_yolo_permissions(&mut params);
     }
     let result = client
-        .request("thread/resume", Value::Object(params), |_| {})
+        .request("thread/resume", Value::Object(params), |notification| {
+            on_notification(notification);
+        })
         .await?;
     Ok(result)
 }

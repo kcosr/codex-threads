@@ -20,6 +20,8 @@
 - Fix TUI transcript and preview bottom scrolling on narrow terminals by
   counting post-wrap rendered rows.
 - Remove unused unbounded storage of raw stream events in the TUI.
+- Preserve attach-time and polled active-turn assistant updates so browser
+  preview and detail transcripts stay current while attached.
 
 ## [0.1.5] - 2026-06-05
 

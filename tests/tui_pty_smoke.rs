@@ -671,19 +671,11 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
     let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
-    tui.write(b"\r");
-    tui.wait_for_all(&[
-        "Transcript",
-        "Active stream",
-        "attached history before live",
-    ]);
     tui.write(b"T");
     tui.wait_for("attached live update");
     server.wait_for_method_count("thread/resume", 1);
-    tui.write(b"\x1b");
-    tui.wait_for("Threads");
-    server.wait_for_method_count("thread/unsubscribe", 1);
     tui.write(b"j");
+    server.wait_for_method_count("thread/unsubscribe", 1);
     tui.write(b"\r");
     tui.wait_for_all(&["Transcript", "Beta task", "beta opening prompt"]);
     tui.write(b"\x1b");
@@ -692,4 +684,9 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
 
     let active_status = run_cli_json(&server, &state_dir, &["status", "--json", "thread_active"]);
     assert_eq!(active_status["activeTurnId"], "turn_active");
+    assert!(
+        fs::read_to_string(stream_log)
+            .expect("stream log")
+            .contains("attached live update")
+    );
 }

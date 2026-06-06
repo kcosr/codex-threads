@@ -11,7 +11,7 @@ use crate::errors::app_server_error;
 use crate::rpc::{Notification, RpcClient};
 use crate::session::request_with_resume_retry;
 #[cfg(feature = "tui")]
-use crate::session::resume_thread_for_action;
+use crate::session::resume_thread_for_action_with_notifications;
 
 #[derive(Debug)]
 pub struct TurnStartOptions {
@@ -53,10 +53,6 @@ struct AssistantResponse {
 }
 
 impl AssistantResponses {
-    fn is_empty(&self) -> bool {
-        self.items.iter().all(|item| item.text.is_empty())
-    }
-
     fn contains_item(&self, item_id: Option<&str>) -> bool {
         self.items.iter().any(|item| match item_id {
             Some(item_id) => item.item_id.as_deref() == Some(item_id),
@@ -82,19 +78,29 @@ impl AssistantResponses {
         self.item_mut(item_id).text = text.to_string();
     }
 
-    fn replace_from_turn(&mut self, turn: &Value) {
-        self.items = turn["items"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .filter(|item| item["type"].as_str() == Some("agentMessage"))
-            .filter_map(|item| {
-                Some(AssistantResponse {
-                    item_id: item["id"].as_str().map(str::to_string),
-                    text: item["text"].as_str()?.to_string(),
-                })
-            })
-            .collect();
+    fn sync_from_turn(&mut self, turn: &Value) -> Vec<AssistantResponse> {
+        let mut updates = Vec::new();
+        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
+            if item["type"].as_str() != Some("agentMessage") {
+                continue;
+            }
+            let Some(text) = item["text"].as_str() else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let item_id = item["id"].as_str();
+            if self.text_for_item(item_id) == Some(text) {
+                continue;
+            }
+            self.set_text(item_id, text);
+            updates.push(AssistantResponse {
+                item_id: item_id.map(str::to_string),
+                text: text.to_string(),
+            });
+        }
+        updates
     }
 
     fn final_text(&self) -> String {
@@ -126,6 +132,12 @@ impl AssistantResponses {
             Some(item_id) => item.item_id.as_deref() == Some(item_id),
             None => item.item_id.is_none(),
         }) {
+            return &mut self.items[index];
+        }
+        if let Some(item_id) = item_id
+            && let Some(index) = self.items.iter().rposition(|item| item.item_id.is_none())
+        {
+            self.items[index].item_id = Some(item_id.to_string());
             return &mut self.items[index];
         }
         self.items.push(AssistantResponse {
@@ -219,11 +231,13 @@ where
     F: FnMut(&Value) -> Result<()>,
     G: FnMut(&str) -> Result<()>,
 {
-    let resume = resume_thread_for_action(
+    let mut early_notifications = Vec::new();
+    let resume = resume_thread_for_action_with_notifications(
         client,
         &options.thread_id,
         options.yolo,
         /*exclude_turns*/ false,
+        |notification| early_notifications.push(notification),
     )
     .await?;
     let attached = json!({
@@ -242,7 +256,7 @@ where
             acceptance: attached,
             thread_id: options.thread_id,
             turn_id: options.turn_id,
-            early_notifications: Vec::new(),
+            early_notifications,
         },
         ControlledTurnWaitOptions {
             poll_limit: options.poll_limit,
@@ -283,14 +297,10 @@ where
         if let Some(terminal) =
             process_turn_notification(&wait, notification, &mut assistant, &mut events)?
         {
-            if events.len() > before_len {
-                on_event(events.last().expect("terminal event just pushed"))?;
-            }
+            emit_new_events(&events, before_len, &mut on_event)?;
             return Ok(TurnWaitOutcome::Terminal(terminal));
         }
-        if events.len() > before_len {
-            on_event(events.last().expect("event just pushed"))?;
-        }
+        emit_new_events(&events, before_len, &mut on_event)?;
     }
 
     let mut poll = tokio::time::interval(Duration::from_secs(1));
@@ -309,16 +319,15 @@ where
                 match control {
                     Some(TurnControl::PollNow) => {
                         let before_len = events.len();
-                        if let Some(terminal) = poll_turn_completion(
+                        let terminal = poll_turn_completion(
                             client,
                             &wait,
                             &mut assistant,
                             &mut events,
                             &mut on_assistant_text_from_poll,
-                        ).await? {
-                            if events.len() > before_len {
-                                on_event(events.last().expect("terminal event just pushed"))?;
-                            }
+                        ).await?;
+                        emit_new_events(&events, before_len, &mut on_event)?;
+                        if let Some(terminal) = terminal {
                             return Ok(TurnWaitOutcome::Terminal(terminal));
                         }
                     }
@@ -353,27 +362,22 @@ where
                     &mut assistant,
                     &mut events,
                 )? {
-                    if events.len() > before_len {
-                        on_event(events.last().expect("terminal event just pushed"))?;
-                    }
+                    emit_new_events(&events, before_len, &mut on_event)?;
                     return Ok(TurnWaitOutcome::Terminal(terminal));
                 }
-                if events.len() > before_len {
-                    on_event(events.last().expect("event just pushed"))?;
-                }
+                emit_new_events(&events, before_len, &mut on_event)?;
             }
             _ = poll.tick() => {
                 let before_len = events.len();
-                if let Some(terminal) = poll_turn_completion(
+                let terminal = poll_turn_completion(
                     client,
                     &wait,
                     &mut assistant,
                     &mut events,
                     &mut on_assistant_text_from_poll,
-                ).await? {
-                    if events.len() > before_len {
-                        on_event(events.last().expect("terminal event just pushed"))?;
-                    }
+                ).await?;
+                emit_new_events(&events, before_len, &mut on_event)?;
+                if let Some(terminal) = terminal {
                     return Ok(TurnWaitOutcome::Terminal(terminal));
                 }
             }
@@ -477,14 +481,10 @@ where
         if let Some(terminal) =
             process_turn_notification(&wait, notification, &mut assistant, &mut events)?
         {
-            if events.len() > before_len {
-                on_event(events.last().expect("terminal event just pushed"))?;
-            }
+            emit_new_events(&events, before_len, &mut on_event)?;
             return Ok(TurnWaitOutcome::Terminal(terminal));
         }
-        if events.len() > before_len {
-            on_event(events.last().expect("event just pushed"))?;
-        }
+        emit_new_events(&events, before_len, &mut on_event)?;
     }
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -513,27 +513,22 @@ where
                     &mut assistant,
                     &mut events,
                 )? {
-                    if events.len() > before_len {
-                        on_event(events.last().expect("terminal event just pushed"))?;
-                    }
+                    emit_new_events(&events, before_len, &mut on_event)?;
                     return Ok(TurnWaitOutcome::Terminal(terminal));
                 }
-                if events.len() > before_len {
-                    on_event(events.last().expect("event just pushed"))?;
-                }
+                emit_new_events(&events, before_len, &mut on_event)?;
             }
             _ = poll.tick() => {
                 let before_len = events.len();
-                if let Some(terminal) = poll_turn_completion(
+                let terminal = poll_turn_completion(
                     client,
                     &wait,
                     &mut assistant,
                     &mut events,
                     &mut on_assistant_text_from_poll,
-                ).await? {
-                    if events.len() > before_len {
-                        on_event(events.last().expect("terminal event just pushed"))?;
-                    }
+                ).await?;
+                emit_new_events(&events, before_len, &mut on_event)?;
+                if let Some(terminal) = terminal {
                     return Ok(TurnWaitOutcome::Terminal(terminal));
                 }
             }
@@ -572,19 +567,40 @@ async fn poll_turn_completion(
     };
     reject_unknown_turn_status(turn)?;
     let status = turn_status(turn);
+    let updates = assistant.sync_from_turn(turn);
+    let polled_new_assistant_text = !updates.is_empty();
+    for update in updates {
+        let mut event = Map::new();
+        event.insert("type".to_string(), json!("progress"));
+        event.insert("server".to_string(), json!(wait.target.server));
+        event.insert("threadId".to_string(), json!(wait.thread_id));
+        event.insert("turnId".to_string(), json!(wait.turn_id));
+        insert_opt(&mut event, "itemId", update.item_id);
+        event.insert("text".to_string(), json!(update.text));
+        event.insert("source".to_string(), json!("poll"));
+        events.push(Value::Object(event));
+    }
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
-    if assistant.is_empty() {
-        assistant.replace_from_turn(turn);
-        let final_text = assistant.final_text();
-        if !final_text.is_empty() {
-            on_assistant_text_from_poll(&final_text)?;
-        }
+    let final_text = assistant.final_text();
+    if polled_new_assistant_text && !final_text.is_empty() {
+        on_assistant_text_from_poll(&final_text)?;
     }
     let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": wait.turn_id, "status": status, "source": "poll"});
     events.push(event);
     Ok(Some(turn_terminal(wait, status, assistant, events)))
+}
+
+fn emit_new_events(
+    events: &[Value],
+    before_len: usize,
+    on_event: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    for event in events.iter().skip(before_len) {
+        on_event(event)?;
+    }
+    Ok(())
 }
 
 fn process_turn_notification(
@@ -842,5 +858,86 @@ mod tests {
         assert_eq!(terminal.output["progress"][2]["itemId"], "assistant-2");
         assert_eq!(terminal.output["progress"][3]["type"], "assistantMessage");
         assert_eq!(terminal.output["progress"][3]["itemId"], "assistant-2");
+    }
+
+    #[test]
+    fn assistant_response_adopts_item_id_for_provisional_delta() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "turn-1",
+            poll_limit: 50,
+        };
+        let mut assistant = AssistantResponses::default();
+        let mut events = Vec::new();
+
+        process_turn_notification(
+            &wait,
+            Notification {
+                method: "item/agentMessage/delta".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "delta": "draft"
+                }),
+            },
+            &mut assistant,
+            &mut events,
+        )
+        .unwrap();
+        process_turn_notification(
+            &wait,
+            Notification {
+                method: "item/completed".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "assistant-1",
+                        "type": "agentMessage",
+                        "text": "draft final"
+                    }
+                }),
+            },
+            &mut assistant,
+            &mut events,
+        )
+        .unwrap();
+
+        assert_eq!(assistant.final_text(), "draft final");
+        assert_eq!(
+            assistant.to_json(),
+            vec![json!({"itemId": "assistant-1", "text": "draft final"})]
+        );
+    }
+
+    #[test]
+    fn assistant_response_sync_from_turn_reports_changes_once() {
+        let mut assistant = AssistantResponses::default();
+        let turn = json!({
+            "items": [
+                {
+                    "id": "assistant-1",
+                    "type": "agentMessage",
+                    "text": "current active text"
+                }
+            ]
+        });
+
+        let updates = assistant.sync_from_turn(&turn);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(updates[0].text, "current active text");
+        assert_eq!(assistant.final_text(), "current active text");
+        assert!(assistant.sync_from_turn(&turn).is_empty());
     }
 }
