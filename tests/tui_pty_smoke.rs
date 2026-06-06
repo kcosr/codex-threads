@@ -896,7 +896,9 @@ fn tui_detail_enter_send_on_initial_active_thread_follows_started_turn() {
         "attached history before live",
     ]);
     tui.write(b"\r");
-    tui.wait_for("Compose stream");
+    tui.wait_for("Steer active turn");
+    tui.write(b"\t");
+    tui.wait_for("Send new turn");
     tui.type_text("detail active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for detail active followup");
@@ -965,7 +967,9 @@ fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
     tui.write(b"m");
-    tui.wait_for("Compose stream");
+    tui.wait_for("Steer active turn");
+    tui.write(b"\t");
+    tui.wait_for("Send new turn");
     tui.type_text("browser active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for browser active followup");
@@ -989,7 +993,7 @@ fn tui_browser_explicit_steer_and_interrupt_use_active_control_rpcs() {
     let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
-    tui.write(b"S");
+    tui.write(b"m");
     tui.wait_for("Steer active turn");
     tui.type_text("browser explicit steer");
     tui.write(b"\r");

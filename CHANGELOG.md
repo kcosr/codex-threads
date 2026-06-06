@@ -12,6 +12,12 @@
 - Add opt-in PTY smoke tests for TUI navigation, streaming, attach/detach, and
   CLI history/status validation.
 
+### Changed
+
+- Make TUI compose default to steering active threads, with `Tab` switching
+  between steer and normal send when the thread is active.
+- Automatically attach the TUI stream when opening an active thread in detail.
+
 ### Fixed
 
 - Keep TUI browser row status from falling back to stale `notLoaded` after a
