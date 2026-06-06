@@ -41,6 +41,8 @@
   `turn/start` id that differs from the persisted turn id in history.
 - Show turn timestamps only on the first rendered TUI message block for a turn
   instead of repeating the same turn timestamp on every message.
+- Suppress repeated TUI transcript headers for consecutive same-role messages in
+  the same turn.
 
 ## [0.1.5] - 2026-06-05
 

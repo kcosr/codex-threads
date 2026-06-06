@@ -405,6 +405,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut previous_turn_id: Option<&str> = None;
+    let mut previous_role: Option<&str> = None;
     for message in messages {
         let role_style = match message.role.as_str() {
             "user" => Style::default()
@@ -421,12 +422,18 @@ fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'s
             role_style
         };
         let turn_id = message.turn_id.as_deref();
-        let show_timestamp = turn_id.is_none() || turn_id != previous_turn_id;
-        lines.push(Line::from(Span::styled(
-            message_header(message, show_timestamp),
-            header_style,
-        )));
+        let role = message.role.as_str();
+        let same_turn = turn_id.is_some() && turn_id == previous_turn_id;
+        let same_role = previous_role == Some(role);
+        if !(same_turn && same_role) {
+            let show_timestamp = !same_turn;
+            lines.push(Line::from(Span::styled(
+                message_header(message, show_timestamp),
+                header_style,
+            )));
+        }
         previous_turn_id = turn_id;
+        previous_role = Some(role);
         for line in &message.lines {
             let mut text_style = match line.kind {
                 MessageLineKind::Text => Style::default(),
@@ -1525,6 +1532,18 @@ mod tests {
                     is_match: false,
                 },
                 MessageBlock {
+                    turn_id: Some("turn-1".to_string()),
+                    item_id: Some("item-2b".to_string()),
+                    role: "assistant".to_string(),
+                    timestamp: Some("2026-06-05 09:01".to_string()),
+                    lines: vec![MessageLine {
+                        kind: MessageLineKind::Text,
+                        text: "Second assistant item".to_string(),
+                        spans: Vec::new(),
+                    }],
+                    is_match: false,
+                },
+                MessageBlock {
                     turn_id: Some("turn-2".to_string()),
                     item_id: Some("item-3".to_string()),
                     role: "user".to_string(),
@@ -1558,13 +1577,14 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("USER · 2026-06-05 09:00"));
-        assert!(text.contains("ASSISTANT"));
+        assert_eq!(text.matches("ASSISTANT").count(), 1);
         assert!(!text.contains("ASSISTANT · 2026-06-05 09:01"));
         assert!(text.contains("USER · 2026-06-05 09:02"));
         assert!(!text.contains("USER · 2026-06-05 09:00 · turn-1"));
         assert!(!text.contains("ASSISTANT · 2026-06-05 09:01 · turn-1"));
         assert!(text.contains("First response line"));
         assert!(text.contains("Continuation line"));
+        assert!(text.contains("Second assistant item"));
         assert!(text.contains("Next turn"));
         assert!(!text.contains("assistant Continuation line"));
     }
