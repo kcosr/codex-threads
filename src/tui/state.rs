@@ -493,13 +493,19 @@ impl TuiState {
         }
         let previous_offset = detail.scroll as usize;
         let width = detail.transcript_width();
+        let previous_first = detail.messages.first().cloned();
         let mut merged = Vec::new();
         append_unique_messages(&mut merged, page.messages.drain(..));
-        let prepended_lines = merged
-            .iter()
-            .map(|message| message_rendered_line_count(message, width))
-            .sum::<usize>();
         append_unique_messages(&mut merged, detail.messages.drain(..));
+        let prepended_lines = previous_first
+            .as_ref()
+            .and_then(|first| {
+                merged
+                    .iter()
+                    .position(|message| same_message(message, first))
+            })
+            .map(|index| transcript_scroll_offset(&merged, index, width))
+            .unwrap_or_else(|| transcript_rendered_line_count(&merged, width));
         detail.messages = merged;
         if previous_offset > 0 || prepended_lines > 0 {
             detail.scroll = previous_offset
@@ -724,19 +730,12 @@ impl DetailState {
 
     pub fn message_scroll_offset(&self, message_index: usize) -> usize {
         let width = self.transcript_width();
-        self.messages
-            .iter()
-            .take(message_index)
-            .map(|message| message_rendered_line_count(message, width))
-            .sum()
+        transcript_scroll_offset(&self.messages, message_index, width)
     }
 
     pub fn transcript_line_count(&self) -> usize {
         let width = self.transcript_width();
-        self.messages
-            .iter()
-            .map(|message| message_rendered_line_count(message, width))
-            .sum()
+        transcript_rendered_line_count(&self.messages, width)
     }
 
     fn transcript_width(&self) -> usize {
@@ -748,12 +747,64 @@ impl DetailState {
 
 pub const DEFAULT_TRANSCRIPT_WIDTH: u16 = 100;
 
-pub fn message_rendered_line_count(message: &MessageBlock, width: usize) -> usize {
-    1 + message
-        .lines
-        .iter()
-        .map(|line| rendered_line_count(&line.text, width))
-        .sum::<usize>()
+pub fn transcript_rendered_line_count(messages: &[MessageBlock], width: usize) -> usize {
+    let mut previous_turn_id: Option<&str> = None;
+    let mut previous_role: Option<&str> = None;
+    let mut count = 0usize;
+    for message in messages {
+        count += message_rendered_line_count_with_header(
+            message,
+            width,
+            message_header_visible(message, previous_turn_id, previous_role),
+        );
+        previous_turn_id = message.turn_id.as_deref();
+        previous_role = Some(message.role.as_str());
+    }
+    count
+}
+
+pub fn transcript_scroll_offset(
+    messages: &[MessageBlock],
+    message_index: usize,
+    width: usize,
+) -> usize {
+    let mut previous_turn_id: Option<&str> = None;
+    let mut previous_role: Option<&str> = None;
+    let mut offset = 0usize;
+    for message in messages.iter().take(message_index) {
+        offset += message_rendered_line_count_with_header(
+            message,
+            width,
+            message_header_visible(message, previous_turn_id, previous_role),
+        );
+        previous_turn_id = message.turn_id.as_deref();
+        previous_role = Some(message.role.as_str());
+    }
+    offset
+}
+
+pub fn message_header_visible(
+    message: &MessageBlock,
+    previous_turn_id: Option<&str>,
+    previous_role: Option<&str>,
+) -> bool {
+    let turn_id = message.turn_id.as_deref();
+    let same_turn = turn_id.is_some() && turn_id == previous_turn_id;
+    let same_role = previous_role == Some(message.role.as_str());
+    !(same_turn && same_role)
+}
+
+fn message_rendered_line_count_with_header(
+    message: &MessageBlock,
+    width: usize,
+    show_header: bool,
+) -> usize {
+    usize::from(show_header)
+        + message
+            .lines
+            .iter()
+            .map(|line| rendered_line_count(&line.text, width))
+            .sum::<usize>()
         + 1
 }
 
@@ -770,17 +821,19 @@ fn append_unique_messages(
     messages: impl IntoIterator<Item = MessageBlock>,
 ) {
     for message in messages {
-        let duplicate = target.iter().any(|existing| {
-            if message.item_id.is_some() || existing.item_id.is_some() {
-                existing.item_id == message.item_id
-            } else {
-                existing.turn_id == message.turn_id
-                    && existing.role == message.role
-                    && existing.lines == message.lines
-            }
-        });
+        let duplicate = target
+            .iter()
+            .any(|existing| same_message(existing, &message));
         if !duplicate {
             target.push(message);
         }
+    }
+}
+
+fn same_message(left: &MessageBlock, right: &MessageBlock) -> bool {
+    if left.item_id.is_some() || right.item_id.is_some() {
+        left.item_id == right.item_id
+    } else {
+        left.turn_id == right.turn_id && left.role == right.role && left.lines == right.lines
     }
 }

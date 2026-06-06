@@ -8,8 +8,8 @@ use crate::tui::keymap::{
     BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
 };
 use crate::tui::state::{
-    BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState,
-    message_rendered_line_count,
+    BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState, message_header_visible,
+    transcript_rendered_line_count,
 };
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
@@ -335,11 +335,7 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         let lines = transcript_lines(&preview.messages);
         let viewport = area.height.saturating_sub(2) as usize;
         let width = area.width.saturating_sub(2).max(1) as usize;
-        let rendered_lines = preview
-            .messages
-            .iter()
-            .map(|message| message_rendered_line_count(message, width))
-            .sum::<usize>();
+        let rendered_lines = transcript_rendered_line_count(&preview.messages, width);
         let scroll = rendered_lines
             .saturating_sub(viewport)
             .min(u16::MAX as usize) as u16;
@@ -423,10 +419,9 @@ fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'s
         };
         let turn_id = message.turn_id.as_deref();
         let role = message.role.as_str();
-        let same_turn = turn_id.is_some() && turn_id == previous_turn_id;
-        let same_role = previous_role == Some(role);
-        if !(same_turn && same_role) {
-            let show_timestamp = !same_turn;
+        let show_header = message_header_visible(message, previous_turn_id, previous_role);
+        if show_header {
+            let show_timestamp = turn_id.is_none() || turn_id != previous_turn_id;
             lines.push(Line::from(Span::styled(
                 message_header(message, show_timestamp),
                 header_style,
@@ -1571,6 +1566,11 @@ mod tests {
             viewport_width: None,
             last_error: None,
         });
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(
+            transcript_lines(&detail.messages).len(),
+            detail.transcript_line_count()
+        );
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state)).unwrap();

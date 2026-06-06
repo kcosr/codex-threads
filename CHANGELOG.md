@@ -43,6 +43,8 @@
   instead of repeating the same turn timestamp on every message.
 - Suppress repeated TUI transcript headers for consecutive same-role messages in
   the same turn.
+- Keep TUI transcript scroll bounds in sync with suppressed headers so long
+  threads opened at the bottom do not render blank.
 
 ## [0.1.5] - 2026-06-05
 
