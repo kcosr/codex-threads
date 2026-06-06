@@ -2518,6 +2518,17 @@ fn send_falls_back_to_polling_when_turn_notifications_are_absent() {
         completed["progress"].as_array().unwrap().last().unwrap()["source"],
         "poll"
     );
+
+    let output = server
+        .command()
+        .args(["send", "--server", "work", "thread_1", "continue"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).expect("utf8");
+    assert_eq!(text.match_indices("done").count(), 1, "{text}");
 }
 
 #[test]

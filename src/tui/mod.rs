@@ -1354,6 +1354,11 @@ async fn schedule_pending_detail_jump(
         DetailJump::End => (detail.backwards_cursor.clone(), DetailPageDirection::Newer),
     };
     if let Some(cursor) = cursor {
+        if detail.current_cursor.as_deref() == Some(cursor.as_str()) {
+            state.pending_detail_jump = None;
+            state.set_notice("stopped history jump: cursor did not advance");
+            return Ok(());
+        }
         schedule_detail_page_with_limit(
             state,
             fetch_tx,
@@ -1415,6 +1420,13 @@ async fn schedule_detail_older_if_available(
 ) -> Result<()> {
     let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
         if detail.loading {
+            return None;
+        }
+        if detail
+            .next_cursor
+            .as_deref()
+            .is_some_and(|cursor| detail.current_cursor.as_deref() == Some(cursor))
+        {
             return None;
         }
         detail
@@ -2599,9 +2611,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     .as_str()
                     .map(str::to_string)
                     .or_else(|| stream.turn_id.clone());
-                if snapshot_detail.is_some() {
-                    seed_stream_from_resume_snapshot(stream, event_turn_id.as_deref(), &event);
-                }
+                seed_stream_from_resume_snapshot(stream, event_turn_id.as_deref(), &event);
                 if let Some(delta) = event["delta"].as_str() {
                     let item_id = event["itemId"].as_str().map(str::to_string);
                     let item = append_stream_assistant_delta(
@@ -5518,6 +5528,45 @@ mod tests {
         assert_eq!(state.pending_detail_jump, Some(DetailJump::End));
     }
 
+    #[tokio::test]
+    async fn detail_jump_stops_on_non_advancing_cursor() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.pending_detail_jump = Some(DetailJump::Start);
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": "same", "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            Some("same".to_string()),
+        ));
+
+        schedule_pending_detail_jump(&mut state, &fetch_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(state.pending_detail_jump, None);
+        assert!(state.notice.as_ref().unwrap().message.contains("cursor"));
+        assert!(fetch_rx.try_recv().is_err());
+    }
+
     #[test]
     fn initial_detail_load_scrolls_to_bottom_after_loaded() {
         let mut state = TuiState::new(TuiInit {
@@ -5939,6 +5988,92 @@ mod tests {
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
         assert_eq!(
             detail.messages[0].lines[0].text,
+            "Already streamed plus anonymous"
+        );
+    }
+
+    #[test]
+    fn browser_auto_attach_snapshot_seeds_stream_for_anonymous_delta() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        state.browser.preview.thread_id = Some("t1".to_string());
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "attached",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "attached",
+                "thread": {
+                    "id": "t1",
+                    "name": "Thread",
+                    "status": {"type": "active"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "items": [
+                                {
+                                    "id": "assistant-1",
+                                    "type": "agentMessage",
+                                    "text": "Already streamed"
+                                }
+                            ],
+                            "itemsView": "full"
+                        }
+                    ]
+                }
+            })),
+            &mut state,
+        );
+
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(
+            state.browser.preview.messages[0].item_id.as_deref(),
+            Some("assistant-1")
+        );
+        assert_eq!(
+            state
+                .stream
+                .as_ref()
+                .unwrap()
+                .assistant_items
+                .first()
+                .unwrap()
+                .item_id
+                .as_deref(),
+            Some("assistant-1")
+        );
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": " plus anonymous"
+            })),
+            &mut state,
+        );
+
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(
+            state.browser.preview.messages[0].item_id.as_deref(),
+            Some("assistant-1")
+        );
+        assert_eq!(
+            state.browser.preview.messages[0].lines[0].text,
             "Already streamed plus anonymous"
         );
     }

@@ -28,6 +28,11 @@
   start/end boundaries instead of stopping at the prefetched window, using the
   server's maximum turn page size for full-history jumps.
 - Recognize Shift-G in terminals that report it as shifted lowercase `g`.
+- Prevent TUI history jumps from repeatedly requesting a non-advancing cursor.
+- Keep browser auto-attach streams from duplicating snapshot assistant text when
+  anonymous live deltas arrive after launch.
+- Avoid duplicate human CLI assistant output when turn notifications are missed
+  and completion is discovered through polling.
 
 ## [0.1.5] - 2026-06-05
 

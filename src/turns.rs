@@ -541,7 +541,7 @@ async fn poll_turn_completion(
     wait: &TurnWaitContext<'_>,
     assistant: &mut AssistantResponses,
     events: &mut Vec<Value>,
-    on_assistant_text_from_poll: &mut impl FnMut(&str) -> Result<()>,
+    _on_assistant_text_from_poll: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<Option<TurnTerminal>> {
     let mut notifications = Vec::new();
     let result = client
@@ -568,7 +568,6 @@ async fn poll_turn_completion(
     reject_unknown_turn_status(turn)?;
     let status = turn_status(turn);
     let updates = assistant.sync_from_turn(turn);
-    let polled_new_assistant_text = !updates.is_empty();
     for update in updates {
         let mut event = Map::new();
         event.insert("type".to_string(), json!("progress"));
@@ -582,10 +581,6 @@ async fn poll_turn_completion(
     }
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
-    }
-    let final_text = assistant.final_text();
-    if polled_new_assistant_text && !final_text.is_empty() {
-        on_assistant_text_from_poll(&final_text)?;
     }
     let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": wait.turn_id, "status": status, "source": "poll"});
     events.push(event);

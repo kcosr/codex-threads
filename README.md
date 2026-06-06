@@ -206,13 +206,13 @@ Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `?` for keyboard help, `/` to search threads or loaded transcript messages,
 `Enter` to open a thread, `p` to toggle the lazy recent-message preview pane,
-`f` for filters, `s` for sort, `c` for visible columns and updated-time
-display, `a` to annotate, `e` to rename, `A` to confirm archive or unarchive,
-`T` to attach to the selected active thread, `S` to steer the selected active
-thread, `i` to confirm interrupting it, `r` to refresh, `y` to copy the active
-thread id with OSC 52, and `m` to compose. Use `l` to explicitly load the
-selected or open thread, matching `status THREAD_ID --load`, then refresh
-visible metadata and history.
+`[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
+visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
+to confirm archive or unarchive, `T` to attach to the selected active thread,
+`S` to steer the selected active thread, `i` to confirm interrupting it, `r` to
+refresh, `y` to copy the active thread id with OSC 52, and `m` to compose. Use
+`l` to explicitly load the selected or open thread, matching
+`status THREAD_ID --load`, then refresh visible metadata and history.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns. Browser compose streams into the preview while the
 thread remains selected, and detaches locally when selection moves away. If the
