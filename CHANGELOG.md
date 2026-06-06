@@ -33,6 +33,8 @@
   anonymous live deltas arrive after launch.
 - Avoid duplicate human CLI assistant output when turn notifications are missed
   and completion is discovered through polling.
+- Keep TUI detail and browser streaming sends attached to the turn returned by
+  `turn/start` instead of a pre-existing active turn.
 
 ## [0.1.5] - 2026-06-05
 

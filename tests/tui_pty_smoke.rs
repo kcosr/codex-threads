@@ -332,36 +332,6 @@ impl ServerState {
     fn complete_started_turn(&mut self, thread_id: &str, prompt: &str) -> (String, String) {
         let reply = format!("stream reply for {prompt}");
         let thread = self.threads.get_mut(thread_id).expect("thread exists");
-        if let Some(active_turn_id) = thread.active_turn_id.clone() {
-            let item_id = format!("item_agent_{}", self.next_turn);
-            self.next_turn += 1;
-            if let Some(turn) = thread
-                .turns
-                .iter_mut()
-                .find(|turn| turn["id"].as_str() == Some(active_turn_id.as_str()))
-            {
-                if let Some(items) = turn["items"].as_array_mut() {
-                    items.push(json!({
-                        "id": format!("item_user_{}", self.next_turn),
-                        "type": "userMessage",
-                        "content": [{ "type": "text", "text": prompt }]
-                    }));
-                    items.push(json!({
-                        "id": item_id,
-                        "type": "agentMessage",
-                        "text": reply
-                    }));
-                }
-                turn["status"] = json!("completed");
-                turn["completedAt"] = json!(thread.updated_at + 1);
-            }
-            thread.status = "idle".to_string();
-            thread.active_turn_id = None;
-            thread.preview = prompt.to_string();
-            thread.updated_at += 1;
-            return (active_turn_id, reply);
-        }
-
         let turn_id = format!("turn_{}", self.next_turn);
         self.next_turn += 1;
         let item_id = format!("item_agent_{}", self.next_turn);
@@ -447,6 +417,24 @@ async fn handle_websocket<S>(
                 state.complete_started_turn(&thread_id, &prompt)
             };
             send_stream_notifications(&mut ws, &thread_id, &turn_id, &reply).await;
+            let response = json!({
+                "id": id,
+                "result": {
+                    "turn": {
+                        "id": turn_id,
+                        "status": "inProgress",
+                        "items": []
+                    }
+                }
+            });
+            if ws
+                .send(Message::Text(response.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
         }
 
         if method == "thread/resume" && request["params"]["excludeTurns"].as_bool() == Some(false) {
@@ -771,6 +759,41 @@ fn tui_detail_compose_stream_updates_screen_and_cli_history() {
     );
     assert!(server.method_count("turn/start") >= 1);
     assert!(server.method_count("thread/turns/list") >= 2);
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_detail_enter_send_on_initial_active_thread_follows_started_turn() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"\r");
+    tui.wait_for_all(&[
+        "Transcript",
+        "watch the active session",
+        "attached history before live",
+    ]);
+    tui.write(b"\r");
+    tui.wait_for("Compose stream");
+    tui.type_text("detail active followup");
+    tui.write(b"\r");
+    tui.wait_for("stream reply for detail active followup");
+    tui.quit();
+
+    assert!(server.method_count("turn/start") >= 1);
+    assert_eq!(
+        server.method_count("turn/steer"),
+        0,
+        "normal detail send should not use explicit steer"
+    );
+    assert!(
+        fs::read_to_string(stream_log)
+            .expect("stream log")
+            .contains("stream reply for detail active followup")
+    );
 }
 
 #[test]
