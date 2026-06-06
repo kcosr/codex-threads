@@ -119,6 +119,10 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        if state.force_terminal_clear {
+            terminal.clear()?;
+            state.force_terminal_clear = false;
+        }
         let size = terminal.size()?;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         views::sync_viewport_state(&mut state, area);
@@ -1110,6 +1114,7 @@ async fn handle_terminal_event(
                             state.set_notice(format!("failed to launch codex: {error}"));
                         }
                     }
+                    state.force_terminal_clear = true;
                     schedule_browser_refresh(state, fetch_tx).await?;
                     if state
                         .detail
