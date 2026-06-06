@@ -2794,11 +2794,12 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     ));
                 } else if let Some(text) = event["text"].as_str() {
                     let item_id = event["itemId"].as_str().map(str::to_string);
-                    set_stream_assistant_text(stream, event_turn_id.clone(), item_id.clone(), text);
+                    let item =
+                        set_stream_assistant_text(stream, event_turn_id.clone(), item_id, text);
                     assistant_updates.push((
-                        event_turn_id.clone(),
-                        item_id,
-                        text.to_string(),
+                        item.turn_id.clone(),
+                        item.item_id.clone(),
+                        item.text.clone(),
                         true,
                     ));
                 } else if let Some(responses) = event["assistantResponses"].as_array() {
@@ -2807,16 +2808,12 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                             continue;
                         };
                         let item_id = response["itemId"].as_str().map(str::to_string);
-                        set_stream_assistant_text(
-                            stream,
-                            event_turn_id.clone(),
-                            item_id.clone(),
-                            text,
-                        );
+                        let item =
+                            set_stream_assistant_text(stream, event_turn_id.clone(), item_id, text);
                         assistant_updates.push((
-                            event_turn_id.clone(),
-                            item_id,
-                            text.to_string(),
+                            item.turn_id.clone(),
+                            item.item_id.clone(),
+                            item.text.clone(),
                             true,
                         ));
                     }
@@ -2824,8 +2821,13 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     && !text.is_empty()
                     && stream.assistant_items.is_empty()
                 {
-                    set_stream_assistant_text(stream, event_turn_id.clone(), None, text);
-                    assistant_updates.push((event_turn_id.clone(), None, text.to_string(), true));
+                    let item = set_stream_assistant_text(stream, event_turn_id.clone(), None, text);
+                    assistant_updates.push((
+                        item.turn_id.clone(),
+                        item.item_id.clone(),
+                        item.text.clone(),
+                        true,
+                    ));
                 }
                 stream.status = match event["status"].as_str() {
                     Some("completed") => StreamStatus::Completed,
@@ -3088,7 +3090,7 @@ fn seed_stream_from_resume_snapshot(
             let Some(text) = item["text"].as_str() else {
                 continue;
             };
-            set_stream_assistant_text(
+            set_stream_assistant_snapshot_text(
                 stream,
                 Some(turn_id.to_string()),
                 item["id"].as_str().map(str::to_string),
@@ -3452,8 +3454,8 @@ fn append_stream_assistant_delta(
     item_id: Option<String>,
     delta: &str,
 ) -> StreamAssistantItem {
-    let item = stream_assistant_item_mut(stream, turn_id, item_id);
-    item.text.push_str(delta);
+    let item = stream_assistant_item_mut_for_delta(stream, turn_id, item_id);
+    merge_stream_delta(item, delta);
     item.clone()
 }
 
@@ -3462,8 +3464,112 @@ fn set_stream_assistant_text(
     turn_id: Option<String>,
     item_id: Option<String>,
     text: &str,
+) -> StreamAssistantItem {
+    let item = stream_assistant_item_mut_for_text(stream, turn_id, item_id, text);
+    item.text = text.to_string();
+    item.replay_prefix_len = None;
+    item.clone()
+}
+
+fn set_stream_assistant_snapshot_text(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
 ) {
-    stream_assistant_item_mut(stream, turn_id, item_id).text = text.to_string();
+    let item = stream_assistant_item_mut(stream, turn_id, item_id);
+    item.text = text.to_string();
+    item.from_snapshot = true;
+    item.replay_prefix_len = None;
+}
+
+fn stream_assistant_item_mut_for_delta(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+) -> &mut StreamAssistantItem {
+    let incoming_item_id = item_id.as_deref();
+    let incoming_turn_id = turn_id.as_deref();
+    if let Some(index) = stream
+        .assistant_items
+        .iter()
+        .position(|item| assistant_item_exact_match(item, incoming_turn_id, incoming_item_id))
+    {
+        return &mut stream.assistant_items[index];
+    }
+    if item_id.is_some()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .position(|item| assistant_item_provisional_match(item, incoming_turn_id))
+    {
+        let item = &mut stream.assistant_items[index];
+        item.item_id = item_id;
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
+    }
+    if item_id.is_some()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .rposition(|item| assistant_item_snapshot_match(item, incoming_turn_id))
+    {
+        return &mut stream.assistant_items[index];
+    }
+    if item_id.is_none()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .rposition(|item| turns_compatible(item.turn_id.as_deref(), incoming_turn_id))
+    {
+        let item = &mut stream.assistant_items[index];
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
+    }
+    push_stream_assistant_item(stream, turn_id, item_id)
+}
+
+fn stream_assistant_item_mut_for_text<'a>(
+    stream: &'a mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+) -> &'a mut StreamAssistantItem {
+    let incoming_item_id = item_id.as_deref();
+    let incoming_turn_id = turn_id.as_deref();
+    if let Some(index) = stream
+        .assistant_items
+        .iter()
+        .position(|item| assistant_item_exact_match(item, incoming_turn_id, incoming_item_id))
+    {
+        return &mut stream.assistant_items[index];
+    }
+    if item_id.is_some()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .position(|item| assistant_item_provisional_match(item, incoming_turn_id))
+    {
+        let item = &mut stream.assistant_items[index];
+        item.item_id = item_id;
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
+    }
+    if item_id.is_some()
+        && let Some(index) = stream.assistant_items.iter().rposition(|item| {
+            assistant_item_snapshot_match(item, incoming_turn_id)
+                && stream_texts_related(&item.text, text)
+        })
+    {
+        return &mut stream.assistant_items[index];
+    }
+    push_stream_assistant_item(stream, turn_id, item_id)
 }
 
 fn stream_assistant_item_mut(
@@ -3503,15 +3609,67 @@ fn stream_assistant_item_mut(
         }
         return item;
     }
+    push_stream_assistant_item(stream, turn_id, item_id)
+}
+
+fn push_stream_assistant_item(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+) -> &mut StreamAssistantItem {
     stream.assistant_items.push(StreamAssistantItem {
         turn_id,
         item_id,
         text: String::new(),
+        from_snapshot: false,
+        replay_prefix_len: None,
     });
     stream
         .assistant_items
         .last_mut()
         .expect("stream assistant item just pushed")
+}
+
+fn merge_stream_delta(item: &mut StreamAssistantItem, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if let Some(prefix_len) = item.replay_prefix_len
+        && let Some(remaining) = item.text.get(prefix_len..)
+        && remaining.starts_with(delta)
+    {
+        item.replay_prefix_len = Some(prefix_len + delta.len());
+        return;
+    }
+    if item.from_snapshot && item.text.starts_with(delta) {
+        item.replay_prefix_len = Some(delta.len());
+        return;
+    }
+    let overlap = append_overlap_len(&item.text, delta);
+    item.text.push_str(&delta[overlap..]);
+    item.replay_prefix_len = None;
+}
+
+fn append_overlap_len(existing: &str, fragment: &str) -> usize {
+    let max = existing.len().min(fragment.len());
+    let mut candidates = fragment
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(fragment.len()))
+        .filter(|length| *length <= max)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| right.cmp(left));
+    candidates
+        .into_iter()
+        .find(|length| existing.ends_with(&fragment[..*length]))
+        .unwrap_or(0)
+}
+
+fn stream_texts_related(existing: &str, incoming: &str) -> bool {
+    existing == incoming
+        || existing.starts_with(incoming)
+        || incoming.starts_with(existing)
+        || append_overlap_len(existing, incoming) > 0
 }
 
 fn assistant_item_exact_match(
@@ -3531,6 +3689,10 @@ fn assistant_item_provisional_match(item: &StreamAssistantItem, turn_id: Option<
     item.item_id.is_none()
         && turn_id.is_some()
         && turns_compatible(item.turn_id.as_deref(), turn_id)
+}
+
+fn assistant_item_snapshot_match(item: &StreamAssistantItem, turn_id: Option<&str>) -> bool {
+    item.from_snapshot && turns_compatible(item.turn_id.as_deref(), turn_id)
 }
 
 fn turns_compatible(existing: Option<&str>, incoming: Option<&str>) -> bool {
@@ -5442,6 +5604,8 @@ mod tests {
                 turn_id: Some("turn-1".to_string()),
                 item_id: Some("assistant-1".to_string()),
                 text: "old text".to_string(),
+                from_snapshot: false,
+                replay_prefix_len: None,
             });
 
         handle_app_event(
@@ -6615,6 +6779,97 @@ mod tests {
         assert_eq!(
             detail.messages[0].lines[0].text,
             "Already streamed plus anonymous"
+        );
+    }
+
+    #[test]
+    fn replayed_deltas_after_snapshot_do_not_duplicate_assistant_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "attached",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "attached",
+                "thread": {
+                    "id": "t1",
+                    "name": "Thread",
+                    "status": {"type": "active"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "items": [
+                                {
+                                    "id": "snapshot-assistant",
+                                    "type": "agentMessage",
+                                    "text": "The full paragraph"
+                                }
+                            ],
+                            "itemsView": "full"
+                        }
+                    ]
+                }
+            })),
+            &mut state,
+        );
+
+        for delta in ["The full", " paragraph", " with live suffix"] {
+            handle_app_event(
+                stream_event(serde_json::json!({
+                    "type": "progress",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "live-assistant",
+                    "delta": delta
+                })),
+                &mut state,
+            );
+        }
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "assistantMessage",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "live-assistant",
+                "text": "The full paragraph with live suffix"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(
+            detail.messages[0].lines[0].text,
+            "The full paragraph with live suffix"
+        );
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.assistant_items.len(), 1);
+        assert_eq!(
+            stream.assistant_items[0].text,
+            "The full paragraph with live suffix"
         );
     }
 

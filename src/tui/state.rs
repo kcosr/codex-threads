@@ -201,6 +201,8 @@ pub struct StreamAssistantItem {
     pub turn_id: Option<String>,
     pub item_id: Option<String>,
     pub text: String,
+    pub from_snapshot: bool,
+    pub replay_prefix_len: Option<usize>,
 }
 
 impl StreamState {

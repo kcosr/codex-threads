@@ -18,6 +18,8 @@
   locally observed send or stream completion.
 - Keep TUI streaming transcript updates from splitting anonymous deltas into
   separate fragments after an attached snapshot.
+- Keep TUI attach snapshots from duplicating replayed live deltas or final
+  assistant text when Codex changes the live item id.
 - Show a connected/detach-oriented detail footer while attached to a stream.
 - Fix TUI transcript and preview bottom scrolling on narrow terminals by
   counting post-wrap rendered rows.
