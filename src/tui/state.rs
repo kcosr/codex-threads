@@ -264,6 +264,7 @@ pub struct TuiState {
     pub next_stream_id: u64,
     pub pending_goto_top: bool,
     pub pending_detail_jump: Option<DetailJump>,
+    pub force_terminal_clear: bool,
     pub notice: Option<Notice>,
     pub should_quit: bool,
 }
@@ -328,6 +329,7 @@ impl TuiState {
             next_stream_id: 0,
             pending_goto_top: false,
             pending_detail_jump: None,
+            force_terminal_clear: false,
             notice: None,
             should_quit: false,
         }

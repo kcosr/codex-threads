@@ -398,10 +398,19 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let chunks = detail_chunks(area);
     let detail_status = detail_header_status(state);
     let connection = detail_connection_label(state);
+    let inner_width = chunks[0].width.saturating_sub(2) as usize;
+    let mut used_width = detail_status.chars().count();
     let mut metadata_spans = vec![Span::raw(detail_status)];
     if let Some(connection) = connection {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(connection));
+        used_width += 2 + connection.chars().count();
+    }
+    if let Some(annotation) =
+        detail_header_annotation(detail.annotation.as_deref(), inner_width, used_width)
+    {
+        metadata_spans.push(Span::raw("  "));
+        metadata_spans.push(Span::raw(annotation));
     }
     let metadata = vec![Line::from(metadata_spans)];
     frame.render_widget(
@@ -423,6 +432,35 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .style(Style::default()),
         chunks[1],
     );
+}
+
+fn detail_header_annotation(
+    annotation: Option<&str>,
+    inner_width: usize,
+    used_width: usize,
+) -> Option<String> {
+    let annotation = annotation?.trim();
+    if annotation.is_empty() {
+        return None;
+    }
+    let available = inner_width.checked_sub(used_width + 2)?;
+    if available < "note: ".chars().count() {
+        return None;
+    }
+    let text = annotation.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(truncate_text(&format!("note: {text}"), available))
+}
+
+fn truncate_text(text: &str, max_width: usize) -> String {
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return text.chars().take(max_width).collect();
+    }
+    let mut value = text.chars().take(max_width - 3).collect::<String>();
+    value.push_str("...");
+    value
 }
 
 fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'static>> {
@@ -1636,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_header_does_not_render_annotation_text() {
+    fn detail_header_renders_labeled_annotation_text() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -1687,8 +1725,8 @@ mod tests {
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("Thread"));
         assert!(text.contains("idle"));
+        assert!(text.contains("note: unexpected message-like annotation"));
         assert!(text.contains("transcript content"));
-        assert!(!text.contains("unexpected message-like annotation"));
     }
 
     #[test]

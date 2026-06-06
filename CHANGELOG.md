@@ -17,6 +17,7 @@
 - Make TUI compose default to steering active threads, with `Tab` switching
   between steer and normal send when the thread is active.
 - Automatically attach the TUI stream when opening an active thread in detail.
+- Show a labeled local annotation note in the TUI detail header when present.
 
 ### Fixed
 
