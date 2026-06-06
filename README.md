@@ -597,6 +597,15 @@ cargo build --release
 The integration smoke tests in `tests/mock_smoke.rs` start mock UDS and TCP
 WebSocket app-servers and exercise the compiled CLI binary end to end.
 
+The opt-in PTY smoke tests in `tests/tui_pty_smoke.rs` drive the real
+interactive TUI through a pseudo-terminal, including browser/detail navigation,
+streaming sends, attach/detach, and CLI history/status validation against a
+stateful mock app-server:
+
+```bash
+cargo test --test tui_pty_smoke -- --ignored
+```
+
 Live smoke checks are opt-in:
 
 ```bash

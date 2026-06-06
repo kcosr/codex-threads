@@ -7,6 +7,8 @@
 - Add `codex-threads tui`, an interactive terminal UI for browsing, viewing,
   searching, and controlling threads.
 - Add TUI `l` shortcut to explicitly load the selected or open thread.
+- Add opt-in PTY smoke tests for TUI navigation, streaming, attach/detach, and
+  CLI history/status validation.
 
 ### Fixed
 
