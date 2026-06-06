@@ -66,6 +66,16 @@ pub(crate) enum AppEvent {
         archived: bool,
         error: String,
     },
+    RenameChanged {
+        thread_id: String,
+        name: String,
+        thread: Value,
+    },
+    RenameChangeFailed {
+        thread_id: String,
+        name: String,
+        error: String,
+    },
     ShutdownSignal,
 }
 

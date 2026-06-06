@@ -33,6 +33,11 @@ pub enum Mode {
         draft: String,
         return_to_detail: bool,
     },
+    RenameInput {
+        thread_id: String,
+        draft: String,
+        return_to_detail: bool,
+    },
     Compose(ComposeState),
     Help,
 }
@@ -528,6 +533,10 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
         Mode::Detail
         | Mode::MessageSearchInput { .. }
         | Mode::AnnotationInput {
+            return_to_detail: true,
+            ..
+        }
+        | Mode::RenameInput {
             return_to_detail: true,
             ..
         }

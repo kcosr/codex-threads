@@ -6,9 +6,10 @@
 
 - Add `codex-threads tui`, an interactive thread browser with list/search
   filters, sort/column menus, preview pane, detail viewing, loaded-message
-  search, local annotation editing, archive/unarchive, refresh, send-and-stream,
-  no-wait send, active-turn attach/steer/interrupt, persisted TUI preferences,
-  mouse support, Vim-style navigation, and OSC 52 thread id copy.
+  search, local annotation editing, rename, archive/unarchive, refresh,
+  send-and-stream, no-wait send, active-turn attach/steer/interrupt, persisted
+  TUI preferences, mouse support, Vim-style navigation, and OSC 52 thread id
+  copy.
 
 ### Fixed
 

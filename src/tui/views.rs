@@ -28,8 +28,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             | Mode::Compose(_)
             | Mode::ActiveTurnPrompt { .. }
             | Mode::ConfirmInterrupt { .. }
-    ) || (matches!(state.mode, Mode::AnnotationInput { .. })
-        && state.detail.is_some());
+    ) || (matches!(
+        state.mode,
+        Mode::AnnotationInput { .. } | Mode::RenameInput { .. }
+    ) && state.detail.is_some());
     if detail_background {
         draw_detail(frame, chunks[0], state);
     } else {
@@ -65,6 +67,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 draft,
                 "Enter save, Ctrl-D clear, Esc cancel",
             );
+        }
+        Mode::RenameInput { draft, .. } => {
+            draw_prompt(frame, area, "Rename", draft, "Enter save, Esc cancel");
         }
         Mode::FilterMenu => draw_filter_menu(frame, area, state),
         Mode::SortMenu => draw_sort_menu(frame, area, state),
@@ -496,7 +501,10 @@ fn draws_detail_background(state: &TuiState) -> bool {
             | Mode::Compose(_)
             | Mode::ActiveTurnPrompt { .. }
             | Mode::ConfirmInterrupt { .. }
-    ) || (matches!(state.mode, Mode::AnnotationInput { .. }) && state.detail.is_some())
+    ) || (matches!(
+        state.mode,
+        Mode::AnnotationInput { .. } | Mode::RenameInput { .. }
+    ) && state.detail.is_some())
 }
 
 fn browser_status_bar(state: &TuiState) -> String {
@@ -770,11 +778,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let items = [
         "Browser",
         "  j/k, arrows, or wheel move; Enter opens; p toggles preview; / searches.",
-        "  a edits annotation; A toggles archive/unarchive; f filters; s sort; c columns.",
+        "  a edits annotation; e renames; A toggles archive/unarchive.",
+        "  f filters; s sort; c columns.",
         "  In Filters, a toggles the archived-thread filter; t toggles auto-refresh.",
         "Detail",
         "  Esc returns to the browser; / searches loaded transcript lines; gg/G jump.",
-        "  a edits annotation; A toggles archive/unarchive; m opens compose.",
+        "  a edits annotation; e renames; A toggles archive/unarchive; m opens compose.",
         "  T attaches; S steers; i opens interrupt confirmation.",
         "Streams",
         "  T attaches to an active turn. Esc or q detaches locally; remote turns keep running unless interrupted.",
@@ -990,6 +999,43 @@ mod tests {
                 .content()
                 .iter()
                 .any(|cell| { cell.symbol() == "C" && cell.style().fg == Some(Color::Gray) })
+        );
+    }
+
+    #[test]
+    fn rename_panel_keeps_footer_on_bottom_border() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::RenameInput {
+            thread_id: "thread-1".to_string(),
+            draft: "New thread name".to_string(),
+            return_to_detail: false,
+        };
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("New thread name"));
+        assert!(text.contains("Enter save, Esc cancel"));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol() == "E" && cell.style().fg == Some(Color::Gray) })
         );
     }
 

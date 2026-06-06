@@ -167,6 +167,29 @@ pub async fn set_thread_archived(
     }))
 }
 
+#[cfg(feature = "tui")]
+pub async fn set_thread_name(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+    name: String,
+) -> Result<Value> {
+    let result = client
+        .request(
+            "thread/name/set",
+            json!({"threadId": thread_id, "name": name}),
+            |_| {},
+        )
+        .await?;
+    Ok(json!({
+        "server": target.server,
+        "threadId": thread_id,
+        "name": name,
+        "status": "accepted",
+        "thread": result.get("thread").cloned().unwrap_or(Value::Null)
+    }))
+}
+
 pub async fn read_thread_detail(
     target: &Target,
     client: &mut RpcClient,

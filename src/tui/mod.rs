@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::annotations::{clear_annotation, set_annotation};
@@ -36,7 +36,7 @@ use crate::errors::usage_error;
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStatusRequest, list_threads,
-    read_thread_detail, search_threads, set_thread_archived, thread_status,
+    read_thread_detail, search_threads, set_thread_archived, set_thread_name, thread_status,
 };
 use crate::tui::events::{AppEvent, BrowserQuery, DetailPageDirection, FetchRequest};
 use crate::tui::input::{InputAction, ModeKind};
@@ -119,6 +119,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
             Some(event) = app_rx.recv() => {
                 let refresh_detail_after_stream = stream_finish_detail_thread(&event, &state);
                 let refresh_after_archive = archive_changed_thread(&event);
+                let refresh_after_rename = rename_changed_thread(&event);
                 handle_app_event(event, &mut state);
                 if let Some(thread_id) = refresh_detail_after_stream
                     && !state.should_quit
@@ -130,6 +131,9 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                     schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
                 }
                 if refresh_after_archive.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if refresh_after_rename.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
             }
@@ -608,6 +612,21 @@ async fn handle_terminal_event(
         } => {
             return handle_annotation_input(key, target, state, thread_id, draft, return_to_detail);
         }
+        Mode::RenameInput {
+            thread_id,
+            draft,
+            return_to_detail,
+        } => {
+            return handle_rename_input(
+                key,
+                target,
+                state,
+                thread_id,
+                draft,
+                return_to_detail,
+                app_tx,
+            );
+        }
         Mode::Compose(compose) => {
             return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx).await;
         }
@@ -861,6 +880,17 @@ async fn handle_terminal_event(
                 spawn_archive_task(target.clone(), thread_id, archived, app_tx.clone());
             }
         }
+        KeyCode::Char('e') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                let draft = active_thread_title(state).unwrap_or_default();
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::RenameInput {
+                    thread_id,
+                    draft,
+                    return_to_detail,
+                };
+            }
+        }
         KeyCode::Char('y') => {
             copy_active_thread_id(state)?;
         }
@@ -1055,8 +1085,16 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         Mode::AnnotationInput {
             return_to_detail: true,
             ..
+        }
+        | Mode::RenameInput {
+            return_to_detail: true,
+            ..
         } => scroll_detail(state, delta),
         Mode::AnnotationInput {
+            return_to_detail: false,
+            ..
+        }
+        | Mode::RenameInput {
             return_to_detail: false,
             ..
         } => state.move_selection(delta),
@@ -1172,6 +1210,67 @@ fn handle_annotation_input(
         }
         _ => {
             state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn handle_rename_input(
+    key: KeyEvent,
+    target: &Target,
+    state: &mut TuiState,
+    thread_id: String,
+    mut draft: String,
+    return_to_detail: bool,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<()> {
+    let return_mode = if return_to_detail {
+        Mode::Detail
+    } else {
+        Mode::Browser
+    };
+    match key.code {
+        KeyCode::Esc => state.mode = return_mode,
+        KeyCode::Enter => {
+            let name = draft.trim().to_string();
+            if name.is_empty() {
+                state.set_notice("name cannot be empty");
+                state.mode = Mode::RenameInput {
+                    thread_id,
+                    draft,
+                    return_to_detail,
+                };
+            } else {
+                state.set_notice(format!("renaming {thread_id}..."));
+                spawn_rename_task(target.clone(), thread_id, name, app_tx.clone());
+                state.mode = return_mode;
+            }
+        }
+        KeyCode::Backspace => {
+            draft.pop();
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            draft.push(ch);
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        _ => {
+            state.mode = Mode::RenameInput {
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1433,6 +1532,37 @@ fn spawn_archive_task(
     });
 }
 
+fn spawn_rename_task(
+    target: Target,
+    thread_id: String,
+    name: String,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<Value> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            set_thread_name(&target, &mut client, thread_id.clone(), name.clone()).await
+        }
+        .await;
+        match result {
+            Ok(output) => app_tx
+                .send(AppEvent::RenameChanged {
+                    thread_id,
+                    name,
+                    thread: output["thread"].clone(),
+                })
+                .ok(),
+            Err(err) => app_tx
+                .send(AppEvent::RenameChangeFailed {
+                    thread_id,
+                    name,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
 fn spawn_send_task(
     target: Target,
     thread_id: String,
@@ -1637,6 +1767,21 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 if archived { "archive" } else { "unarchive" }
             ));
         }
+        AppEvent::RenameChanged {
+            thread_id,
+            name,
+            thread,
+        } => {
+            set_thread_name_in_state(state, &thread_id, &name, &thread);
+            state.set_notice(format!("renamed {thread_id}"));
+        }
+        AppEvent::RenameChangeFailed {
+            thread_id,
+            name,
+            error,
+        } => {
+            state.set_notice(format!("failed to rename {thread_id} to {name}: {error}"));
+        }
         AppEvent::ShutdownSignal => {
             detach_stream(state);
             state.should_quit = true;
@@ -1647,6 +1792,13 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
 fn archive_changed_thread(event: &AppEvent) -> Option<String> {
     match event {
         AppEvent::ArchiveChanged { thread_id, .. } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn rename_changed_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::RenameChanged { thread_id, .. } => Some(thread_id.clone()),
         _ => None,
     }
 }
@@ -1876,6 +2028,37 @@ fn active_annotation(state: &TuiState) -> Option<String> {
             .as_ref()
             .and_then(|detail| detail.annotation.clone()),
         _ => state.selected_thread_annotation().map(str::to_string),
+    }
+}
+
+fn active_thread_title(state: &TuiState) -> Option<String> {
+    match state.mode {
+        Mode::Detail => state.detail.as_ref().map(|detail| detail.title.clone()),
+        _ => state
+            .browser
+            .rows
+            .get(state.browser.selected)
+            .map(|row| row.title.clone()),
+    }
+}
+
+fn set_thread_name_in_state(state: &mut TuiState, thread_id: &str, name: &str, thread: &Value) {
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.title = name.to_string();
+            if !thread.is_null() {
+                if let Some(raw_thread) = row.raw.get_mut("thread") {
+                    raw_thread["name"] = json!(name);
+                } else {
+                    row.raw["name"] = json!(name);
+                }
+            }
+        }
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.title = name.to_string();
     }
 }
 
@@ -3546,6 +3729,81 @@ mod tests {
             panic!("expected annotation input");
         };
         assert_eq!(draft, "note");
+    }
+
+    #[test]
+    fn rename_state_updates_browser_and_detail_title() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Old", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        set_thread_name_in_state(
+            &mut state,
+            "t1",
+            "New name",
+            &serde_json::json!({"id": "t1", "name": "New name"}),
+        );
+
+        assert_eq!(state.browser.rows[0].title, "New name");
+        assert_eq!(state.browser.rows[0].raw["name"], "New name");
+        assert_eq!(state.detail.as_ref().unwrap().title, "New name");
+        assert_eq!(active_thread_title(&state).as_deref(), Some("New name"));
+    }
+
+    #[test]
+    fn rename_input_rejects_empty_names() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_rename_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &target,
+            &mut state,
+            "t1".to_string(),
+            "   ".to_string(),
+            false,
+            &app_tx,
+        )
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::RenameInput { .. }));
+        assert!(state.notice.as_ref().unwrap().message.contains("empty"));
+        assert!(app_rx.try_recv().is_err());
     }
 
     #[test]
