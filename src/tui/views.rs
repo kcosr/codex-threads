@@ -47,7 +47,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 area,
                 "Search threads",
                 draft,
-                "Enter search, Esc cancel",
+                "Enter search, Ctrl-D clear, Esc cancel",
             );
         }
         Mode::MessageSearchInput { draft } => {
@@ -56,7 +56,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 area,
                 "Search messages",
                 draft,
-                "Enter search, Esc cancel",
+                "Enter search, Ctrl-D clear, Esc cancel",
             );
         }
         Mode::AnnotationInput { draft, .. } => {
@@ -68,9 +68,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 "Enter save, Ctrl-D clear, Esc cancel",
             );
         }
-        Mode::RenameInput { draft, .. } => {
-            draw_prompt(frame, area, "Rename", draft, "Enter save, Esc cancel");
-        }
+        Mode::RenameInput { draft, .. } => draw_prompt(
+            frame,
+            area,
+            "Rename",
+            draft,
+            "Enter save, Ctrl-D clear draft, Esc cancel",
+        ),
         Mode::FilterMenu => draw_filter_menu(frame, area, state),
         Mode::SortMenu => draw_sort_menu(frame, area, state),
         Mode::ColumnsMenu => draw_columns_menu(frame, area, state),
@@ -793,7 +797,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "",
         "Compose and Text Inputs",
         "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
-        "  Search/rename: Enter apply/save  Esc cancel",
+        "  Search: Enter apply  Ctrl-D clear  Esc cancel",
+        "  Rename: Enter save  Ctrl-D clear draft  Esc cancel",
         "  Annotation: Enter save  Ctrl-D clear  Esc cancel",
         "",
         "Menus and Prompts",
@@ -1110,7 +1115,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("New thread name"));
-        assert!(text.contains("Enter save, Esc cancel"));
+        assert!(text.contains("Enter save, Ctrl-D clear draft, Esc cancel"));
         assert!(
             buffer
                 .content()

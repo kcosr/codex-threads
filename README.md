@@ -212,16 +212,23 @@ or unarchive, `r` to refresh, `y` to copy the active thread id with OSC 52, and
 `m` to compose.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns.
-Annotation editing uses `Enter` to save and `Ctrl-D` to clear. In detail, `T`
-attaches to an active turn, `S` steers it, `i` confirms interrupt, `Enter` opens
-the message action, and `q` quits. Opening a thread starts at the bottom of the
-transcript; detail views refresh in place while open, and `Esc` returns to the
-browser after unlinking the local detail view and detaching any local stream.
-Local detach leaves remote turns running.
+Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
+uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
+and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
+operation. In detail, `T` attaches to an active turn, `S` steers it, `i`
+confirms interrupt, `Enter` opens the message action, and `q` quits. Attaching
+refreshes the transcript first so already readable active-turn items appear
+before new stream notifications; app-server may not replay deltas emitted before
+the attach. Opening a thread starts at the bottom of the transcript; detail
+views refresh in place while open, and `Esc` returns to the browser after
+unlinking the local detail view and detaching any local stream. Local detach
+leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
 spans when the default-off `tui-syntax-highlighting` Cargo feature is enabled.
+Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to append raw stream
+events while debugging live transcript rendering.
 
 ## Configuration
 

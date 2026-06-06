@@ -706,12 +706,13 @@ async fn handle_terminal_event(
                     state.mode = Mode::Detail;
                     spawn_attach_task(
                         target.clone(),
-                        thread_id,
+                        thread_id.clone(),
                         turn_id,
                         yolo,
                         control_rx,
                         app_tx.clone(),
                     );
+                    schedule_detail_refresh(state, fetch_tx, thread_id).await?;
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     state.mode = Mode::Compose(ComposeState {
@@ -920,9 +921,10 @@ async fn handle_terminal_event(
                 && let Some(detail) = &state.detail
                 && let Some(turn_id) = detail.active_turn_id.clone()
             {
+                let thread_id = detail.thread_id.clone();
                 let (control_tx, control_rx) = mpsc::unbounded_channel();
                 state.stream = Some(StreamState::new(
-                    detail.thread_id.clone(),
+                    thread_id.clone(),
                     Some(turn_id.clone()),
                     StreamStatus::Running,
                     true,
@@ -930,12 +932,13 @@ async fn handle_terminal_event(
                 state.stream_control = Some(control_tx);
                 spawn_attach_task(
                     target.clone(),
-                    detail.thread_id.clone(),
+                    thread_id.clone(),
                     turn_id,
                     yolo,
                     control_rx,
                     app_tx.clone(),
                 );
+                schedule_detail_refresh(state, fetch_tx, thread_id).await?;
             }
         }
         KeyCode::Char('i') => {
@@ -1145,6 +1148,17 @@ where
                 };
             }
         }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if on_submit(String::new(), state)? == InputAction::RefreshBrowser {
+                state.mode = Mode::Browser;
+                schedule_browser_refresh(state, fetch_tx).await?;
+            } else {
+                state.mode = match mode_kind {
+                    ModeKind::MessageSearch => Mode::Detail,
+                    _ => Mode::Browser,
+                };
+            }
+        }
         KeyCode::Backspace => {
             draft.pop();
             state.mode = mode_from_kind(mode_kind, draft);
@@ -1252,6 +1266,14 @@ fn handle_rename_input(
         }
         KeyCode::Backspace => {
             draft.pop();
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.clear();
             state.mode = Mode::RenameInput {
                 thread_id,
                 draft,
@@ -1657,6 +1679,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         },
         AppEvent::DetailLoadFailed { epoch, error } => state.set_detail_error(epoch, error),
         AppEvent::StreamEvent(event) => {
+            log_stream_event(&event);
             if state.stream.is_none()
                 && let Some(thread_id) = event["threadId"].as_str()
             {
@@ -1686,11 +1709,16 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                         item_id.clone(),
                         delta,
                     );
-                    assistant_updates.push((event_turn_id.clone(), item_id, text));
+                    assistant_updates.push((event_turn_id.clone(), item_id, text, false));
                 } else if let Some(text) = event["text"].as_str() {
                     let item_id = event["itemId"].as_str().map(str::to_string);
                     set_stream_assistant_text(stream, event_turn_id.clone(), item_id.clone(), text);
-                    assistant_updates.push((event_turn_id.clone(), item_id, text.to_string()));
+                    assistant_updates.push((
+                        event_turn_id.clone(),
+                        item_id,
+                        text.to_string(),
+                        true,
+                    ));
                 } else if let Some(responses) = event["assistantResponses"].as_array() {
                     for response in responses {
                         let Some(text) = response["text"].as_str() else {
@@ -1703,14 +1731,19 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                             item_id.clone(),
                             text,
                         );
-                        assistant_updates.push((event_turn_id.clone(), item_id, text.to_string()));
+                        assistant_updates.push((
+                            event_turn_id.clone(),
+                            item_id,
+                            text.to_string(),
+                            true,
+                        ));
                     }
                 } else if let Some(text) = event["finalAssistantText"].as_str()
                     && !text.is_empty()
                     && stream.assistant_items.is_empty()
                 {
                     set_stream_assistant_text(stream, event_turn_id.clone(), None, text);
-                    assistant_updates.push((event_turn_id.clone(), None, text.to_string()));
+                    assistant_updates.push((event_turn_id.clone(), None, text.to_string(), true));
                 }
                 stream.status = match event["status"].as_str() {
                     Some("completed") => StreamStatus::Completed,
@@ -1726,8 +1759,8 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             if let Some(turn_id) = pending_turn_id {
                 fill_pending_turn_ids(state, &turn_id);
             }
-            for (turn_id, item_id, text) in assistant_updates {
-                upsert_streaming_assistant_message(state, turn_id, item_id, &text);
+            for (turn_id, item_id, text, finalized) in assistant_updates {
+                upsert_streaming_assistant_message(state, turn_id, item_id, &text, finalized);
             }
         }
         AppEvent::StreamFailed(error) => {
@@ -1800,6 +1833,27 @@ fn rename_changed_thread(event: &AppEvent) -> Option<String> {
     match event {
         AppEvent::RenameChanged { thread_id, .. } => Some(thread_id.clone()),
         _ => None,
+    }
+}
+
+fn log_stream_event(event: &Value) {
+    let Ok(path) = std::env::var("CODEX_THREADS_TUI_STREAM_LOG") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let line = json!({"timestamp": timestamp, "event": event});
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -1996,6 +2050,7 @@ fn upsert_streaming_assistant_message(
     turn_id: Option<String>,
     item_id: Option<String>,
     text: &str,
+    finalized: bool,
 ) {
     let Some(stream) = &state.stream else {
         return;
@@ -2029,12 +2084,19 @@ fn upsert_streaming_assistant_message(
         if message.item_id.is_none() {
             message.item_id = item_id.clone();
         }
+        if finalized {
+            message.timestamp = Some(format_current_epoch());
+        }
     } else {
         detail.messages.push(message_block(
             turn_id,
             item_id,
             "assistant",
-            Some("streaming".to_string()),
+            Some(if finalized {
+                format_current_epoch()
+            } else {
+                "streaming".to_string()
+            }),
             text,
             100,
         ));
@@ -2635,6 +2697,14 @@ fn format_epoch(value: i64) -> String {
         .unwrap_or_default()
 }
 
+fn format_current_epoch() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_epoch(now)
+}
+
 fn format_browser_updated_epoch(value: i64, relative: bool) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3142,6 +3212,7 @@ mod tests {
         assert_eq!(detail.messages[0].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(detail.messages[1].role, "assistant");
         assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[1].timestamp.as_deref(), Some("streaming"));
         assert_eq!(detail.messages[1].lines[0].text, "first prune chunk");
         assert_eq!(detail.matches, vec![1]);
     }
@@ -3262,6 +3333,8 @@ mod tests {
         let detail = state.detail.as_ref().expect("detail");
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_ne!(detail.messages[0].timestamp.as_deref(), Some("streaming"));
+        assert!(detail.messages[0].timestamp.is_some());
         assert_eq!(
             detail.messages[0].lines[0].text,
             "Verification passed. I'm installing the rebuilt binary."
@@ -3317,6 +3390,8 @@ mod tests {
         let detail = state.detail.as_ref().expect("detail");
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_ne!(detail.messages[0].timestamp.as_deref(), Some("streaming"));
+        assert!(detail.messages[0].timestamp.is_some());
         assert_eq!(detail.messages[0].lines[0].text, "Done.");
     }
 
@@ -3804,6 +3879,61 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn attach_active_turn_schedules_detail_refresh() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            fetch_rx.try_recv().unwrap(),
+            FetchRequest::Detail {
+                thread_id,
+                page_direction: DetailPageDirection::Replace,
+                ..
+            } if thread_id == "t1"
+        ));
+    }
+
     #[test]
     fn shutdown_signal_detaches_stream_and_quits() {
         let mut state = TuiState::new(TuiInit {
@@ -3985,6 +4115,132 @@ mod tests {
         assert!(matches!(state.mode, Mode::RenameInput { .. }));
         assert!(state.notice.as_ref().unwrap().message.contains("empty"));
         assert!(app_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rename_input_ctrl_d_clears_draft_only() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_rename_input(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &target,
+            &mut state,
+            "t1".to_string(),
+            "Custom name".to_string(),
+            false,
+            &app_tx,
+        )
+        .unwrap();
+
+        let Mode::RenameInput { draft, .. } = &state.mode else {
+            panic!("expected rename input");
+        };
+        assert!(draft.is_empty());
+        assert!(app_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_clears_thread_search_and_refreshes_browser() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut state = TuiState::new(TuiInit {
+            query: Some("needle".to_string()),
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_text_input(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            "needle".to_string(),
+            ModeKind::Search,
+            |value, state| {
+                state.update_query(value);
+                Ok(InputAction::RefreshBrowser)
+            },
+            &mut state,
+            &fetch_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.browser.query.is_empty());
+        assert!(matches!(
+            fetch_rx.try_recv().unwrap(),
+            FetchRequest::Browser { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_clears_message_search_without_browser_refresh() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "needle"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.update_message_search("needle".to_string());
+
+        handle_text_input(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            "needle".to_string(),
+            ModeKind::MessageSearch,
+            |value, state| {
+                state.update_message_search(value);
+                Ok(InputAction::None)
+            },
+            &mut state,
+            &fetch_tx,
+        )
+        .await
+        .unwrap();
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert!(matches!(state.mode, Mode::Detail));
+        assert!(detail.search_query.is_empty());
+        assert!(detail.matches.is_empty());
+        assert!(fetch_rx.try_recv().is_err());
     }
 
     #[test]

@@ -97,13 +97,15 @@ Useful TUI keys:
   detail transcript; `Enter` opens a thread.
 - `gg` jumps to the top and `G` jumps to the bottom in the browser or detail.
 - `/` searches threads in the browser or loaded transcript lines in detail.
+- Search prompts use `Enter` to apply and `Ctrl-D` to clear.
 - `]` and `[` page through browser/detail cursors when available.
 - `p` toggles the browser preview pane.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
   relative updated-time display toggle. In filters, `a` toggles the archived
   thread filter.
 - `a` edits the local annotation with `Enter` save and `Ctrl-D` clear.
-- `e` renames the active thread with `Enter` save.
+- `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
+  but app-server does not expose a clear-name operation.
 - `A` archives or unarchives the active thread.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
@@ -112,8 +114,11 @@ Useful TUI keys:
 - Opening a detail view starts at the transcript bottom; while in detail,
   `Enter` opens the message action, `n/N` move between message-search matches,
   and `Esc` unlinks the local detail view and returns to the browser.
-- In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms interrupt.
+- In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms
+  interrupt. Attach refreshes readable history first, then streams new events.
 - `q` quits. Local detach leaves remote turns running unless interrupted.
+- Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to capture raw stream
+  events for transcript debugging.
 
 In TUI search mode, `--cwd` is a local refinement over the loaded search page.
 Sort controls are disabled in search mode until app-server supports server-side
