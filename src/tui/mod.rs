@@ -203,7 +203,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     } else {
         SortDirectionPref::Asc
     };
-    save_prefs(&state.prefs)?;
+    let _ = save_prefs(&state.prefs);
     terminal.clear()?;
     Ok(0)
 }
@@ -671,6 +671,7 @@ async fn schedule_detail_page(
             epoch,
             last_refresh_at: None,
             viewport_height: None,
+            viewport_width: None,
             last_error: None,
         });
     }
@@ -837,43 +838,53 @@ async fn handle_terminal_event(
             return Ok(());
         }
         Mode::ColumnsMenu => {
+            let mut changed = false;
             match key.code {
                 KeyCode::Esc => state.mode = Mode::Browser,
                 KeyCode::Char('1') => {
-                    state.prefs.browser.columns.status = !state.prefs.browser.columns.status
+                    state.prefs.browser.columns.status = !state.prefs.browser.columns.status;
+                    changed = true;
                 }
                 KeyCode::Char('2') => {
-                    state.prefs.browser.columns.updated = !state.prefs.browser.columns.updated
+                    state.prefs.browser.columns.updated = !state.prefs.browser.columns.updated;
+                    changed = true;
                 }
                 KeyCode::Char('3') => {
-                    state.prefs.browser.columns.cwd = !state.prefs.browser.columns.cwd
+                    state.prefs.browser.columns.cwd = !state.prefs.browser.columns.cwd;
+                    changed = true;
                 }
                 KeyCode::Char('4') => {
-                    state.prefs.browser.columns.annotation = !state.prefs.browser.columns.annotation
+                    state.prefs.browser.columns.annotation =
+                        !state.prefs.browser.columns.annotation;
+                    changed = true;
                 }
                 KeyCode::Char('5') => {
                     state.prefs.browser.relative_updated = !state.prefs.browser.relative_updated;
+                    changed = true;
                     schedule_browser_refresh(state, fetch_tx).await?;
                 }
                 KeyCode::Char('t') => {
                     state.browser.auto_refresh = !state.browser.auto_refresh;
                     state.prefs.refresh.auto = state.browser.auto_refresh;
+                    changed = true;
                     if state.browser.auto_refresh {
                         schedule_browser_refresh(state, fetch_tx).await?;
                     }
                 }
                 KeyCode::Char('-') | KeyCode::Char('_') => {
-                    adjust_auto_refresh_interval(state, -(AUTO_REFRESH_STEP_SECS as i64));
+                    changed = adjust_auto_refresh_interval(state, -(AUTO_REFRESH_STEP_SECS as i64));
                 }
                 KeyCode::Char('+') | KeyCode::Char('=') => {
-                    adjust_auto_refresh_interval(state, AUTO_REFRESH_STEP_SECS as i64);
+                    changed = adjust_auto_refresh_interval(state, AUTO_REFRESH_STEP_SECS as i64);
                 }
                 _ => {}
             }
             if !matches!(key.code, KeyCode::Esc) {
                 state.mode = Mode::ColumnsMenu;
             }
-            let _ = save_prefs(&state.prefs);
+            if changed {
+                let _ = save_prefs(&state.prefs);
+            }
             return Ok(());
         }
         Mode::ActiveTurnPrompt { thread_id, turn_id } => {
@@ -1145,6 +1156,7 @@ async fn handle_terminal_event(
                 && let Some(turn_id) = detail.active_turn_id.clone()
             {
                 let thread_id = detail.thread_id.clone();
+                detach_stream(state);
                 let (control_tx, control_rx) = mpsc::unbounded_channel();
                 let stream_id = state.allocate_stream_id();
                 state.stream = Some(StreamState::new_with_id(
@@ -2564,7 +2576,6 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 if event["source"].as_str() == Some("poll") {
                     stream.last_poll_at = Some(std::time::Instant::now());
                 }
-                stream.events.push(event.clone());
             }
             if let Some(turn_id) = pending_turn_id {
                 fill_pending_turn_ids(state, &turn_id);
@@ -3357,13 +3368,17 @@ fn active_thread_title(state: &TuiState) -> Option<String> {
     }
 }
 
-fn adjust_auto_refresh_interval(state: &mut TuiState, delta_seconds: i64) {
+fn adjust_auto_refresh_interval(state: &mut TuiState, delta_seconds: i64) -> bool {
     let current = state.browser.auto_refresh_seconds as i64;
     let next = current
         .saturating_add(delta_seconds)
         .clamp(AUTO_REFRESH_MIN_SECS as i64, AUTO_REFRESH_MAX_SECS as i64) as u64;
+    if state.browser.auto_refresh_seconds == next {
+        return false;
+    }
     state.browser.auto_refresh_seconds = next;
     state.prefs.refresh.interval_seconds = next;
+    true
 }
 
 fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
@@ -3674,6 +3689,7 @@ fn detail_state(
         epoch,
         last_refresh_at: Some(std::time::Instant::now()),
         viewport_height: None,
+        viewport_width: None,
         last_error: None,
     }
 }
@@ -4930,7 +4946,7 @@ mod tests {
             None,
         ));
         let detail = state.detail.as_mut().expect("detail");
-        detail.set_viewport_height(4);
+        detail.set_viewport_size(4, 100);
         detail.scroll = detail.bottom_scroll_position();
         let before = detail.scroll;
 
@@ -5226,6 +5242,7 @@ mod tests {
             epoch: 1,
             last_refresh_at: None,
             viewport_height: None,
+            viewport_width: None,
             last_error: None,
         });
         let loaded = detail_state(
@@ -5242,7 +5259,7 @@ mod tests {
             1,
             None,
         );
-        state.detail.as_mut().unwrap().set_viewport_height(4);
+        state.detail.as_mut().unwrap().set_viewport_size(4, 100);
 
         state.replace_detail(1, loaded);
 
@@ -5281,7 +5298,7 @@ mod tests {
             None,
         ));
         let detail = state.detail.as_mut().expect("detail");
-        detail.set_viewport_height(4);
+        detail.set_viewport_size(4, 100);
         detail.scroll = detail.bottom_scroll_position();
         let before = detail.scroll;
         let refreshed = detail_state(

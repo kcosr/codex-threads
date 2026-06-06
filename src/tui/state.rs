@@ -117,6 +117,7 @@ pub struct DetailState {
     pub epoch: u64,
     pub last_refresh_at: Option<Instant>,
     pub viewport_height: Option<u16>,
+    pub viewport_width: Option<u16>,
     pub last_error: Option<String>,
 }
 
@@ -186,7 +187,6 @@ pub struct StreamState {
     pub turn_id: Option<String>,
     pub status: StreamStatus,
     pub assistant_items: Vec<StreamAssistantItem>,
-    pub events: Vec<Value>,
     pub attached: bool,
     pub detached: bool,
     pub last_error: Option<String>,
@@ -224,7 +224,6 @@ impl StreamState {
             turn_id,
             status,
             assistant_items: Vec::new(),
-            events: Vec::new(),
             attached,
             detached: false,
             last_error: None,
@@ -459,6 +458,7 @@ impl TuiState {
                 current.scroll == u16::MAX || current.scroll >= current.max_scroll();
             detail.search_query = current.search_query.clone();
             detail.viewport_height = current.viewport_height;
+            detail.viewport_width = current.viewport_width;
             detail.scroll = if was_at_bottom {
                 detail.bottom_scroll_position()
             } else {
@@ -486,14 +486,18 @@ impl TuiState {
             return;
         }
         let previous_offset = detail.scroll as usize;
-        let previous_lines = page.transcript_line_count();
+        let width = detail.transcript_width();
         let mut merged = Vec::new();
         append_unique_messages(&mut merged, page.messages.drain(..));
+        let prepended_lines = merged
+            .iter()
+            .map(|message| message_rendered_line_count(message, width))
+            .sum::<usize>();
         append_unique_messages(&mut merged, detail.messages.drain(..));
         detail.messages = merged;
-        if previous_offset > 0 || previous_lines > 0 {
+        if previous_offset > 0 || prepended_lines > 0 {
             detail.scroll = previous_offset
-                .saturating_add(previous_lines)
+                .saturating_add(prepended_lines)
                 .min(u16::MAX as usize) as u16;
         }
         detail.next_cursor = page.next_cursor;
@@ -685,8 +689,9 @@ impl ThreadRow {
 }
 
 impl DetailState {
-    pub fn set_viewport_height(&mut self, height: u16) {
+    pub fn set_viewport_size(&mut self, height: u16, width: u16) {
         self.viewport_height = Some(height.max(1));
+        self.viewport_width = Some(width.max(1));
         if self.scroll == u16::MAX && self.transcript_line_count() == 0 {
             return;
         }
@@ -712,18 +717,45 @@ impl DetailState {
     }
 
     pub fn message_scroll_offset(&self, message_index: usize) -> usize {
+        let width = self.transcript_width();
         self.messages
             .iter()
             .take(message_index)
-            .map(|message| 2 + message.lines.len())
+            .map(|message| message_rendered_line_count(message, width))
             .sum()
     }
 
     pub fn transcript_line_count(&self) -> usize {
+        let width = self.transcript_width();
         self.messages
             .iter()
-            .map(|message| 2 + message.lines.len())
+            .map(|message| message_rendered_line_count(message, width))
             .sum()
+    }
+
+    fn transcript_width(&self) -> usize {
+        self.viewport_width
+            .unwrap_or(DEFAULT_TRANSCRIPT_WIDTH)
+            .max(1) as usize
+    }
+}
+
+pub const DEFAULT_TRANSCRIPT_WIDTH: u16 = 100;
+
+pub fn message_rendered_line_count(message: &MessageBlock, width: usize) -> usize {
+    1 + message
+        .lines
+        .iter()
+        .map(|line| rendered_line_count(&line.text, width))
+        .sum::<usize>()
+        + 1
+}
+
+pub fn rendered_line_count(text: &str, width: usize) -> usize {
+    if text.is_empty() {
+        1
+    } else {
+        textwrap::wrap(text, width.max(1)).len().max(1)
     }
 }
 

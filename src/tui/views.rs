@@ -7,7 +7,10 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use crate::tui::keymap::{
     BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
 };
-use crate::tui::state::{BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState};
+use crate::tui::state::{
+    BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState,
+    message_rendered_line_count,
+};
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
 const BROWSER_COLUMN_SPACING: u16 = 2;
@@ -123,7 +126,10 @@ pub fn sync_viewport_state(state: &mut TuiState, area: Rect) {
     let chunks = root_chunks(area);
     let detail_chunks = detail_chunks(chunks[0]);
     if let Some(detail) = &mut state.detail {
-        detail.set_viewport_height(detail_chunks[1].height.saturating_sub(2));
+        detail.set_viewport_size(
+            detail_chunks[1].height.saturating_sub(2),
+            detail_chunks[1].width.saturating_sub(2),
+        );
     }
 }
 
@@ -323,7 +329,15 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else if !preview.messages.is_empty() {
         let lines = transcript_lines(&preview.messages);
         let viewport = area.height.saturating_sub(2) as usize;
-        let scroll = lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16;
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let rendered_lines = preview
+            .messages
+            .iter()
+            .map(|message| message_rendered_line_count(message, width))
+            .sum::<usize>();
+        let scroll = rendered_lines
+            .saturating_sub(viewport)
+            .min(u16::MAX as usize) as u16;
         (lines, scroll)
     } else if let Some(snippet) = &row.snippet {
         (vec![Line::from(snippet.clone())], 0)
@@ -1136,6 +1150,7 @@ mod tests {
             epoch: 1,
             last_refresh_at: None,
             viewport_height: None,
+            viewport_width: None,
             last_error: None,
         });
         state.stream = Some(StreamState::new_with_id(
@@ -1160,6 +1175,81 @@ mod tests {
         assert!(text.contains("Esc detach/browser"));
         assert!(text.contains("r poll"));
         assert!(!text.contains("T/S/i"));
+    }
+
+    #[test]
+    fn narrow_detail_follow_bottom_reaches_post_wrap_bottom() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(DetailState {
+            thread_id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            annotation: None,
+            messages: vec![MessageBlock {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("item-1".to_string()),
+                role: "assistant".to_string(),
+                timestamp: None,
+                lines: (0..10)
+                    .map(|index| MessageLine {
+                        kind: MessageLineKind::Text,
+                        text: if index == 9 {
+                            "final wrapped assistant content includes TAIL_MARKER".to_string()
+                        } else {
+                            "wide assistant content that wraps again on a narrow terminal"
+                                .to_string()
+                        },
+                        spans: Vec::new(),
+                    })
+                    .collect(),
+                is_match: false,
+            }],
+            scroll: u16::MAX,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: None,
+            active_turn_id: None,
+            loading: false,
+            epoch: 1,
+            last_refresh_at: None,
+            viewport_height: None,
+            viewport_width: None,
+            last_error: None,
+        });
+
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                sync_viewport_state(&mut state, frame.area());
+                if let Some(detail) = &mut state.detail {
+                    detail.scroll = detail.bottom_scroll_position();
+                }
+                draw(frame, &state);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("TAIL_MARKER"));
     }
 
     #[test]
@@ -1445,6 +1535,7 @@ mod tests {
             epoch: 1,
             last_refresh_at: None,
             viewport_height: None,
+            viewport_width: None,
             last_error: None,
         });
         let backend = TestBackend::new(100, 18);
@@ -1506,6 +1597,7 @@ mod tests {
             epoch: 1,
             last_refresh_at: None,
             viewport_height: None,
+            viewport_width: None,
             last_error: None,
         });
         let backend = TestBackend::new(100, 18);
@@ -1548,6 +1640,7 @@ mod tests {
             epoch: 1,
             last_refresh_at: None,
             viewport_height: None,
+            viewport_width: None,
             last_error: None,
         });
         state.stream = Some(StreamState::new(

@@ -15,6 +15,9 @@
 - Keep TUI streaming transcript updates from splitting anonymous deltas into
   separate fragments after an attached snapshot.
 - Show a connected/detach-oriented detail footer while attached to a stream.
+- Fix TUI transcript and preview bottom scrolling on narrow terminals by
+  counting post-wrap rendered rows.
+- Remove unused unbounded storage of raw stream events in the TUI.
 
 ## [0.1.5] - 2026-06-05
 

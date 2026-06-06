@@ -470,12 +470,8 @@ fn sort_key(sort: SortKey) -> &'static str {
 }
 
 fn direction(asc: bool, desc: bool) -> &'static str {
-    if asc {
-        "asc"
-    } else {
-        let _desc_requested = desc;
-        "desc"
-    }
+    let descending = desc || !asc;
+    if descending { "desc" } else { "asc" }
 }
 
 fn items_view(view: ItemsView) -> &'static str {

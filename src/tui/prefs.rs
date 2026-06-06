@@ -21,7 +21,6 @@ pub struct TuiPrefs {
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
     pub browser: BrowserPrefs,
-    pub detail: DetailPrefs,
     pub refresh: RefreshPrefs,
 }
 
@@ -40,13 +39,6 @@ pub struct BrowserPrefs {
     pub preview_pane: bool,
     #[serde(rename = "relativeUpdated")]
     pub relative_updated: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DetailPrefs {
-    #[serde(rename = "messageMode")]
-    pub message_mode: MessageMode,
-    pub wrap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,19 +63,12 @@ pub enum SortDirectionPref {
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum MessageMode {
-    Summary,
-}
-
 impl Default for TuiPrefs {
     fn default() -> Self {
         Self {
             version: PREFS_VERSION,
             updated_at: now_epoch_seconds(),
             browser: BrowserPrefs::default(),
-            detail: DetailPrefs::default(),
             refresh: RefreshPrefs::default(),
         }
     }
@@ -97,15 +82,6 @@ impl Default for BrowserPrefs {
             direction: SortDirectionPref::Desc,
             preview_pane: true,
             relative_updated: true,
-        }
-    }
-}
-
-impl Default for DetailPrefs {
-    fn default() -> Self {
-        Self {
-            message_mode: MessageMode::Summary,
-            wrap: true,
         }
     }
 }
@@ -321,8 +297,7 @@ mod tests {
         assert_eq!(value["browser"]["direction"], "desc");
         assert_eq!(value["browser"]["previewPane"], true);
         assert_eq!(value["browser"]["relativeUpdated"], true);
-        assert_eq!(value["detail"]["messageMode"], "summary");
-        assert_eq!(value["detail"]["wrap"], true);
+        assert!(value.get("detail").is_none());
         assert_eq!(value["refresh"]["auto"], false);
         assert_eq!(value["refresh"]["intervalSeconds"], 30);
         assert!(value.get("visibleColumns").is_none());
