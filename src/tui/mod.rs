@@ -1565,14 +1565,20 @@ fn submit_compose(
     }
     match compose.target {
         ComposeTarget::NewTurn { thread_id } => {
-            let probe_active_turn =
-                should_probe_active_turn_for_compose(state, compose.return_to_detail, &thread_id);
+            let active_turn_hint = active_turn_hint_for_compose(state, &thread_id);
+            let probe_active_turn = should_probe_active_turn_for_compose(
+                state,
+                compose.return_to_detail,
+                &thread_id,
+                active_turn_hint.as_deref(),
+            );
+            let sent_at = format_current_epoch();
             append_detail_message(
                 state,
                 thread_id.as_str(),
                 None,
                 "user",
-                Some("draft sent".to_string()),
+                Some(sent_at.clone()),
                 &prompt,
             );
             append_preview_message(
@@ -1580,9 +1586,10 @@ fn submit_compose(
                 thread_id.as_str(),
                 None,
                 "user",
-                Some("draft sent".to_string()),
+                Some(sent_at),
                 &prompt,
             );
+            touch_browser_thread_updated(state, &thread_id);
             state.mode = return_mode;
             match compose.send_mode {
                 SendMode::Stream => {
@@ -1616,6 +1623,7 @@ fn submit_compose(
                                 prompt,
                                 yolo,
                                 stream_id,
+                                active_turn_hint,
                                 probe_active_turn,
                             },
                             app_tx.clone(),
@@ -1628,6 +1636,7 @@ fn submit_compose(
                         thread_id,
                         prompt,
                         yolo,
+                        active_turn_hint,
                         probe_active_turn,
                         app_tx.clone(),
                     );
@@ -1652,7 +1661,11 @@ fn should_probe_active_turn_for_compose(
     state: &TuiState,
     return_to_detail: bool,
     thread_id: &str,
+    active_turn_hint: Option<&str>,
 ) -> bool {
+    if active_turn_hint.is_some() {
+        return true;
+    }
     if return_to_detail {
         return state.detail.as_ref().is_some_and(|detail| {
             detail.thread_id == thread_id && detail.active_turn_id.is_some()
@@ -1663,6 +1676,21 @@ fn should_probe_active_turn_for_compose(
         .rows
         .get(state.browser.selected)
         .is_some_and(|row| row.id == thread_id && row.is_running())
+}
+
+fn active_turn_hint_for_compose(state: &TuiState, thread_id: &str) -> Option<String> {
+    state.stream.as_ref().and_then(|stream| {
+        if stream.thread_id == thread_id
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+        {
+            stream.turn_id.clone()
+        } else {
+            None
+        }
+    })
 }
 
 fn spawn_attach_task(
@@ -1951,16 +1979,21 @@ fn spawn_no_wait_send_task(
     thread_id: String,
     prompt: String,
     yolo: bool,
+    active_turn_hint: Option<String>,
     probe_active_turn: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            if probe_active_turn
-                && let Some(turn_id) =
-                    active_turn_id_for_thread(&target, &mut client, &thread_id).await?
-            {
+            let active_turn_id = if active_turn_hint.is_some() {
+                active_turn_hint
+            } else if probe_active_turn {
+                active_turn_id_for_thread(&target, &mut client, &thread_id).await?
+            } else {
+                None
+            };
+            if let Some(turn_id) = active_turn_id {
                 steer_turn(
                     &target,
                     &mut client,
@@ -2022,6 +2055,7 @@ struct BrowserWatchSendOptions {
     prompt: String,
     yolo: bool,
     stream_id: u64,
+    active_turn_hint: Option<String>,
     probe_active_turn: bool,
 }
 
@@ -2037,13 +2071,16 @@ fn spawn_browser_watch_send_task(
             prompt,
             yolo,
             stream_id,
+            active_turn_hint,
             probe_active_turn,
         } = options;
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            let active_turn_id = if probe_active_turn {
+            let active_turn_id = if active_turn_hint.is_some() {
+                active_turn_hint
+            } else if probe_active_turn {
                 active_turn_id_for_thread(&target, &mut client, &thread_id).await?
             } else {
                 None
@@ -2325,6 +2362,9 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     return;
                 }
             }
+            if let Some(thread_id) = event_thread_id {
+                touch_browser_thread_updated(state, thread_id);
+            }
             if state.stream.is_none()
                 && let Some(thread_id) = event_thread_id
             {
@@ -2445,6 +2485,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             if !stream_terminal_event_applies(state, stream_id, &thread_id, turn_id.as_deref()) {
                 return;
             }
+            touch_browser_thread_updated(state, &thread_id);
             if let Some(stream) = &mut state.stream {
                 stream.status = StreamStatus::Failed;
                 stream.last_error = Some(error);
@@ -2467,6 +2508,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             ) {
                 return;
             }
+            touch_browser_thread_updated(state, &thread_id);
             if let Some(stream) = &mut state.stream {
                 stream.status = status;
                 if status == StreamStatus::Detached {
@@ -3143,6 +3185,24 @@ fn active_thread_title(state: &TuiState) -> Option<String> {
             .rows
             .get(state.browser.selected)
             .map(|row| row.title.clone()),
+    }
+}
+
+fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let updated = format_browser_updated_epoch(now, state.prefs.browser.relative_updated);
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.updated = updated.clone();
+            if let Some(raw_thread) = row.raw.get_mut("thread") {
+                raw_thread["updatedAt"] = json!(now);
+            } else {
+                row.raw["updatedAt"] = json!(now);
+            }
+        }
     }
 }
 
@@ -4303,7 +4363,7 @@ mod tests {
             "t1",
             None,
             "user",
-            Some("draft sent".to_string()),
+            Some("2026-06-05 09:00".to_string()),
             "please stream",
         );
 
@@ -6060,8 +6120,25 @@ mod tests {
         assert!(!should_probe_active_turn_for_compose(
             &state,
             idle_compose.return_to_detail,
-            "idle-thread"
+            "idle-thread",
+            None
         ));
+
+        state.stream = Some(StreamState::new_with_id(
+            1,
+            "idle-thread".to_string(),
+            Some("turn-local".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
+        assert!(active_turn_hint_for_compose(&state, "idle-thread").is_some());
+        assert!(should_probe_active_turn_for_compose(
+            &state,
+            idle_compose.return_to_detail,
+            "idle-thread",
+            active_turn_hint_for_compose(&state, "idle-thread").as_deref()
+        ));
+        state.stream = None;
 
         state.browser.selected = 1;
         let active_compose = ComposeState {
@@ -6075,8 +6152,43 @@ mod tests {
         assert!(should_probe_active_turn_for_compose(
             &state,
             active_compose.return_to_detail,
-            "active-thread"
+            "active-thread",
+            None
         ));
+    }
+
+    #[test]
+    fn browser_stream_activity_touches_updated_timestamp() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![ThreadRow {
+            id: "t1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            updated: "old".to_string(),
+            cwd: String::new(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({"id": "t1", "updatedAt": 1}),
+        }];
+
+        touch_browser_thread_updated(&mut state, "t1");
+
+        assert_ne!(state.browser.rows[0].updated, "old");
+        assert!(
+            state.browser.rows[0].raw["updatedAt"]
+                .as_i64()
+                .unwrap_or_default()
+                > 1
+        );
     }
 
     #[tokio::test]
