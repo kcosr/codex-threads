@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::config::Target;
 use crate::errors::app_server_error;
-use crate::rpc::{Notification, RpcClient, RpcRequestError};
+use crate::rpc::{Notification, RpcClient};
+use crate::session::request_with_resume_retry;
+#[cfg(feature = "tui")]
+use crate::session::resume_thread_for_action;
 
 #[derive(Debug)]
 pub struct TurnStartOptions {
@@ -538,65 +541,6 @@ where
     }
 }
 
-async fn resume_thread_for_action(
-    client: &mut RpcClient,
-    thread_id: &str,
-    yolo: bool,
-    exclude_turns: bool,
-) -> Result<Value> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(thread_id));
-    params.insert("excludeTurns".to_string(), json!(exclude_turns));
-    if yolo {
-        insert_thread_yolo_permissions(&mut params);
-    }
-    let result = client
-        .request("thread/resume", Value::Object(params), |_| {})
-        .await?;
-    Ok(result)
-}
-
-async fn request_with_resume_retry<F>(
-    client: &mut RpcClient,
-    method: &str,
-    params: Value,
-    thread_id: &str,
-    yolo: bool,
-    mut before_retry: impl FnMut(),
-    mut on_notification: F,
-) -> Result<Value>
-where
-    F: FnMut(Notification),
-{
-    match client
-        .request(method, params.clone(), |notification| {
-            on_notification(notification);
-        })
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
-            before_retry();
-            resume_thread_for_action(client, thread_id, yolo, /*exclude_turns*/ true).await?;
-            client
-                .request(method, params, |notification| {
-                    on_notification(notification);
-                })
-                .await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
-    let Some(error) = err.downcast_ref::<RpcRequestError>() else {
-        return false;
-    };
-    error.method == method
-        && error.error.code == -32600
-        && error.error.message == format!("thread not found: {thread_id}")
-}
-
 async fn poll_turn_completion(
     client: &mut RpcClient,
     wait: &TurnWaitContext<'_>,
@@ -763,11 +707,6 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         map.insert(key.to_string(), json!(value));
     }
-}
-
-fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
-    map.insert("approvalPolicy".to_string(), json!("never"));
-    map.insert("sandbox".to_string(), json!("danger-full-access"));
 }
 
 fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {

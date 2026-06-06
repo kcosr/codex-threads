@@ -6,6 +6,7 @@ mod config;
 mod errors;
 mod rpc;
 mod session;
+mod time_filter;
 #[cfg(feature = "tui")]
 mod tui;
 mod turns;

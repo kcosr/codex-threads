@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use crate::annotations::{load_annotation, namespace_annotations};
 use crate::cli::{ItemsView, MessageRole, SortKey};
 use crate::config::Target;
-use crate::rpc::RpcClient;
+use crate::rpc::{Notification, RpcClient, RpcRequestError};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ThreadProjection {
@@ -442,7 +442,28 @@ fn flatten_messages(turns: &Value) -> Vec<Value> {
     out
 }
 
-async fn resume_thread_for_inspection(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
+pub async fn resume_thread_for_action(
+    client: &mut RpcClient,
+    thread_id: &str,
+    yolo: bool,
+    exclude_turns: bool,
+) -> Result<Value> {
+    let mut params = Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    params.insert("excludeTurns".to_string(), json!(exclude_turns));
+    if yolo {
+        insert_thread_yolo_permissions(&mut params);
+    }
+    let result = client
+        .request("thread/resume", Value::Object(params), |_| {})
+        .await?;
+    Ok(result)
+}
+
+pub async fn resume_thread_for_inspection(
+    client: &mut RpcClient,
+    thread_id: &str,
+) -> Result<Value> {
     let result = client
         .request(
             "thread/resume",
@@ -454,6 +475,59 @@ async fn resume_thread_for_inspection(client: &mut RpcClient, thread_id: &str) -
         .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
         .await;
     Ok(result)
+}
+
+pub async fn request_with_resume_retry<F>(
+    client: &mut RpcClient,
+    method: &str,
+    params: Value,
+    thread_id: &str,
+    yolo: bool,
+    mut before_retry: impl FnMut(),
+    mut on_notification: F,
+) -> Result<Value>
+where
+    F: FnMut(Notification),
+{
+    // Only use this for operations whose app-server implementation requires a
+    // loaded CodexThread. Persisted metadata/history/goal commands can operate
+    // without this, and interrupting a non-loaded thread cannot become useful
+    // by loading an inactive session.
+    match client
+        .request(method, params.clone(), |notification| {
+            on_notification(notification);
+        })
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
+            before_retry();
+            resume_thread_for_action(client, thread_id, yolo, /*exclude_turns*/ true).await?;
+            client
+                .request(method, params, |notification| {
+                    on_notification(notification);
+                })
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
+    let Some(error) = err.downcast_ref::<RpcRequestError>() else {
+        return false;
+    };
+    // Codex app-server currently returns invalid_request(-32600) with this
+    // message from request_processors::{turn_processor,thread_processor}::load_thread.
+    error.method == method
+        && error.error.code == -32600
+        && error.error.message == format!("thread not found: {thread_id}")
+}
+
+pub fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
+    // Thread start/resume use the legacy SandboxMode string shape.
+    map.insert("approvalPolicy".to_string(), json!("never"));
+    map.insert("sandbox".to_string(), json!("danger-full-access"));
 }
 
 fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {

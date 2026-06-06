@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use serde_json::{Map, Value, json};
 
@@ -19,12 +19,14 @@ use crate::config::{
     resolve_config_path, resolve_direct_target, resolve_target,
 };
 use crate::errors::{ExitError, app_server_error, usage_error};
-use crate::rpc::{Notification, RpcClient, RpcRequestError};
+use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
-    ShowThreadRequest, ThreadProjection, ThreadStatusRequest, list_threads, load_messages,
-    loaded_status, read_thread_detail, search_threads, thread_status,
+    ShowThreadRequest, ThreadProjection, ThreadStatusRequest, insert_thread_yolo_permissions,
+    is_thread_not_found_error, list_threads, load_messages, loaded_status, read_thread_detail,
+    request_with_resume_retry, resume_thread_for_inspection, search_threads, thread_status,
 };
+use crate::time_filter::parse_since;
 use crate::turns::{
     TurnStartOptions, TurnTerminal, TurnWaitOutcome, start_turn as start_turn_request,
     wait_for_turn,
@@ -895,84 +897,6 @@ fn print_legacy_warnings(config: &AppConfig) {
     for warning in legacy_server_warnings(config) {
         eprintln!("warning: {warning}");
     }
-}
-
-async fn resume_thread_for_action(
-    client: &mut RpcClient,
-    thread_id: &str,
-    yolo: bool,
-) -> Result<()> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(thread_id));
-    params.insert("excludeTurns".to_string(), json!(true));
-    if yolo {
-        insert_thread_yolo_permissions(&mut params);
-    }
-    client
-        .request("thread/resume", Value::Object(params), |_| {})
-        .await?;
-    Ok(())
-}
-
-async fn resume_thread_for_inspection(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
-    let result = client
-        .request(
-            "thread/resume",
-            json!({"threadId": thread_id, "excludeTurns": true}),
-            |_| {},
-        )
-        .await?;
-    let _ = client
-        .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
-        .await;
-    Ok(result)
-}
-
-async fn request_with_resume_retry<F>(
-    client: &mut RpcClient,
-    method: &str,
-    params: Value,
-    thread_id: &str,
-    yolo: bool,
-    mut before_retry: impl FnMut(),
-    mut on_notification: F,
-) -> Result<Value>
-where
-    F: FnMut(Notification),
-{
-    // Only use this for operations whose app-server implementation requires a
-    // loaded CodexThread. Persisted metadata/history/goal commands can operate
-    // without this, and interrupting a non-loaded thread cannot become useful
-    // by loading an inactive session.
-    match client
-        .request(method, params.clone(), |notification| {
-            on_notification(notification);
-        })
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
-            before_retry();
-            resume_thread_for_action(client, thread_id, yolo).await?;
-            client
-                .request(method, params, |notification| {
-                    on_notification(notification);
-                })
-                .await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
-    let Some(error) = err.downcast_ref::<RpcRequestError>() else {
-        return false;
-    };
-    // Codex app-server currently returns invalid_request(-32600) with this
-    // message from request_processors::{turn_processor,thread_processor}::load_thread.
-    error.method == method
-        && error.error.code == -32600
-        && error.error.message == format!("thread not found: {thread_id}")
 }
 
 async fn settings_show_command(
@@ -1926,12 +1850,6 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     }
 }
 
-fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
-    // Thread start/resume use the legacy SandboxMode string shape.
-    map.insert("approvalPolicy".to_string(), json!("never"));
-    map.insert("sandbox".to_string(), json!("danger-full-access"));
-}
-
 fn turn_status(turn: &Value) -> &'static str {
     match turn["status"].as_str().unwrap_or("inProgress") {
         "completed" => "completed",
@@ -1959,31 +1877,6 @@ fn goal_status(status: &str) -> Result<&'static str> {
         "complete" => Ok("complete"),
         _ => Err(usage_error(format!("invalid goal status `{status}`"))),
     }
-}
-
-fn parse_since(since: &str) -> Result<i64> {
-    if let Ok(timestamp) = since.parse::<i64>() {
-        return Ok(timestamp);
-    }
-    let (number, multiplier) = if let Some(value) = since.strip_suffix('s') {
-        (value, 1)
-    } else if let Some(value) = since.strip_suffix('m') {
-        (value, 60)
-    } else if let Some(value) = since.strip_suffix('h') {
-        (value, 60 * 60)
-    } else if let Some(value) = since.strip_suffix('d') {
-        (value, 60 * 60 * 24)
-    } else {
-        return Err(usage_error(format!("invalid --since value `{since}`")));
-    };
-    let seconds: i64 = number
-        .parse()
-        .with_context(|| format!("invalid --since value `{since}`"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    Ok(now - seconds * multiplier)
 }
 
 fn classify_error(err: &anyhow::Error) -> i32 {
