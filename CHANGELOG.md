@@ -37,6 +37,8 @@
   `turn/start` instead of a pre-existing active turn.
 - Keep live-updated TUI transcript messages from showing stale turn-start
   timestamps inherited from active-turn snapshots.
+- Let CLI/TUI turn waits complete when live app-server returns a temporary
+  `turn/start` id that differs from the persisted turn id in history.
 
 ## [0.1.5] - 2026-06-05
 

@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
@@ -26,6 +26,8 @@ pub struct StartedTurn {
     pub acceptance: Value,
     pub thread_id: String,
     pub turn_id: String,
+    prompt: Option<String>,
+    started_after_epoch: Option<i64>,
     early_notifications: Vec<Notification>,
 }
 
@@ -256,6 +258,8 @@ where
             acceptance: attached,
             thread_id: options.thread_id,
             turn_id: options.turn_id,
+            prompt: None,
+            started_after_epoch: None,
             early_notifications,
         },
         ControlledTurnWaitOptions {
@@ -286,10 +290,12 @@ where
 {
     let mut events = vec![started.acceptance];
     let mut assistant = AssistantResponses::default();
-    let wait = TurnWaitContext {
+    let mut wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
-        turn_id: &started.turn_id,
+        turn_id: started.turn_id.clone(),
+        prompt: started.prompt.as_deref(),
+        started_after_epoch: started.started_after_epoch,
         poll_limit: options.poll_limit,
     };
     for notification in started.early_notifications {
@@ -321,7 +327,7 @@ where
                         let before_len = events.len();
                         let terminal = poll_turn_completion(
                             client,
-                            &wait,
+                            &mut wait,
                             &mut assistant,
                             &mut events,
                             &mut on_assistant_text_from_poll,
@@ -338,15 +344,15 @@ where
                                 .await;
                         }
                         return Ok(TurnWaitOutcome::LocalInterrupt {
-                            thread_id: started.thread_id,
-                            turn_id: started.turn_id,
+                            thread_id: started.thread_id.clone(),
+                            turn_id: wait.turn_id.clone(),
                         });
                     }
                     Some(TurnControl::Interrupt) => {
                         let _ = client
                             .request(
                                 "turn/interrupt",
-                                json!({"threadId": started.thread_id, "turnId": started.turn_id}),
+                                json!({"threadId": started.thread_id, "turnId": &wait.turn_id}),
                                 |_| {},
                             )
                             .await?;
@@ -371,7 +377,7 @@ where
                 let before_len = events.len();
                 let terminal = poll_turn_completion(
                     client,
-                    &wait,
+                    &mut wait,
                     &mut assistant,
                     &mut events,
                     &mut on_assistant_text_from_poll,
@@ -388,7 +394,9 @@ where
 struct TurnWaitContext<'a> {
     target: &'a Target,
     thread_id: &'a str,
-    turn_id: &'a str,
+    turn_id: String,
+    prompt: Option<&'a str>,
+    started_after_epoch: Option<i64>,
     poll_limit: u32,
 }
 
@@ -401,6 +409,8 @@ pub async fn start_turn(
 ) -> Result<StartedTurn> {
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
+    let prompt_for_match = prompt.clone();
+    let started_after_epoch = Some(current_epoch_seconds().saturating_sub(1));
     params.insert(
         "input".to_string(),
         json!([{"type": "text", "text": prompt, "textElements": []}]),
@@ -448,6 +458,8 @@ pub async fn start_turn(
         acceptance,
         thread_id,
         turn_id,
+        prompt: Some(prompt_for_match),
+        started_after_epoch,
         early_notifications: early_notifications
             .lock()
             .expect("early notification buffer poisoned")
@@ -470,10 +482,12 @@ where
 {
     let mut events = vec![started.acceptance];
     let mut assistant = AssistantResponses::default();
-    let wait = TurnWaitContext {
+    let mut wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
-        turn_id: &started.turn_id,
+        turn_id: started.turn_id.clone(),
+        prompt: started.prompt.as_deref(),
+        started_after_epoch: started.started_after_epoch,
         poll_limit,
     };
     for notification in started.early_notifications {
@@ -500,8 +514,8 @@ where
             }
             _ = tokio::signal::ctrl_c() => {
                 return Ok(TurnWaitOutcome::LocalInterrupt {
-                    thread_id: started.thread_id,
-                    turn_id: started.turn_id,
+                    thread_id: started.thread_id.clone(),
+                    turn_id: wait.turn_id.clone(),
                 });
             }
             notification = client.next_notification_or_request() => {
@@ -522,7 +536,7 @@ where
                 let before_len = events.len();
                 let terminal = poll_turn_completion(
                     client,
-                    &wait,
+                    &mut wait,
                     &mut assistant,
                     &mut events,
                     &mut on_assistant_text_from_poll,
@@ -538,7 +552,7 @@ where
 
 async fn poll_turn_completion(
     client: &mut RpcClient,
-    wait: &TurnWaitContext<'_>,
+    wait: &mut TurnWaitContext<'_>,
     assistant: &mut AssistantResponses,
     events: &mut Vec<Value>,
     _on_assistant_text_from_poll: &mut impl FnMut(&str) -> Result<()>,
@@ -557,11 +571,7 @@ async fn poll_turn_completion(
         }
     }
 
-    let turn = result["data"].as_array().and_then(|turns| {
-        turns
-            .iter()
-            .find(|turn| turn["id"].as_str() == Some(wait.turn_id))
-    });
+    let turn = poll_result_turn(wait, &result);
     let Some(turn) = turn else {
         return Ok(None);
     };
@@ -573,7 +583,7 @@ async fn poll_turn_completion(
         event.insert("type".to_string(), json!("progress"));
         event.insert("server".to_string(), json!(wait.target.server));
         event.insert("threadId".to_string(), json!(wait.thread_id));
-        event.insert("turnId".to_string(), json!(wait.turn_id));
+        event.insert("turnId".to_string(), json!(&wait.turn_id));
         insert_opt(&mut event, "itemId", update.item_id);
         event.insert("text".to_string(), json!(update.text));
         event.insert("source".to_string(), json!("poll"));
@@ -582,9 +592,59 @@ async fn poll_turn_completion(
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
-    let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": wait.turn_id, "status": status, "source": "poll"});
+    let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": &wait.turn_id, "status": status, "source": "poll"});
     events.push(event);
     Ok(Some(turn_terminal(wait, status, assistant, events)))
+}
+
+fn poll_result_turn<'a>(wait: &mut TurnWaitContext<'_>, result: &'a Value) -> Option<&'a Value> {
+    let turns = result["data"].as_array()?;
+    if let Some(turn) = turns
+        .iter()
+        .find(|turn| turn["id"].as_str() == Some(wait.turn_id.as_str()))
+    {
+        return Some(turn);
+    }
+    let prompt = wait.prompt?;
+    let turn = turns.first()?;
+    if !turn_matches_prompt(turn, prompt) || !turn_started_after(turn, wait.started_after_epoch) {
+        return None;
+    }
+    if let Some(turn_id) = turn["id"].as_str() {
+        wait.turn_id = turn_id.to_string();
+    }
+    Some(turn)
+}
+
+fn turn_matches_prompt(turn: &Value, prompt: &str) -> bool {
+    let Some(items) = turn["items"].as_array() else {
+        return false;
+    };
+    items.iter().any(|item| {
+        item["type"].as_str() == Some("userMessage")
+            && user_message_text(item).as_deref() == Some(prompt)
+    })
+}
+
+fn user_message_text(item: &Value) -> Option<String> {
+    let content = item["content"].as_array()?;
+    Some(
+        content
+            .iter()
+            .filter_map(|input| input["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn turn_started_after(turn: &Value, started_after_epoch: Option<i64>) -> bool {
+    let Some(started_after_epoch) = started_after_epoch else {
+        return false;
+    };
+    turn["startedAt"]
+        .as_i64()
+        .or_else(|| turn["completedAt"].as_i64())
+        .is_some_and(|timestamp| timestamp >= started_after_epoch)
 }
 
 fn emit_new_events(
@@ -607,7 +667,7 @@ fn process_turn_notification(
     let Some(event) = turn_event(
         &wait.target.server,
         wait.thread_id,
-        wait.turn_id,
+        &wait.turn_id,
         notification,
         assistant,
     )?
@@ -638,7 +698,7 @@ fn turn_terminal(
     let output = json!({
         "server": wait.target.server,
         "threadId": wait.thread_id,
-        "turnId": wait.turn_id,
+        "turnId": &wait.turn_id,
         "status": status,
         "progress": events,
         "assistantResponses": assistant.to_json(),
@@ -728,6 +788,13 @@ fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
     );
 }
 
+fn current_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 fn turn_status(turn: &Value) -> &'static str {
     match turn["status"].as_str().unwrap_or("inProgress") {
         "completed" => "completed",
@@ -769,7 +836,9 @@ mod tests {
         let wait = TurnWaitContext {
             target: &target,
             thread_id: "thread-1",
-            turn_id: "turn-1",
+            turn_id: "turn-1".to_string(),
+            prompt: None,
+            started_after_epoch: None,
             poll_limit: 50,
         };
         let mut assistant = AssistantResponses::default();
@@ -868,7 +937,9 @@ mod tests {
         let wait = TurnWaitContext {
             target: &target,
             thread_id: "thread-1",
-            turn_id: "turn-1",
+            turn_id: "turn-1".to_string(),
+            prompt: None,
+            started_after_epoch: None,
             poll_limit: 50,
         };
         let mut assistant = AssistantResponses::default();
@@ -934,5 +1005,102 @@ mod tests {
         assert_eq!(updates[0].text, "current active text");
         assert_eq!(assistant.final_text(), "current active text");
         assert!(assistant.sync_from_turn(&turn).is_empty());
+    }
+
+    #[test]
+    fn poll_result_turn_adopts_persisted_turn_id_by_prompt_when_start_id_is_absent() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "returned-id".to_string(),
+            prompt: Some("Reply with exactly: ok"),
+            started_after_epoch: Some(1_700_000_000),
+            poll_limit: 50,
+        };
+        let result = json!({
+            "data": [
+                {
+                    "id": "persisted-id",
+                    "status": "completed",
+                    "startedAt": 1_700_000_001_i64,
+                    "items": [
+                        {
+                            "id": "item-user",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "Reply with exactly: ok"}]
+                        },
+                        {
+                            "id": "item-agent",
+                            "type": "agentMessage",
+                            "text": "ok"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let turn = poll_result_turn(&mut wait, &result).expect("aliased turn");
+
+        assert_eq!(turn["id"], "persisted-id");
+        assert_eq!(wait.turn_id, "persisted-id");
+    }
+
+    #[test]
+    fn poll_result_turn_does_not_alias_to_older_repeated_prompt() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "returned-id".to_string(),
+            prompt: Some("repeat prompt"),
+            started_after_epoch: Some(1_700_000_000),
+            poll_limit: 50,
+        };
+        let result = json!({
+            "data": [
+                {
+                    "id": "newest-other-turn",
+                    "status": "completed",
+                    "startedAt": 1_700_000_010_i64,
+                    "items": [
+                        {
+                            "id": "item-user-new",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "different prompt"}]
+                        }
+                    ]
+                },
+                {
+                    "id": "older-repeated-turn",
+                    "status": "completed",
+                    "startedAt": 1_699_999_000_i64,
+                    "items": [
+                        {
+                            "id": "item-user-old",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "repeat prompt"}]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        assert!(poll_result_turn(&mut wait, &result).is_none());
+        assert_eq!(wait.turn_id, "returned-id");
     }
 }
