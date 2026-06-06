@@ -181,6 +181,7 @@ pub enum SendMode {
 
 #[derive(Debug, Clone)]
 pub struct StreamState {
+    pub id: u64,
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub status: StreamStatus,
@@ -200,13 +201,25 @@ pub struct StreamAssistantItem {
 }
 
 impl StreamState {
+    #[cfg(test)]
     pub fn new(
         thread_id: String,
         turn_id: Option<String>,
         status: StreamStatus,
         attached: bool,
     ) -> Self {
+        Self::new_with_id(0, thread_id, turn_id, status, attached)
+    }
+
+    pub fn new_with_id(
+        id: u64,
+        thread_id: String,
+        turn_id: Option<String>,
+        status: StreamStatus,
+        attached: bool,
+    ) -> Self {
         Self {
+            id,
             thread_id,
             turn_id,
             status,
@@ -238,6 +251,7 @@ pub struct TuiState {
     pub prefs: TuiPrefs,
     pub stream: Option<StreamState>,
     pub stream_control: Option<mpsc::UnboundedSender<TurnControl>>,
+    pub next_stream_id: u64,
     pub pending_goto_top: bool,
     pub notice: Option<Notice>,
     pub should_quit: bool,
@@ -300,6 +314,7 @@ impl TuiState {
             prefs: init.prefs,
             stream: None,
             stream_control: None,
+            next_stream_id: 0,
             pending_goto_top: false,
             notice: None,
             should_quit: false,
@@ -315,6 +330,11 @@ impl TuiState {
             message: message.into(),
             expires_at: Instant::now() + Duration::from_secs(2),
         });
+    }
+
+    pub fn allocate_stream_id(&mut self) -> u64 {
+        self.next_stream_id += 1;
+        self.next_stream_id
     }
 
     pub fn clear_expired_notice(&mut self) {
