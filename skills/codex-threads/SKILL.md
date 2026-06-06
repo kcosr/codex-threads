@@ -75,6 +75,71 @@ Default limits: `list` uses `--limit 50`, `show` uses `--last 20`, and `messages
 
 Examples in this skill use `jq` for compact JSON projection; use another JSON tool if `jq` is not installed.
 
+## Interactive TUI
+
+Use `codex-threads tui` when the user wants to browse, search, inspect, annotate,
+refresh, or control threads interactively from a terminal:
+
+```bash
+codex-threads tui --since 24h --cwd "$PWD"
+codex-threads tui --query "release process" --limit 20
+```
+
+The TUI accepts the same initial discovery filters as `list`/`search`: `--query`,
+`--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc`.
+Do not use it for machine-readable automation; use the CLI `--json` commands
+instead.
+
+Useful TUI keys:
+
+- `?` opens the comprehensive keyboard help modal.
+- `j/k`, arrow keys, or mouse wheel scrolling move through the browser and
+  detail transcript; `Enter` opens a thread.
+- `gg` jumps to the top and `G` jumps to the bottom in the browser or detail.
+- `/` searches threads in the browser or loaded transcript lines in detail.
+- Search prompts use `Enter` to apply and `Ctrl-D` to clear.
+- `]` and `[` page through browser/detail cursors when available.
+- `p` toggles the browser preview pane, which lazily fetches the selected
+  thread's recent messages.
+- `f` opens filters, `s` opens sort, and `c` opens visible columns plus
+  relative updated-time and auto-refresh interval controls. In filters, `a`
+  toggles the archived thread filter.
+- `a` edits the local annotation with `Enter` save and `Ctrl-D` clear.
+- `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
+  but app-server does not expose a clear-name operation.
+- `A` opens confirmation to archive or unarchive the active thread.
+- `T` attaches to the selected active thread in the browser or the open active
+  thread in detail.
+- `r` refreshes; `R` resets pagination; `t` toggles real browser auto-refresh.
+  Use the `c` menu to set the persisted 5-300 second refresh interval.
+- `l` explicitly loads the selected/open thread, matching
+  `status THREAD_ID --load`, then refreshes visible metadata and history.
+- `y` copies the active thread id with OSC 52.
+- `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
+  `Tab` toggles stream/no-wait. Browser compose streams into the preview while
+  the thread remains selected and detaches locally when selection moves away.
+  If the initial selected browser row is active, the TUI attaches to it
+  automatically.
+- Opening a detail view loads a small recent turn window and starts at the
+  transcript bottom; while in detail, `Enter` opens the message action, `n/N`
+  move between message-search matches, and `Esc` unlinks the local detail view
+  and returns to the browser.
+- In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms
+  interrupt. Attach resumes with a turn snapshot first, then streams new events.
+- `q` quits. Local detach leaves remote turns running unless interrupted.
+- Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to capture raw stream
+  events for transcript debugging.
+
+In TUI search mode, `--cwd` is a local refinement over the loaded search page.
+Sort controls are disabled in search mode until app-server supports server-side
+search sorting.
+
+TUI transcript rendering is markdown-aware and preserves paragraph spacing.
+Message headings show role and timestamp without repeating turn IDs. Syntax
+highlighting for fenced code blocks is behind the default-off Cargo feature
+`tui-syntax-highlighting`; normal release builds still show readable plain code
+blocks.
+
 ## Local Annotations
 
 `codex-threads annotate` manages local notes for threads. These annotations are

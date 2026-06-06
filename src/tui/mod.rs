@@ -1,0 +1,6814 @@
+mod events;
+#[cfg(feature = "tui-syntax-highlighting")]
+mod highlight;
+mod input;
+mod keymap;
+mod prefs;
+mod state;
+mod views;
+
+use std::io::{self, IsTerminal, Write};
+use std::panic;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use crossterm::cursor::Show;
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures_util::StreamExt;
+use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+use crate::annotations::{clear_annotation, set_annotation};
+use crate::cli::{ItemsView, SortKey, TuiCommand};
+use crate::config::Target;
+use crate::errors::usage_error;
+use crate::rpc::RpcClient;
+use crate::session::{
+    ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStatusRequest, list_threads,
+    read_thread_detail, search_threads, set_thread_archived, set_thread_name, thread_status,
+};
+use crate::time_filter::parse_since;
+use crate::tui::events::{
+    AppEvent, BrowserQuery, DetailPageDirection, FetchRequest, PreviewRequest,
+};
+use crate::tui::input::{InputAction, ModeKind};
+use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
+use crate::tui::state::{
+    BrowserSource, ComposeState, ComposeTarget, DetailState, MessageBlock, MessageLine,
+    MessageLineKind, MessageSpan, Mode, SendMode, StreamAssistantItem, StreamState, StreamStatus,
+    ThreadRow, TuiInit, TuiState,
+};
+use crate::turns::{
+    AttachTurnOptions, ControlledTurnWaitOptions, StartedTurn, TurnControl, TurnStartOptions,
+    TurnWaitOutcome, attach_turn, interrupt_turn, start_turn as start_turn_request, steer_turn,
+    wait_for_turn_controlled,
+};
+
+const DEFAULT_LIMIT: u32 = 50;
+const DETAIL_TURN_LIMIT: u32 = 10;
+const PREVIEW_TURN_LIMIT: u32 = 3;
+const DETAIL_FOLLOW_REFRESH_SECS: u64 = 5;
+const AUTO_REFRESH_MIN_SECS: u64 = 5;
+const AUTO_REFRESH_MAX_SECS: u64 = 300;
+const AUTO_REFRESH_STEP_SECS: u64 = 5;
+const SCHEDULER_TICK_SECS: u64 = 5;
+const TURN_SCAN_LIMIT: u32 = 200;
+const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
+
+pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<i32> {
+    if !io::stdout().is_terminal() {
+        return Err(usage_error("tui requires an interactive terminal"));
+    }
+
+    let since = command.since.as_deref().map(parse_since).transpose()?;
+    let limit = command.limit.unwrap_or(DEFAULT_LIMIT);
+    let loaded_prefs = load_prefs_with_warning();
+    let prefs = loaded_prefs.prefs;
+    let descending = if command.asc {
+        false
+    } else if command.desc {
+        true
+    } else {
+        prefs.browser.direction == SortDirectionPref::Desc
+    };
+    let mut state = TuiState::new(TuiInit {
+        query: command.query,
+        since,
+        cwd: command.cwd,
+        archived: command.archived,
+        limit,
+        sort: command.sort,
+        descending,
+        prefs,
+    });
+    state.browser.last_error = loaded_prefs.warning;
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let (fetch_tx, fetch_rx) = mpsc::channel(32);
+    let (preview_tx, preview_rx) = mpsc::channel(8);
+    let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+    tokio::spawn(fetch_worker(target.clone(), fetch_rx, app_tx.clone()));
+    tokio::spawn(preview_worker(target.clone(), preview_rx, app_tx.clone()));
+    spawn_shutdown_signal_task(app_tx.clone());
+    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+
+    let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_TICK_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let size = terminal.size()?;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        views::sync_viewport_state(&mut state, area);
+        terminal.draw(|frame| views::draw(frame, &state))?;
+        if state.should_quit {
+            break;
+        }
+
+        tokio::select! {
+            maybe_event = events.next() => {
+                if let Some(Ok(event)) = maybe_event {
+                    let previous_selection = state.selected_thread_id().map(str::to_string);
+                    handle_terminal_event(event, &mut state, &target, yolo, &fetch_tx, &app_tx)
+                        .await?;
+                    detach_stream_if_browser_selection_changed(&mut state, previous_selection);
+                    schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
+                }
+            }
+            Some(event) = app_rx.recv() => {
+                let auto_attach_initial_active =
+                    initial_browser_load_needs_auto_attach(&event, &state);
+                let refresh_detail_after_stream = stream_finish_detail_thread(&event, &state);
+                let refresh_after_archive = archive_changed_thread(&event);
+                let refresh_after_rename = rename_changed_thread(&event);
+                let refresh_after_submit = turn_submitted_thread(&event);
+                let refresh_after_load = loaded_thread(&event);
+                handle_app_event(event, &mut state);
+                if auto_attach_initial_active && !state.should_quit {
+                    auto_attach_selected_browser_thread_if_active(
+                        &mut state,
+                        target.clone(),
+                        yolo,
+                        app_tx.clone(),
+                    );
+                }
+                if let Some(thread_id) = refresh_detail_after_stream
+                    && !state.should_quit
+                    && state
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.thread_id == thread_id)
+                {
+                    schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                }
+                if refresh_after_archive.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if refresh_after_rename.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if refresh_after_submit.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if let Some(thread_id) = refresh_after_load
+                    && !state.should_quit
+                {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                    if state
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.thread_id == thread_id)
+                    {
+                        schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                    }
+                }
+                schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
+            }
+            _ = tick.tick() => {
+                state.clear_expired_notice();
+                if state.browser.auto_refresh
+                    && !state.browser.loading
+                    && state.browser.last_refresh_at.is_none_or(|last| {
+                        last.elapsed() >= Duration::from_secs(state.browser.auto_refresh_seconds)
+                    })
+                {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if let Some(thread_id) = detail_follow_refresh_thread(&state) {
+                    schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                }
+            }
+        }
+    }
+
+    state.prefs.refresh.auto = state.browser.auto_refresh;
+    state.prefs.refresh.interval_seconds = state.browser.auto_refresh_seconds;
+    state.prefs.browser.sort = state.browser.sort;
+    state.prefs.browser.direction = if state.browser.descending {
+        SortDirectionPref::Desc
+    } else {
+        SortDirectionPref::Asc
+    };
+    let _ = save_prefs(&state.prefs);
+    terminal.clear()?;
+    Ok(0)
+}
+
+type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+struct TerminalGuard {
+    previous_hook: Arc<Mutex<Option<PanicHook>>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        let previous_hook = panic::take_hook();
+        let previous_hook = Arc::new(Mutex::new(Some(previous_hook)));
+        let hook_for_panic = Arc::clone(&previous_hook);
+        panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            if let Ok(hook) = hook_for_panic.lock()
+                && let Some(previous) = hook.as_ref()
+            {
+                previous(info);
+            } else {
+                eprintln!("{info}");
+            }
+        }));
+        Ok(Self { previous_hook })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+        let previous_hook = self
+            .previous_hook
+            .lock()
+            .ok()
+            .and_then(|mut hook| hook.take());
+        if let Some(previous_hook) = previous_hook {
+            panic::set_hook(previous_hook);
+        }
+    }
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        Show,
+        LeaveAlternateScreen
+    );
+}
+
+#[cfg(unix)]
+fn spawn_shutdown_signal_task(app_tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+            return;
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+        let _ = app_tx.send(AppEvent::ShutdownSignal);
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_shutdown_signal_task(_app_tx: mpsc::UnboundedSender<AppEvent>) {}
+
+async fn fetch_worker(
+    target: Target,
+    mut fetch_rx: mpsc::Receiver<FetchRequest>,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut client = match RpcClient::connect(&target.endpoint).await {
+        Ok(client) => client,
+        Err(err) => {
+            while let Some(request) = fetch_rx.recv().await {
+                match request {
+                    FetchRequest::Browser { epoch, .. } => {
+                        let _ = app_tx.send(AppEvent::BrowserLoadFailed {
+                            epoch,
+                            error: err.to_string(),
+                        });
+                    }
+                    FetchRequest::Detail { epoch, .. } => {
+                        let _ = app_tx.send(AppEvent::DetailLoadFailed {
+                            epoch,
+                            error: err.to_string(),
+                        });
+                    }
+                    FetchRequest::LoadThread { thread_id } => {
+                        let _ = app_tx.send(AppEvent::ThreadLoadFailed {
+                            thread_id,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+            return;
+        }
+    };
+
+    while let Some(request) = fetch_rx.recv().await {
+        match request {
+            FetchRequest::Browser { epoch, query } => {
+                let result = fetch_browser(&target, &mut client, query).await;
+                match result {
+                    Ok((rows, next_cursor, backwards_cursor)) => {
+                        let _ = app_tx.send(AppEvent::BrowserLoaded {
+                            epoch,
+                            rows,
+                            next_cursor,
+                            backwards_cursor,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = app_tx.send(AppEvent::BrowserLoadFailed {
+                            epoch,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+            FetchRequest::Detail {
+                epoch,
+                thread_id,
+                cursor,
+                page_direction,
+            } => {
+                let result = fetch_detail(&target, &mut client, thread_id, cursor, epoch).await;
+                match result {
+                    Ok(detail) => {
+                        let _ = app_tx.send(AppEvent::DetailLoaded {
+                            epoch,
+                            detail: Box::new(detail),
+                            page_direction,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = app_tx.send(AppEvent::DetailLoadFailed {
+                            epoch,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+            FetchRequest::LoadThread { thread_id } => {
+                let result = thread_status(
+                    &target,
+                    &mut client,
+                    ThreadStatusRequest {
+                        thread_id: thread_id.clone(),
+                        load: true,
+                        turn_scan_limit: TURN_SCAN_LIMIT,
+                    },
+                )
+                .await;
+                match result {
+                    Ok(status) => {
+                        let _ = app_tx.send(AppEvent::ThreadLoaded { thread_id, status });
+                    }
+                    Err(err) => {
+                        let _ = app_tx.send(AppEvent::ThreadLoadFailed {
+                            thread_id,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn preview_worker(
+    target: Target,
+    mut preview_rx: mpsc::Receiver<PreviewRequest>,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut client = match RpcClient::connect(&target.endpoint).await {
+        Ok(client) => client,
+        Err(err) => {
+            while let Some(request) = preview_rx.recv().await {
+                let _ = app_tx.send(AppEvent::PreviewLoadFailed {
+                    epoch: request.epoch,
+                    thread_id: request.thread_id,
+                    error: err.to_string(),
+                });
+            }
+            return;
+        }
+    };
+
+    while let Some(mut request) = preview_rx.recv().await {
+        while let Ok(newer) = preview_rx.try_recv() {
+            request = newer;
+        }
+        let result = fetch_preview(&target, &mut client, request.thread_id.clone()).await;
+        match result {
+            Ok(text) => {
+                let _ = app_tx.send(AppEvent::PreviewLoaded {
+                    epoch: request.epoch,
+                    thread_id: request.thread_id,
+                    messages: text,
+                });
+            }
+            Err(err) => {
+                let _ = app_tx.send(AppEvent::PreviewLoadFailed {
+                    epoch: request.epoch,
+                    thread_id: request.thread_id,
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+}
+
+async fn fetch_browser(
+    target: &Target,
+    client: &mut RpcClient,
+    query: BrowserQuery,
+) -> Result<(Vec<ThreadRow>, Option<String>, Option<String>)> {
+    let output = match query.source {
+        BrowserSource::List => {
+            list_threads(
+                target,
+                client,
+                ListThreadsRequest {
+                    limit: query.limit,
+                    cursor: query.cursor,
+                    since: query.since,
+                    cwd: query.cwd,
+                    archived: query.archived,
+                    sort: query.sort,
+                    asc: !query.descending,
+                    desc: query.descending,
+                },
+            )
+            .await?
+        }
+        BrowserSource::Search => {
+            let mut output = search_threads(
+                target,
+                client,
+                SearchThreadsRequest {
+                    query: query.query,
+                    limit: query.limit,
+                    cursor: query.cursor,
+                    since: query.since,
+                    archived: query.archived,
+                },
+            )
+            .await?;
+            if let Some(cwd) = query.cwd {
+                filter_search_cwd(&mut output, &cwd);
+            }
+            output
+        }
+    };
+    let rows = output["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| thread_row(item, query.source, query.relative_updated))
+        .collect();
+    Ok((
+        rows,
+        output["nextCursor"].as_str().map(str::to_string),
+        output["backwardsCursor"].as_str().map(str::to_string),
+    ))
+}
+
+async fn fetch_detail(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+    cursor: Option<String>,
+    epoch: u64,
+) -> Result<DetailState> {
+    let mut output = read_thread_detail(
+        target,
+        client,
+        ShowThreadRequest {
+            thread_id: thread_id.clone(),
+            last: DETAIL_TURN_LIMIT,
+            cursor: cursor.clone(),
+            asc: false,
+            desc: true,
+            items: ItemsView::Full,
+        },
+    )
+    .await?;
+    normalize_detail_turns_for_display(&mut output);
+    let status = thread_status(
+        target,
+        client,
+        ThreadStatusRequest {
+            thread_id: thread_id.clone(),
+            load: false,
+            turn_scan_limit: TURN_SCAN_LIMIT,
+        },
+    )
+    .await
+    .ok();
+    Ok(detail_state(output, status, thread_id, epoch, cursor))
+}
+
+async fn fetch_preview(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+) -> Result<Vec<MessageBlock>> {
+    let mut output = read_thread_detail(
+        target,
+        client,
+        ShowThreadRequest {
+            thread_id: thread_id.clone(),
+            last: PREVIEW_TURN_LIMIT,
+            cursor: None,
+            asc: false,
+            desc: true,
+            items: ItemsView::Full,
+        },
+    )
+    .await?;
+    normalize_detail_turns_for_display(&mut output);
+    Ok(detail_state(output, None, thread_id, 0, None).messages)
+}
+
+async fn schedule_browser_refresh(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+) -> Result<()> {
+    schedule_browser_page(state, fetch_tx, state.browser.current_cursor.clone()).await
+}
+
+async fn schedule_thread_load(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+) -> Result<()> {
+    state.set_notice(format!("loading {thread_id}..."));
+    fetch_tx
+        .send(FetchRequest::LoadThread { thread_id })
+        .await
+        .context("failed to schedule thread load")
+}
+
+async fn schedule_browser_reset(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+) -> Result<()> {
+    schedule_browser_page(state, fetch_tx, None).await
+}
+
+async fn schedule_browser_page(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    cursor: Option<String>,
+) -> Result<()> {
+    state.browser.epoch += 1;
+    state.browser.loading = true;
+    state.browser.last_error = None;
+    state.browser.current_cursor = cursor.clone();
+    let query = BrowserQuery {
+        source: state.browser.source,
+        query: state.browser.query.clone(),
+        cursor,
+        limit: state.browser.limit,
+        since: state.browser.since,
+        cwd: state.browser.cwd.clone(),
+        archived: state.browser.archived,
+        sort: state.browser.sort,
+        descending: state.browser.descending,
+        relative_updated: state.prefs.browser.relative_updated,
+    };
+    fetch_tx
+        .send(FetchRequest::Browser {
+            epoch: state.browser.epoch,
+            query,
+        })
+        .await
+        .context("failed to schedule browser refresh")
+}
+
+async fn schedule_detail_load(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+) -> Result<()> {
+    schedule_detail_page(
+        state,
+        fetch_tx,
+        thread_id,
+        None,
+        DetailPageDirection::Replace,
+    )
+    .await
+}
+
+async fn schedule_detail_refresh(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+) -> Result<()> {
+    let cursor = state
+        .detail
+        .as_ref()
+        .filter(|detail| detail.thread_id == thread_id)
+        .and_then(|detail| detail.current_cursor.clone());
+    schedule_detail_page(
+        state,
+        fetch_tx,
+        thread_id,
+        cursor,
+        DetailPageDirection::Replace,
+    )
+    .await
+}
+
+async fn schedule_detail_page(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+    cursor: Option<String>,
+    page_direction: DetailPageDirection,
+) -> Result<()> {
+    let epoch = state
+        .detail
+        .as_ref()
+        .map(|detail| detail.epoch + 1)
+        .unwrap_or(1);
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.epoch = epoch;
+        detail.loading = true;
+        detail.last_error = None;
+        detail.current_cursor = cursor.clone();
+    } else {
+        state.detail = Some(DetailState {
+            thread_id: thread_id.clone(),
+            title: thread_id.clone(),
+            status: "loading".to_string(),
+            annotation: None,
+            messages: Vec::new(),
+            scroll: u16::MAX,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: cursor.clone(),
+            active_turn_id: None,
+            loading: true,
+            epoch,
+            last_refresh_at: None,
+            viewport_height: None,
+            viewport_width: None,
+            last_error: None,
+        });
+    }
+    state.mode = Mode::Detail;
+    fetch_tx
+        .send(FetchRequest::Detail {
+            epoch,
+            thread_id,
+            cursor,
+            page_direction,
+        })
+        .await
+        .context("failed to schedule detail load")
+}
+
+async fn schedule_selected_preview_if_needed(
+    state: &mut TuiState,
+    preview_tx: &mpsc::Sender<PreviewRequest>,
+) -> Result<()> {
+    if !state.prefs.browser.preview_pane || !matches!(state.mode, Mode::Browser) {
+        return Ok(());
+    }
+    let Some(thread_id) = state.selected_thread_id().map(str::to_string) else {
+        return Ok(());
+    };
+    if state.browser.preview.thread_id.as_deref() == Some(thread_id.as_str())
+        && (state.browser.preview.loading
+            || !state.browser.preview.messages.is_empty()
+            || state.browser.preview.error.is_some())
+    {
+        return Ok(());
+    }
+    let epoch = state.set_preview_loading(thread_id.clone());
+    preview_tx
+        .send(PreviewRequest { epoch, thread_id })
+        .await
+        .context("failed to schedule preview load")
+}
+
+async fn handle_terminal_event(
+    event: Event,
+    state: &mut TuiState,
+    target: &Target,
+    yolo: bool,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<()> {
+    let key = match event {
+        Event::Key(key) => key,
+        Event::Mouse(mouse) => {
+            handle_mouse_event(mouse, state);
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        if let Some(stream) = &state.stream
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+            && let Some(turn_id) = stream.turn_id.clone()
+        {
+            state.mode = Mode::ConfirmInterrupt {
+                thread_id: stream.thread_id.clone(),
+                turn_id,
+            };
+        } else {
+            state.should_quit = true;
+        }
+        return Ok(());
+    }
+
+    let current_mode = std::mem::replace(&mut state.mode, Mode::Browser);
+    match current_mode {
+        Mode::SearchInput { draft } => {
+            return handle_text_input(
+                key,
+                draft,
+                ModeKind::Search,
+                |value, state| {
+                    state.update_query(value);
+                    Ok(InputAction::RefreshBrowser)
+                },
+                state,
+                fetch_tx,
+            )
+            .await;
+        }
+        Mode::MessageSearchInput { draft } => {
+            return handle_text_input(
+                key,
+                draft,
+                ModeKind::MessageSearch,
+                |value, state| {
+                    state.update_message_search(value);
+                    Ok(InputAction::None)
+                },
+                state,
+                fetch_tx,
+            )
+            .await;
+        }
+        Mode::AnnotationInput {
+            thread_id,
+            draft,
+            return_to_detail,
+        } => {
+            return handle_annotation_input(key, target, state, thread_id, draft, return_to_detail);
+        }
+        Mode::RenameInput {
+            thread_id,
+            draft,
+            return_to_detail,
+        } => {
+            return handle_rename_input(
+                key,
+                target,
+                state,
+                thread_id,
+                draft,
+                return_to_detail,
+                app_tx,
+            );
+        }
+        Mode::Compose(compose) => {
+            return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx).await;
+        }
+        Mode::FilterMenu => {
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Browser,
+                KeyCode::Char('a') => {
+                    state.browser.archived = !state.browser.archived;
+                    state.mode = Mode::Browser;
+                    schedule_browser_refresh(state, fetch_tx).await?;
+                }
+                _ => state.mode = Mode::FilterMenu,
+            }
+            return Ok(());
+        }
+        Mode::SortMenu => {
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Browser,
+                KeyCode::Char('u') if state.browser.source == BrowserSource::List => {
+                    state.browser.sort = Some(SortKey::Updated);
+                    state.mode = Mode::Browser;
+                    schedule_browser_refresh(state, fetch_tx).await?;
+                }
+                KeyCode::Char('c') if state.browser.source == BrowserSource::List => {
+                    state.browser.sort = Some(SortKey::Created);
+                    state.mode = Mode::Browser;
+                    schedule_browser_refresh(state, fetch_tx).await?;
+                }
+                KeyCode::Char('d') if state.browser.source == BrowserSource::List => {
+                    state.browser.descending = !state.browser.descending;
+                    state.mode = Mode::Browser;
+                    schedule_browser_refresh(state, fetch_tx).await?;
+                }
+                _ => state.mode = Mode::SortMenu,
+            }
+            return Ok(());
+        }
+        Mode::ColumnsMenu => {
+            let mut changed = false;
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Browser,
+                KeyCode::Char('1') => {
+                    state.prefs.browser.columns.status = !state.prefs.browser.columns.status;
+                    changed = true;
+                }
+                KeyCode::Char('2') => {
+                    state.prefs.browser.columns.updated = !state.prefs.browser.columns.updated;
+                    changed = true;
+                }
+                KeyCode::Char('3') => {
+                    state.prefs.browser.columns.cwd = !state.prefs.browser.columns.cwd;
+                    changed = true;
+                }
+                KeyCode::Char('4') => {
+                    state.prefs.browser.columns.annotation =
+                        !state.prefs.browser.columns.annotation;
+                    changed = true;
+                }
+                KeyCode::Char('5') => {
+                    state.prefs.browser.relative_updated = !state.prefs.browser.relative_updated;
+                    changed = true;
+                    schedule_browser_refresh(state, fetch_tx).await?;
+                }
+                KeyCode::Char('t') => {
+                    state.browser.auto_refresh = !state.browser.auto_refresh;
+                    state.prefs.refresh.auto = state.browser.auto_refresh;
+                    changed = true;
+                    if state.browser.auto_refresh {
+                        schedule_browser_refresh(state, fetch_tx).await?;
+                    }
+                }
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    changed = adjust_auto_refresh_interval(state, -(AUTO_REFRESH_STEP_SECS as i64));
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    changed = adjust_auto_refresh_interval(state, AUTO_REFRESH_STEP_SECS as i64);
+                }
+                _ => {}
+            }
+            if !matches!(key.code, KeyCode::Esc) {
+                state.mode = Mode::ColumnsMenu;
+            }
+            if changed {
+                let _ = save_prefs(&state.prefs);
+            }
+            return Ok(());
+        }
+        Mode::ActiveTurnPrompt { thread_id, turn_id } => {
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Detail,
+                KeyCode::Enter | KeyCode::Char('T') | KeyCode::Char('t') => {
+                    let (control_tx, control_rx) = mpsc::unbounded_channel();
+                    let stream_id = state.allocate_stream_id();
+                    state.stream = Some(StreamState::new_with_id(
+                        stream_id,
+                        thread_id.clone(),
+                        Some(turn_id.clone()),
+                        StreamStatus::Running,
+                        true,
+                    ));
+                    state.stream_control = Some(control_tx);
+                    state.mode = Mode::Detail;
+                    spawn_attach_task(
+                        target.clone(),
+                        thread_id.clone(),
+                        turn_id,
+                        yolo,
+                        control_rx,
+                        stream_id,
+                        app_tx.clone(),
+                    );
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    state.mode = Mode::Compose(ComposeState {
+                        target: ComposeTarget::Steer { thread_id, turn_id },
+                        text: String::new(),
+                        send_mode: SendMode::NoWait,
+                        return_to_detail: true,
+                    });
+                }
+                KeyCode::Char('i') => {
+                    state.mode = Mode::ConfirmInterrupt { thread_id, turn_id };
+                }
+                _ => state.mode = Mode::ActiveTurnPrompt { thread_id, turn_id },
+            }
+            return Ok(());
+        }
+        Mode::ConfirmInterrupt { thread_id, turn_id } => {
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Detail,
+                KeyCode::Enter => {
+                    state.mode = Mode::Detail;
+                    if let Some(control) = &state.stream_control {
+                        let _ = control.send(TurnControl::Interrupt);
+                    } else {
+                        spawn_interrupt_task(target.clone(), thread_id, turn_id, app_tx.clone());
+                    }
+                }
+                _ => state.mode = Mode::ConfirmInterrupt { thread_id, turn_id },
+            }
+            return Ok(());
+        }
+        Mode::ConfirmArchive {
+            thread_id,
+            archived,
+            return_to_detail,
+        } => {
+            let return_mode = if return_to_detail {
+                Mode::Detail
+            } else {
+                Mode::Browser
+            };
+            match key.code {
+                KeyCode::Esc => state.mode = return_mode,
+                KeyCode::Enter => {
+                    state.mode = return_mode;
+                    state.set_notice(format!(
+                        "{} {thread_id}...",
+                        if archived { "archiving" } else { "unarchiving" }
+                    ));
+                    spawn_archive_task(target.clone(), thread_id, archived, app_tx.clone());
+                }
+                _ => {
+                    state.mode = Mode::ConfirmArchive {
+                        thread_id,
+                        archived,
+                        return_to_detail,
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Mode::Help => {
+            state.mode = Mode::Browser;
+            return Ok(());
+        }
+        other => state.mode = other,
+    }
+
+    if matches!(
+        key.code,
+        KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Home | KeyCode::End
+    ) {
+        handle_goto_key(key.code, state);
+        return Ok(());
+    }
+    state.pending_goto_top = false;
+
+    match key.code {
+        KeyCode::Char('q') => {
+            detach_stream(state);
+            state.should_quit = true;
+        }
+        KeyCode::Char('?') => state.mode = Mode::Help,
+        KeyCode::Char('r') => match state.mode {
+            _ if stream_is_running(state) => {
+                if let Some(control) = &state.stream_control {
+                    let _ = control.send(TurnControl::PollNow);
+                }
+            }
+            Mode::Detail => {
+                if let Some(thread_id) =
+                    state.detail.as_ref().map(|detail| detail.thread_id.clone())
+                {
+                    schedule_detail_refresh(state, fetch_tx, thread_id).await?;
+                }
+            }
+            _ => schedule_browser_refresh(state, fetch_tx).await?,
+        },
+        KeyCode::Char('R') => match state.mode {
+            Mode::Detail => {
+                if let Some(thread_id) =
+                    state.detail.as_ref().map(|detail| detail.thread_id.clone())
+                {
+                    schedule_detail_load(state, fetch_tx, thread_id).await?;
+                }
+            }
+            _ => schedule_browser_reset(state, fetch_tx).await?,
+        },
+        KeyCode::Char(']') => match state.mode {
+            Mode::Detail => {
+                if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
+                    detail
+                        .next_cursor
+                        .clone()
+                        .map(|cursor| (detail.thread_id.clone(), cursor))
+                }) {
+                    schedule_detail_page(
+                        state,
+                        fetch_tx,
+                        thread_id,
+                        Some(cursor),
+                        DetailPageDirection::Older,
+                    )
+                    .await?;
+                }
+            }
+            _ => {
+                if let Some(cursor) = state.browser.next_cursor.clone() {
+                    schedule_browser_page(state, fetch_tx, Some(cursor)).await?;
+                }
+            }
+        },
+        KeyCode::Char('[') => match state.mode {
+            Mode::Detail => {
+                if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
+                    detail
+                        .backwards_cursor
+                        .clone()
+                        .map(|cursor| (detail.thread_id.clone(), cursor))
+                }) {
+                    schedule_detail_page(
+                        state,
+                        fetch_tx,
+                        thread_id,
+                        Some(cursor),
+                        DetailPageDirection::Newer,
+                    )
+                    .await?;
+                }
+            }
+            _ => {
+                if let Some(cursor) = state.browser.backwards_cursor.clone() {
+                    schedule_browser_page(state, fetch_tx, Some(cursor)).await?;
+                }
+            }
+        },
+        KeyCode::Char('/') => match state.mode {
+            Mode::Detail => {
+                let draft = state
+                    .detail
+                    .as_ref()
+                    .map(|detail| detail.search_query.clone())
+                    .unwrap_or_default();
+                state.mode = Mode::MessageSearchInput { draft };
+            }
+            _ => {
+                state.mode = Mode::SearchInput {
+                    draft: state.browser.query.clone(),
+                }
+            }
+        },
+        KeyCode::Char('n') if matches!(state.mode, Mode::Detail) => {
+            state.next_message_match();
+        }
+        KeyCode::Char('N') if matches!(state.mode, Mode::Detail) => {
+            state.previous_message_match();
+        }
+        KeyCode::Char('a') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                let draft = active_annotation(state).unwrap_or_default();
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::AnnotationInput {
+                    thread_id,
+                    draft,
+                    return_to_detail,
+                };
+            }
+        }
+        KeyCode::Char('A') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                let archived = !active_thread_is_archived(state);
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::ConfirmArchive {
+                    thread_id,
+                    archived,
+                    return_to_detail,
+                };
+            }
+        }
+        KeyCode::Char('e') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                let draft = active_thread_title(state).unwrap_or_default();
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::RenameInput {
+                    thread_id,
+                    draft,
+                    return_to_detail,
+                };
+            }
+        }
+        KeyCode::Char('y') => {
+            copy_active_thread_id(state)?;
+        }
+        KeyCode::Char('m') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                open_message_action(state, thread_id);
+            }
+        }
+        KeyCode::Char('l') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                schedule_thread_load(state, fetch_tx, thread_id).await?;
+            }
+        }
+        KeyCode::Char('S') => {
+            if matches!(state.mode, Mode::Detail)
+                && let Some(detail) = &state.detail
+                && let Some(turn_id) = detail.active_turn_id.clone()
+            {
+                state.mode = Mode::Compose(ComposeState {
+                    target: ComposeTarget::Steer {
+                        thread_id: detail.thread_id.clone(),
+                        turn_id,
+                    },
+                    text: String::new(),
+                    send_mode: SendMode::NoWait,
+                    return_to_detail: true,
+                });
+            }
+        }
+        KeyCode::Char('T') => {
+            if matches!(state.mode, Mode::Detail)
+                && let Some(detail) = &state.detail
+                && let Some(turn_id) = detail.active_turn_id.clone()
+            {
+                let thread_id = detail.thread_id.clone();
+                detach_stream(state);
+                let (control_tx, control_rx) = mpsc::unbounded_channel();
+                let stream_id = state.allocate_stream_id();
+                state.stream = Some(StreamState::new_with_id(
+                    stream_id,
+                    thread_id.clone(),
+                    Some(turn_id.clone()),
+                    StreamStatus::Running,
+                    true,
+                ));
+                state.stream_control = Some(control_tx);
+                spawn_attach_task(
+                    target.clone(),
+                    thread_id.clone(),
+                    turn_id,
+                    yolo,
+                    control_rx,
+                    stream_id,
+                    app_tx.clone(),
+                );
+            } else if matches!(state.mode, Mode::Browser)
+                && let Some(thread_id) = state.selected_thread_id().map(str::to_string)
+            {
+                detach_stream(state);
+                let stream_id = state.allocate_stream_id();
+                state.stream = Some(StreamState::new_with_id(
+                    stream_id,
+                    thread_id.clone(),
+                    None,
+                    StreamStatus::Starting,
+                    true,
+                ));
+                let (control_tx, control_rx) = mpsc::unbounded_channel();
+                state.stream_control = Some(control_tx);
+                spawn_browser_attach_task(
+                    target.clone(),
+                    thread_id,
+                    yolo,
+                    control_rx,
+                    stream_id,
+                    app_tx.clone(),
+                );
+            }
+        }
+        KeyCode::Char('i') => {
+            if matches!(state.mode, Mode::Detail)
+                && let Some(detail) = &state.detail
+                && let Some(turn_id) = detail.active_turn_id.clone()
+            {
+                state.mode = Mode::ConfirmInterrupt {
+                    thread_id: detail.thread_id.clone(),
+                    turn_id,
+                };
+            }
+        }
+        KeyCode::Char('f') if matches!(state.mode, Mode::Browser) => state.mode = Mode::FilterMenu,
+        KeyCode::Char('c') if matches!(state.mode, Mode::Browser) => state.mode = Mode::ColumnsMenu,
+        KeyCode::Char('t') => {
+            state.browser.auto_refresh = !state.browser.auto_refresh;
+            state.prefs.refresh.auto = state.browser.auto_refresh;
+            let _ = save_prefs(&state.prefs);
+            if state.browser.auto_refresh && matches!(state.mode, Mode::Browser) {
+                schedule_browser_refresh(state, fetch_tx).await?;
+            }
+        }
+        KeyCode::Char('p') if matches!(state.mode, Mode::Browser) => {
+            state.prefs.browser.preview_pane = !state.prefs.browser.preview_pane;
+            if !state.prefs.browser.preview_pane {
+                state.browser.preview = Default::default();
+            }
+            let _ = save_prefs(&state.prefs);
+        }
+        KeyCode::Char('s') if matches!(state.mode, Mode::Browser) => state.mode = Mode::SortMenu,
+        KeyCode::Down | KeyCode::Char('j') => match state.mode {
+            Mode::Detail => scroll_detail(state, 1),
+            _ => state.move_selection(1),
+        },
+        KeyCode::Up | KeyCode::Char('k') => match state.mode {
+            Mode::Detail => scroll_detail(state, -1),
+            _ => state.move_selection(-1),
+        },
+        KeyCode::Enter => match state.mode {
+            Mode::Browser => {
+                if let Some(thread_id) = state.selected_thread_id().map(str::to_string) {
+                    schedule_detail_load(state, fetch_tx, thread_id).await?;
+                }
+            }
+            Mode::Detail => {
+                if let Some(thread_id) = active_thread_id(state) {
+                    open_message_action(state, thread_id);
+                }
+            }
+            _ => {}
+        },
+        KeyCode::Esc => match state.mode {
+            Mode::Detail => {
+                unlink_detail_session(state);
+            }
+            _ => state.mode = Mode::Browser,
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_goto_key(code: KeyCode, state: &mut TuiState) -> bool {
+    match code {
+        KeyCode::Char('g') => {
+            if state.pending_goto_top {
+                jump_to_top(state);
+                state.pending_goto_top = false;
+            } else {
+                state.pending_goto_top = true;
+            }
+            true
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            jump_to_bottom(state);
+            state.pending_goto_top = false;
+            true
+        }
+        KeyCode::Home => {
+            jump_to_top(state);
+            state.pending_goto_top = false;
+            true
+        }
+        _ => {
+            state.pending_goto_top = false;
+            false
+        }
+    }
+}
+
+fn jump_to_top(state: &mut TuiState) {
+    match state.mode {
+        Mode::Detail => {
+            if let Some(detail) = &mut state.detail {
+                detail.scroll = 0;
+            }
+        }
+        _ => state.browser.selected = 0,
+    }
+}
+
+fn jump_to_bottom(state: &mut TuiState) {
+    match state.mode {
+        Mode::Detail => {
+            if let Some(detail) = &mut state.detail {
+                detail.scroll = detail.bottom_scroll_position();
+            }
+        }
+        _ => {
+            state.browser.selected = state.browser.rows.len().saturating_sub(1);
+        }
+    }
+}
+
+fn open_message_action(state: &mut TuiState, thread_id: String) {
+    let return_to_detail = matches!(state.mode, Mode::Detail);
+    if return_to_detail
+        && let Some(detail) = &state.detail
+        && detail.thread_id == thread_id
+        && let Some(turn_id) = detail.active_turn_id.clone()
+    {
+        state.mode = Mode::ActiveTurnPrompt { thread_id, turn_id };
+    } else {
+        state.mode = Mode::Compose(ComposeState {
+            target: ComposeTarget::NewTurn { thread_id },
+            text: String::new(),
+            send_mode: SendMode::Stream,
+            return_to_detail,
+        });
+    }
+}
+
+fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+    state.pending_goto_top = false;
+    let delta: isize = match mouse.kind {
+        MouseEventKind::ScrollUp => -3,
+        MouseEventKind::ScrollDown => 3,
+        _ => return,
+    };
+    match state.mode {
+        Mode::Detail
+        | Mode::MessageSearchInput { .. }
+        | Mode::Compose(_)
+        | Mode::ActiveTurnPrompt { .. }
+        | Mode::ConfirmInterrupt { .. }
+        | Mode::ConfirmArchive {
+            return_to_detail: true,
+            ..
+        } => scroll_detail(state, delta),
+        Mode::Browser
+        | Mode::SearchInput { .. }
+        | Mode::FilterMenu
+        | Mode::SortMenu
+        | Mode::ColumnsMenu
+        | Mode::Help
+        | Mode::ConfirmArchive {
+            return_to_detail: false,
+            ..
+        } => state.move_selection(delta),
+        Mode::AnnotationInput {
+            return_to_detail: true,
+            ..
+        }
+        | Mode::RenameInput {
+            return_to_detail: true,
+            ..
+        } => scroll_detail(state, delta),
+        Mode::AnnotationInput {
+            return_to_detail: false,
+            ..
+        }
+        | Mode::RenameInput {
+            return_to_detail: false,
+            ..
+        } => state.move_selection(delta),
+    }
+}
+
+fn scroll_detail(state: &mut TuiState, delta: isize) {
+    let Some(detail) = &mut state.detail else {
+        return;
+    };
+    if delta.is_negative() {
+        detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs() as u16);
+    } else {
+        detail.scroll = detail
+            .scroll
+            .saturating_add(delta as u16)
+            .min(detail.max_scroll());
+    }
+}
+
+async fn handle_text_input<F>(
+    key: KeyEvent,
+    mut draft: String,
+    mode_kind: ModeKind,
+    mut on_submit: F,
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+) -> Result<()>
+where
+    F: FnMut(String, &mut TuiState) -> Result<InputAction>,
+{
+    match key.code {
+        KeyCode::Esc => {
+            state.mode = match mode_kind {
+                ModeKind::MessageSearch => Mode::Detail,
+                _ => Mode::Browser,
+            }
+        }
+        KeyCode::Enter => {
+            let value = draft.clone();
+            if on_submit(value, state)? == InputAction::RefreshBrowser {
+                state.mode = Mode::Browser;
+                schedule_browser_refresh(state, fetch_tx).await?;
+            } else {
+                state.mode = match mode_kind {
+                    ModeKind::MessageSearch => Mode::Detail,
+                    _ => Mode::Browser,
+                };
+            }
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if on_submit(String::new(), state)? == InputAction::RefreshBrowser {
+                state.mode = Mode::Browser;
+                schedule_browser_refresh(state, fetch_tx).await?;
+            } else {
+                state.mode = match mode_kind {
+                    ModeKind::MessageSearch => Mode::Detail,
+                    _ => Mode::Browser,
+                };
+            }
+        }
+        KeyCode::Backspace => {
+            draft.pop();
+            state.mode = mode_from_kind(mode_kind, draft);
+        }
+        KeyCode::Char(ch) => {
+            draft.push(ch);
+            state.mode = mode_from_kind(mode_kind, draft);
+        }
+        _ => state.mode = mode_from_kind(mode_kind, draft),
+    }
+    Ok(())
+}
+
+fn mode_from_kind(kind: ModeKind, draft: String) -> Mode {
+    match kind {
+        ModeKind::Search => Mode::SearchInput { draft },
+        ModeKind::MessageSearch => Mode::MessageSearchInput { draft },
+    }
+}
+
+fn handle_annotation_input(
+    key: KeyEvent,
+    target: &Target,
+    state: &mut TuiState,
+    thread_id: String,
+    mut draft: String,
+    return_to_detail: bool,
+) -> Result<()> {
+    let return_mode = if return_to_detail {
+        Mode::Detail
+    } else {
+        Mode::Browser
+    };
+    match key.code {
+        KeyCode::Esc => state.mode = return_mode.clone(),
+        KeyCode::Enter => {
+            save_annotation_draft(target, state, &thread_id, draft)?;
+            state.mode = return_mode.clone();
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            clear_annotation(target, &thread_id)?;
+            set_annotation_in_state(state, &thread_id, None);
+            state.mode = return_mode.clone();
+        }
+        KeyCode::Backspace => {
+            draft.pop();
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            draft.push(ch);
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        _ => {
+            state.mode = Mode::AnnotationInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn handle_rename_input(
+    key: KeyEvent,
+    target: &Target,
+    state: &mut TuiState,
+    thread_id: String,
+    mut draft: String,
+    return_to_detail: bool,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<()> {
+    let return_mode = if return_to_detail {
+        Mode::Detail
+    } else {
+        Mode::Browser
+    };
+    match key.code {
+        KeyCode::Esc => state.mode = return_mode,
+        KeyCode::Enter => {
+            let name = draft.trim().to_string();
+            if name.is_empty() {
+                state.set_notice("name cannot be empty");
+                state.mode = Mode::RenameInput {
+                    thread_id,
+                    draft,
+                    return_to_detail,
+                };
+            } else {
+                state.set_notice(format!("renaming {thread_id}..."));
+                spawn_rename_task(target.clone(), thread_id, name, app_tx.clone());
+                state.mode = return_mode;
+            }
+        }
+        KeyCode::Backspace => {
+            draft.pop();
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.clear();
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            draft.push(ch);
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+        _ => {
+            state.mode = Mode::RenameInput {
+                thread_id,
+                draft,
+                return_to_detail,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn save_annotation_draft(
+    target: &Target,
+    state: &mut TuiState,
+    thread_id: &str,
+    value: String,
+) -> Result<()> {
+    if value.trim().is_empty() {
+        clear_annotation(target, thread_id)?;
+        set_annotation_in_state(state, thread_id, None);
+    } else {
+        set_annotation(target, thread_id, &value)?;
+        set_annotation_in_state(state, thread_id, Some(value));
+    }
+    Ok(())
+}
+
+fn set_annotation_in_state(state: &mut TuiState, thread_id: &str, value: Option<String>) {
+    if let Some(row) = state
+        .browser
+        .rows
+        .iter_mut()
+        .find(|row| row.id == thread_id)
+    {
+        row.annotation = value.clone();
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.annotation = value;
+    }
+}
+
+async fn handle_compose_input(
+    key: KeyEvent,
+    state: &mut TuiState,
+    mut compose: ComposeState,
+    target: &Target,
+    yolo: bool,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<()> {
+    let return_mode = if compose.return_to_detail {
+        Mode::Detail
+    } else {
+        Mode::Browser
+    };
+    match key.code {
+        KeyCode::Esc => state.mode = return_mode.clone(),
+        KeyCode::Tab => {
+            if matches!(compose.target, ComposeTarget::NewTurn { .. }) {
+                compose.send_mode = match compose.send_mode {
+                    SendMode::Stream => SendMode::NoWait,
+                    SendMode::NoWait => SendMode::Stream,
+                };
+            }
+            state.mode = Mode::Compose(compose);
+        }
+        KeyCode::Backspace => {
+            compose.text.pop();
+            state.mode = Mode::Compose(compose);
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            compose.text.push('\n');
+            state.mode = Mode::Compose(compose);
+        }
+        KeyCode::Enter => {
+            submit_compose(state, compose, target, yolo, app_tx, return_mode);
+        }
+        KeyCode::Char(ch) => {
+            compose.text.push(ch);
+            state.mode = Mode::Compose(compose);
+        }
+        _ => state.mode = Mode::Compose(compose),
+    }
+    Ok(())
+}
+
+fn submit_compose(
+    state: &mut TuiState,
+    compose: ComposeState,
+    target: &Target,
+    yolo: bool,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+    return_mode: Mode,
+) {
+    let prompt = compose.text.trim().to_string();
+    if prompt.is_empty() {
+        state.mode = return_mode;
+        return;
+    }
+    match compose.target {
+        ComposeTarget::NewTurn { thread_id } => {
+            let active_turn_hint = active_turn_hint_for_compose(state, &thread_id);
+            let probe_active_turn = should_probe_active_turn_for_compose(
+                state,
+                compose.return_to_detail,
+                &thread_id,
+                active_turn_hint.as_deref(),
+            );
+            let sent_at = format_current_epoch();
+            append_detail_message(
+                state,
+                thread_id.as_str(),
+                None,
+                "user",
+                Some(sent_at.clone()),
+                &prompt,
+            );
+            append_preview_message(
+                state,
+                thread_id.as_str(),
+                None,
+                "user",
+                Some(sent_at),
+                &prompt,
+            );
+            touch_browser_thread_updated(state, &thread_id);
+            state.mode = return_mode;
+            match compose.send_mode {
+                SendMode::Stream => {
+                    detach_stream(state);
+                    let (control_tx, control_rx) = mpsc::unbounded_channel();
+                    let stream_id = state.allocate_stream_id();
+                    state.stream = Some(StreamState::new_with_id(
+                        stream_id,
+                        thread_id.clone(),
+                        None,
+                        StreamStatus::Starting,
+                        false,
+                    ));
+                    state.stream_control = Some(control_tx);
+                    if compose.return_to_detail {
+                        spawn_stream_send_task(
+                            target.clone(),
+                            thread_id,
+                            prompt,
+                            yolo,
+                            control_rx,
+                            stream_id,
+                            app_tx.clone(),
+                        );
+                    } else {
+                        spawn_browser_watch_send_task(
+                            target.clone(),
+                            thread_id,
+                            control_rx,
+                            BrowserWatchSendOptions {
+                                prompt,
+                                yolo,
+                                stream_id,
+                                active_turn_hint,
+                                probe_active_turn,
+                            },
+                            app_tx.clone(),
+                        );
+                    }
+                }
+                SendMode::NoWait => {
+                    spawn_no_wait_send_task(
+                        target.clone(),
+                        thread_id,
+                        prompt,
+                        yolo,
+                        active_turn_hint,
+                        probe_active_turn,
+                        app_tx.clone(),
+                    );
+                }
+            }
+        }
+        ComposeTarget::Steer { thread_id, turn_id } => {
+            state.mode = return_mode;
+            spawn_steer_task(
+                target.clone(),
+                thread_id,
+                turn_id,
+                prompt,
+                yolo,
+                app_tx.clone(),
+            );
+        }
+    }
+}
+
+fn should_probe_active_turn_for_compose(
+    state: &TuiState,
+    return_to_detail: bool,
+    thread_id: &str,
+    active_turn_hint: Option<&str>,
+) -> bool {
+    if active_turn_hint.is_some() {
+        return true;
+    }
+    if return_to_detail {
+        return state.detail.as_ref().is_some_and(|detail| {
+            detail.thread_id == thread_id && detail.active_turn_id.is_some()
+        });
+    }
+    state
+        .browser
+        .rows
+        .get(state.browser.selected)
+        .is_some_and(|row| row.id == thread_id && row.is_running())
+}
+
+fn active_turn_hint_for_compose(state: &TuiState, thread_id: &str) -> Option<String> {
+    state.stream.as_ref().and_then(|stream| {
+        if stream.thread_id == thread_id
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+        {
+            stream.turn_id.clone()
+        } else {
+            None
+        }
+    })
+}
+
+fn send_stream_event(app_tx: &mpsc::UnboundedSender<AppEvent>, stream_id: u64, event: Value) {
+    app_tx
+        .send(AppEvent::StreamEvent {
+            stream_id: Some(stream_id),
+            event,
+        })
+        .ok();
+}
+
+fn stream_status_from_wait_outcome(
+    outcome: TurnWaitOutcome,
+    stream_id: u64,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> StreamStatus {
+    match outcome {
+        TurnWaitOutcome::Terminal(terminal) => {
+            send_stream_event(app_tx, stream_id, terminal.output);
+            match terminal.exit_code {
+                0 => StreamStatus::Completed,
+                _ => StreamStatus::Failed,
+            }
+        }
+        TurnWaitOutcome::LocalInterrupt { .. } => StreamStatus::Detached,
+    }
+}
+
+async fn attach_existing_turn_stream(
+    target: &Target,
+    client: &mut RpcClient,
+    options: AttachTurnOptions,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<StreamStatus> {
+    let tx = app_tx.clone();
+    let outcome = attach_turn(
+        target,
+        client,
+        options,
+        control_rx,
+        |event| {
+            send_stream_event(&tx, stream_id, event.clone());
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .await?;
+    Ok(stream_status_from_wait_outcome(outcome, stream_id, &tx))
+}
+
+async fn wait_started_turn_stream(
+    target: &Target,
+    client: &mut RpcClient,
+    started: StartedTurn,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<StreamStatus> {
+    let tx = app_tx.clone();
+    let outcome = wait_for_turn_controlled(
+        target,
+        client,
+        started,
+        ControlledTurnWaitOptions {
+            poll_limit: TURN_SCAN_LIMIT,
+            timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+            unsubscribe_on_detach: false,
+        },
+        control_rx,
+        |event| {
+            send_stream_event(&tx, stream_id, event.clone());
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .await?;
+    Ok(stream_status_from_wait_outcome(outcome, stream_id, &tx))
+}
+
+fn report_stream_task_result(
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+    stream_id: u64,
+    thread_id: String,
+    turn_id: Option<String>,
+    result: Result<StreamStatus>,
+) {
+    match result {
+        Ok(status) => app_tx
+            .send(AppEvent::StreamFinished {
+                stream_id,
+                thread_id,
+                turn_id,
+                status,
+            })
+            .ok(),
+        Err(err) => app_tx
+            .send(AppEvent::StreamFailed {
+                stream_id: Some(stream_id),
+                thread_id,
+                turn_id,
+                error: err.to_string(),
+            })
+            .ok(),
+    };
+}
+
+fn spawn_attach_task(
+    target: Target,
+    thread_id: String,
+    turn_id: String,
+    yolo: bool,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let stream_thread_id = thread_id.clone();
+        let stream_turn_id = Some(turn_id.clone());
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            attach_existing_turn_stream(
+                &target,
+                &mut client,
+                AttachTurnOptions {
+                    thread_id,
+                    turn_id,
+                    yolo,
+                    poll_limit: TURN_SCAN_LIMIT,
+                    timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                },
+                control_rx,
+                stream_id,
+                &app_tx,
+            )
+            .await
+        }
+        .await;
+        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+    });
+}
+
+fn spawn_browser_attach_task(
+    target: Target,
+    thread_id: String,
+    yolo: bool,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let stream_thread_id = thread_id.clone();
+        let mut stream_turn_id = None;
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let turn_id = active_turn_id_for_thread(&target, &mut client, &thread_id, true)
+                .await?
+                .ok_or_else(|| usage_error(format!("thread `{thread_id}` has no active turn")))?;
+            stream_turn_id = Some(turn_id.clone());
+            attach_existing_turn_stream(
+                &target,
+                &mut client,
+                AttachTurnOptions {
+                    thread_id,
+                    turn_id,
+                    yolo,
+                    poll_limit: TURN_SCAN_LIMIT,
+                    timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                },
+                control_rx,
+                stream_id,
+                &app_tx,
+            )
+            .await
+        }
+        .await;
+        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+    });
+}
+
+fn spawn_steer_task(
+    target: Target,
+    thread_id: String,
+    turn_id: String,
+    prompt: String,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let stream_thread_id = thread_id.clone();
+        let stream_turn_id = Some(turn_id.clone());
+        let result: Result<Value> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            steer_turn(&target, &mut client, thread_id, turn_id, prompt, yolo).await
+        }
+        .await;
+        match result {
+            Ok(event) => app_tx
+                .send(AppEvent::StreamEvent {
+                    stream_id: None,
+                    event,
+                })
+                .ok(),
+            Err(err) => app_tx
+                .send(AppEvent::StreamFailed {
+                    stream_id: None,
+                    thread_id: stream_thread_id,
+                    turn_id: stream_turn_id,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+fn spawn_interrupt_task(
+    target: Target,
+    thread_id: String,
+    turn_id: String,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let stream_thread_id = thread_id.clone();
+        let stream_turn_id = Some(turn_id.clone());
+        let result: Result<Value> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            interrupt_turn(&target, &mut client, thread_id, turn_id).await
+        }
+        .await;
+        match result {
+            Ok(event) => app_tx
+                .send(AppEvent::StreamEvent {
+                    stream_id: None,
+                    event,
+                })
+                .ok(),
+            Err(err) => app_tx
+                .send(AppEvent::StreamFailed {
+                    stream_id: None,
+                    thread_id: stream_thread_id,
+                    turn_id: stream_turn_id,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+fn spawn_archive_task(
+    target: Target,
+    thread_id: String,
+    archived: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<Value> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            set_thread_archived(&target, &mut client, thread_id.clone(), archived).await
+        }
+        .await;
+        match result {
+            Ok(output) => app_tx
+                .send(AppEvent::ArchiveChanged {
+                    thread_id,
+                    archived,
+                    thread: output["thread"].clone(),
+                })
+                .ok(),
+            Err(err) => app_tx
+                .send(AppEvent::ArchiveChangeFailed {
+                    thread_id,
+                    archived,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+fn spawn_rename_task(
+    target: Target,
+    thread_id: String,
+    name: String,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<Value> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            set_thread_name(&target, &mut client, thread_id.clone(), name.clone()).await
+        }
+        .await;
+        match result {
+            Ok(output) => app_tx
+                .send(AppEvent::RenameChanged {
+                    thread_id,
+                    name,
+                    thread: output["thread"].clone(),
+                })
+                .ok(),
+            Err(err) => app_tx
+                .send(AppEvent::RenameChangeFailed {
+                    thread_id,
+                    name,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+fn spawn_no_wait_send_task(
+    target: Target,
+    thread_id: String,
+    prompt: String,
+    yolo: bool,
+    active_turn_hint: Option<String>,
+    probe_active_turn: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let active_turn_id = if active_turn_hint.is_some() {
+                active_turn_hint
+            } else if probe_active_turn {
+                active_turn_id_for_thread(&target, &mut client, &thread_id, true).await?
+            } else {
+                None
+            };
+            if let Some(turn_id) = active_turn_id {
+                steer_turn(
+                    &target,
+                    &mut client,
+                    thread_id.clone(),
+                    turn_id,
+                    prompt,
+                    yolo,
+                )
+                .await?;
+            } else {
+                start_turn_request(
+                    &target,
+                    &mut client,
+                    thread_id.clone(),
+                    prompt,
+                    TurnStartOptions {
+                        model: None,
+                        effort: None,
+                        service_tier: None,
+                        yolo,
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => app_tx.send(AppEvent::TurnSubmitted { thread_id }).ok(),
+            Err(err) => app_tx
+                .send(AppEvent::TurnSubmitFailed {
+                    thread_id,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+async fn active_turn_id_for_thread(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: &str,
+    load: bool,
+) -> Result<Option<String>> {
+    let status = thread_status(
+        target,
+        client,
+        ThreadStatusRequest {
+            thread_id: thread_id.to_string(),
+            load,
+            turn_scan_limit: TURN_SCAN_LIMIT,
+        },
+    )
+    .await?;
+    Ok(status["activeTurnId"].as_str().map(str::to_string))
+}
+
+struct BrowserWatchSendOptions {
+    prompt: String,
+    yolo: bool,
+    stream_id: u64,
+    active_turn_hint: Option<String>,
+    probe_active_turn: bool,
+}
+
+fn spawn_browser_watch_send_task(
+    target: Target,
+    thread_id: String,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    options: BrowserWatchSendOptions,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let BrowserWatchSendOptions {
+            prompt,
+            yolo,
+            stream_id,
+            active_turn_hint,
+            probe_active_turn,
+        } = options;
+        let stream_thread_id = thread_id.clone();
+        let mut stream_turn_id = None;
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let active_turn_id = if active_turn_hint.is_some() {
+                active_turn_hint
+            } else if probe_active_turn {
+                active_turn_id_for_thread(&target, &mut client, &thread_id, true).await?
+            } else {
+                None
+            };
+            if let Some(turn_id) = active_turn_id {
+                stream_turn_id = Some(turn_id.clone());
+                let accepted = steer_turn(
+                    &target,
+                    &mut client,
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    prompt,
+                    yolo,
+                )
+                .await?;
+                send_stream_event(&app_tx, stream_id, accepted);
+                attach_existing_turn_stream(
+                    &target,
+                    &mut client,
+                    AttachTurnOptions {
+                        thread_id,
+                        turn_id,
+                        yolo,
+                        poll_limit: TURN_SCAN_LIMIT,
+                        timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                    },
+                    control_rx,
+                    stream_id,
+                    &app_tx,
+                )
+                .await
+            } else {
+                let started = start_turn_request(
+                    &target,
+                    &mut client,
+                    thread_id,
+                    prompt,
+                    TurnStartOptions {
+                        model: None,
+                        effort: None,
+                        service_tier: None,
+                        yolo,
+                    },
+                )
+                .await?;
+                stream_turn_id = Some(started.turn_id.clone());
+                send_stream_event(&app_tx, stream_id, started.acceptance.clone());
+                wait_started_turn_stream(
+                    &target,
+                    &mut client,
+                    started,
+                    control_rx,
+                    stream_id,
+                    &app_tx,
+                )
+                .await
+            }
+        }
+        .await;
+        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+    });
+}
+
+fn spawn_stream_send_task(
+    target: Target,
+    thread_id: String,
+    prompt: String,
+    yolo: bool,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let stream_thread_id = thread_id.clone();
+        let mut stream_turn_id = None;
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let started = start_turn_request(
+                &target,
+                &mut client,
+                thread_id,
+                prompt,
+                TurnStartOptions {
+                    model: None,
+                    effort: None,
+                    service_tier: None,
+                    yolo,
+                },
+            )
+            .await?;
+            stream_turn_id = Some(started.turn_id.clone());
+            send_stream_event(&app_tx, stream_id, started.acceptance.clone());
+            wait_started_turn_stream(
+                &target,
+                &mut client,
+                started,
+                control_rx,
+                stream_id,
+                &app_tx,
+            )
+            .await
+        }
+        .await;
+        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+    });
+}
+
+fn handle_app_event(event: AppEvent, state: &mut TuiState) {
+    match event {
+        AppEvent::BrowserLoaded {
+            epoch,
+            rows,
+            next_cursor,
+            backwards_cursor,
+        } => state.set_browser_rows(
+            epoch,
+            rows,
+            next_cursor,
+            backwards_cursor,
+            state.browser.current_cursor.clone(),
+        ),
+        AppEvent::BrowserLoadFailed { epoch, error } => state.set_browser_error(epoch, error),
+        AppEvent::DetailLoaded {
+            epoch,
+            detail,
+            page_direction,
+        } => match page_direction {
+            DetailPageDirection::Replace => state.replace_detail(epoch, *detail),
+            DetailPageDirection::Older => state.extend_detail_older(epoch, *detail),
+            DetailPageDirection::Newer => state.extend_detail_newer(epoch, *detail),
+        },
+        AppEvent::DetailLoadFailed { epoch, error } => state.set_detail_error(epoch, error),
+        AppEvent::PreviewLoaded {
+            epoch,
+            thread_id,
+            messages,
+        } => state.set_preview_loaded(epoch, thread_id, messages),
+        AppEvent::PreviewLoadFailed {
+            epoch,
+            thread_id,
+            error,
+        } => state.set_preview_error(epoch, thread_id, error),
+        AppEvent::ThreadLoaded { thread_id, status } => {
+            apply_thread_load_status(state, &thread_id, &status);
+            reset_preview_for_thread(state, &thread_id);
+            state.set_notice(format!("loaded {thread_id}"));
+        }
+        AppEvent::ThreadLoadFailed { thread_id, error } => {
+            state.set_notice(format!("failed to load {thread_id}: {error}"));
+        }
+        AppEvent::StreamEvent { stream_id, event } => {
+            log_stream_event(&event);
+            let event_thread_id = event["threadId"].as_str();
+            if let Some(current_stream) = &state.stream {
+                if let Some(stream_id) = stream_id {
+                    if current_stream.id != stream_id {
+                        return;
+                    }
+                } else if event_thread_id
+                    .is_some_and(|thread_id| thread_id != current_stream.thread_id.as_str())
+                {
+                    return;
+                }
+            }
+            if let Some(thread_id) = event_thread_id {
+                touch_browser_thread_updated(state, thread_id);
+                match event["status"].as_str() {
+                    Some("completed" | "failed" | "interrupted") => {
+                        set_browser_thread_status(state, thread_id, "idle");
+                    }
+                    _ => set_browser_thread_status(state, thread_id, "active"),
+                }
+            }
+            if state.stream.is_none()
+                && let Some(thread_id) = event_thread_id
+            {
+                if !stream_event_matches_visible_thread(state, thread_id) {
+                    return;
+                }
+                state.stream = Some(StreamState::new_with_id(
+                    stream_id.unwrap_or(0),
+                    thread_id.to_string(),
+                    event["turnId"].as_str().map(str::to_string),
+                    StreamStatus::Running,
+                    event["type"].as_str() == Some("attached"),
+                ));
+            }
+            let mut pending_turn_id = None;
+            let mut assistant_updates = Vec::new();
+            let initial_event_turn_id =
+                event["turnId"].as_str().map(str::to_string).or_else(|| {
+                    state
+                        .stream
+                        .as_ref()
+                        .and_then(|stream| stream.turn_id.clone())
+                });
+            let snapshot_detail =
+                detail_from_resume_snapshot(state, &event, &initial_event_turn_id);
+            if let Some(stream) = &mut state.stream {
+                if let Some(turn_id) = event["turnId"].as_str() {
+                    stream.turn_id = Some(turn_id.to_string());
+                    pending_turn_id = Some(turn_id.to_string());
+                }
+                let event_turn_id = event["turnId"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| stream.turn_id.clone());
+                if snapshot_detail.is_some() {
+                    seed_stream_from_resume_snapshot(stream, event_turn_id.as_deref(), &event);
+                }
+                if let Some(delta) = event["delta"].as_str() {
+                    let item_id = event["itemId"].as_str().map(str::to_string);
+                    let item = append_stream_assistant_delta(
+                        stream,
+                        event_turn_id.clone(),
+                        item_id.clone(),
+                        delta,
+                    );
+                    assistant_updates.push((
+                        item.turn_id.clone(),
+                        item.item_id.clone(),
+                        item.text.clone(),
+                        false,
+                    ));
+                } else if let Some(text) = event["text"].as_str() {
+                    let item_id = event["itemId"].as_str().map(str::to_string);
+                    set_stream_assistant_text(stream, event_turn_id.clone(), item_id.clone(), text);
+                    assistant_updates.push((
+                        event_turn_id.clone(),
+                        item_id,
+                        text.to_string(),
+                        true,
+                    ));
+                } else if let Some(responses) = event["assistantResponses"].as_array() {
+                    for response in responses {
+                        let Some(text) = response["text"].as_str() else {
+                            continue;
+                        };
+                        let item_id = response["itemId"].as_str().map(str::to_string);
+                        set_stream_assistant_text(
+                            stream,
+                            event_turn_id.clone(),
+                            item_id.clone(),
+                            text,
+                        );
+                        assistant_updates.push((
+                            event_turn_id.clone(),
+                            item_id,
+                            text.to_string(),
+                            true,
+                        ));
+                    }
+                } else if let Some(text) = event["finalAssistantText"].as_str()
+                    && !text.is_empty()
+                    && stream.assistant_items.is_empty()
+                {
+                    set_stream_assistant_text(stream, event_turn_id.clone(), None, text);
+                    assistant_updates.push((event_turn_id.clone(), None, text.to_string(), true));
+                }
+                stream.status = match event["status"].as_str() {
+                    Some("completed") => StreamStatus::Completed,
+                    Some("failed") => StreamStatus::Failed,
+                    Some("interrupted") => StreamStatus::Interrupted,
+                    _ => StreamStatus::Running,
+                };
+                if event["source"].as_str() == Some("poll") {
+                    stream.last_poll_at = Some(std::time::Instant::now());
+                }
+            }
+            if let Some(turn_id) = pending_turn_id {
+                fill_pending_turn_ids(state, &turn_id);
+                fill_preview_pending_turn_ids(state, &turn_id);
+            }
+            if let Some(detail) = snapshot_detail {
+                state.replace_detail(detail.epoch, detail);
+            }
+            seed_preview_from_resume_snapshot(state, &event);
+            for (turn_id, item_id, text, finalized) in assistant_updates {
+                upsert_preview_assistant_message(
+                    state,
+                    turn_id.clone(),
+                    item_id.clone(),
+                    &text,
+                    finalized,
+                );
+                upsert_streaming_assistant_message(state, turn_id, item_id, &text, finalized);
+            }
+        }
+        AppEvent::StreamFailed {
+            stream_id,
+            thread_id,
+            turn_id,
+            error,
+        } => {
+            if !stream_terminal_event_applies(state, stream_id, &thread_id, turn_id.as_deref()) {
+                return;
+            }
+            touch_browser_thread_updated(state, &thread_id);
+            if let Some(stream) = &mut state.stream {
+                stream.status = StreamStatus::Failed;
+                stream.last_error = Some(error);
+            } else {
+                state.set_notice(format!("stream failed: {error}"));
+            }
+            state.stream_control = None;
+        }
+        AppEvent::StreamFinished {
+            stream_id,
+            thread_id,
+            turn_id,
+            status,
+        } => {
+            if !stream_terminal_event_applies(
+                state,
+                Some(stream_id),
+                &thread_id,
+                turn_id.as_deref(),
+            ) {
+                return;
+            }
+            touch_browser_thread_updated(state, &thread_id);
+            if status != StreamStatus::Detached {
+                set_browser_thread_status(state, &thread_id, "idle");
+            }
+            if let Some(stream) = &mut state.stream {
+                stream.status = status;
+                if status == StreamStatus::Detached {
+                    stream.detached = true;
+                }
+            }
+            state.stream_control = None;
+        }
+        AppEvent::TurnSubmitted { thread_id } => {
+            set_browser_thread_status(state, &thread_id, "active");
+            touch_browser_thread_updated(state, &thread_id);
+            state.set_notice(format!("sent {thread_id}"));
+        }
+        AppEvent::TurnSubmitFailed { thread_id, error } => {
+            state.set_notice(format!("failed to send {thread_id}: {error}"));
+        }
+        AppEvent::ArchiveChanged {
+            thread_id,
+            archived,
+            thread,
+        } => {
+            apply_archive_change(state, &thread_id, archived, &thread);
+            state.set_notice(format!(
+                "{} {thread_id}",
+                if archived { "archived" } else { "unarchived" }
+            ));
+        }
+        AppEvent::ArchiveChangeFailed {
+            thread_id,
+            archived,
+            error,
+        } => {
+            state.set_notice(format!(
+                "failed to {} {thread_id}: {error}",
+                if archived { "archive" } else { "unarchive" }
+            ));
+        }
+        AppEvent::RenameChanged {
+            thread_id,
+            name,
+            thread,
+        } => {
+            set_thread_name_in_state(state, &thread_id, &name, &thread);
+            state.set_notice(format!("renamed {thread_id}"));
+        }
+        AppEvent::RenameChangeFailed {
+            thread_id,
+            name,
+            error,
+        } => {
+            state.set_notice(format!("failed to rename {thread_id} to {name}: {error}"));
+        }
+        AppEvent::ShutdownSignal => {
+            detach_stream(state);
+            state.should_quit = true;
+        }
+    }
+}
+
+fn archive_changed_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::ArchiveChanged { thread_id, .. } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn rename_changed_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::RenameChanged { thread_id, .. } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn turn_submitted_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::TurnSubmitted { thread_id } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn loaded_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::ThreadLoaded { thread_id, .. } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn log_stream_event(event: &Value) {
+    let Ok(path) = std::env::var("CODEX_THREADS_TUI_STREAM_LOG") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let line = json!({"timestamp": timestamp, "event": event});
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn detail_from_resume_snapshot(
+    state: &TuiState,
+    event: &Value,
+    active_turn_id: &Option<String>,
+) -> Option<DetailState> {
+    let current = state.detail.as_ref()?;
+    let thread = event.get("thread")?;
+    let thread_id = thread["id"]
+        .as_str()
+        .or_else(|| event["threadId"].as_str())?;
+    if current.thread_id != thread_id {
+        return None;
+    }
+    let turns = thread["turns"].as_array()?;
+    if turns.is_empty() {
+        return None;
+    }
+    let output = json!({
+        "thread": thread,
+        "turns": {
+            "data": turns,
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null
+        }
+    });
+    let status_output = active_turn_id
+        .as_ref()
+        .map(|turn_id| json!({"activeTurnId": turn_id}));
+    Some(detail_state(
+        output,
+        status_output,
+        thread_id.to_string(),
+        current.epoch,
+        current.current_cursor.clone(),
+    ))
+}
+
+fn seed_stream_from_resume_snapshot(
+    stream: &mut StreamState,
+    active_turn_id: Option<&str>,
+    event: &Value,
+) {
+    let Some(turns) = event["thread"]["turns"].as_array() else {
+        return;
+    };
+    for turn in turns {
+        let Some(turn_id) = turn["id"].as_str() else {
+            continue;
+        };
+        if active_turn_id.is_some_and(|active| active != turn_id) {
+            continue;
+        }
+        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
+            if item["type"].as_str() != Some("agentMessage") {
+                continue;
+            }
+            let Some(text) = item["text"].as_str() else {
+                continue;
+            };
+            set_stream_assistant_text(
+                stream,
+                Some(turn_id.to_string()),
+                item["id"].as_str().map(str::to_string),
+                text,
+            );
+        }
+    }
+}
+
+fn stream_terminal_event_applies(
+    state: &TuiState,
+    stream_id: Option<u64>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> bool {
+    let Some(stream) = &state.stream else {
+        return stream_id.is_none() && stream_event_matches_visible_thread(state, thread_id);
+    };
+    if let Some(stream_id) = stream_id
+        && stream.id != stream_id
+    {
+        return false;
+    }
+    if stream.thread_id != thread_id {
+        return false;
+    }
+    if let (Some(expected), Some(actual)) = (stream.turn_id.as_deref(), turn_id) {
+        return expected == actual;
+    }
+    true
+}
+
+fn stream_is_running(state: &TuiState) -> bool {
+    state.stream.as_ref().is_some_and(|stream| {
+        matches!(
+            stream.status,
+            StreamStatus::Starting | StreamStatus::Running
+        )
+    })
+}
+
+fn stream_is_visible_in_browser(state: &TuiState, thread_id: &str) -> bool {
+    state.selected_thread_id() == Some(thread_id)
+        || state
+            .browser
+            .preview
+            .thread_id
+            .as_deref()
+            .is_some_and(|preview_thread_id| preview_thread_id == thread_id)
+        || (state.selected_thread_id().is_none()
+            && state.browser.preview.thread_id.is_none()
+            && state
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.thread_id == thread_id))
+}
+
+fn stream_event_matches_visible_thread(state: &TuiState, thread_id: &str) -> bool {
+    match state.mode {
+        Mode::Browser => stream_is_visible_in_browser(state, thread_id),
+        _ => state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.thread_id == thread_id),
+    }
+}
+
+fn detach_stream(state: &mut TuiState) {
+    if let Some(control) = &state.stream_control {
+        let _ = control.send(TurnControl::Detach);
+    }
+    if let Some(stream) = &mut state.stream
+        && matches!(
+            stream.status,
+            StreamStatus::Starting | StreamStatus::Running
+        )
+    {
+        stream.status = StreamStatus::Detached;
+        stream.detached = true;
+    }
+    state.stream_control = None;
+}
+
+fn detach_stream_if_browser_selection_changed(
+    state: &mut TuiState,
+    previous_selection: Option<String>,
+) {
+    if !matches!(state.mode, Mode::Browser) {
+        return;
+    }
+    let current_selection = state.selected_thread_id().map(str::to_string);
+    if previous_selection == current_selection {
+        return;
+    }
+    let Some(stream_thread_id) = state.stream.as_ref().map(|stream| stream.thread_id.clone())
+    else {
+        return;
+    };
+    if current_selection.as_deref() != Some(stream_thread_id.as_str()) {
+        detach_stream(state);
+        state.stream = None;
+    }
+}
+
+fn unlink_detail_session(state: &mut TuiState) {
+    let detail_thread_id = state.detail.as_ref().map(|detail| detail.thread_id.clone());
+    if let Some(detail_thread_id) = detail_thread_id
+        && state
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.thread_id == detail_thread_id)
+    {
+        detach_stream(state);
+        state.stream = None;
+    }
+    state.detail = None;
+    state.mode = Mode::Browser;
+}
+
+fn initial_browser_load_needs_auto_attach(event: &AppEvent, state: &TuiState) -> bool {
+    matches!(event, AppEvent::BrowserLoaded { .. })
+        && matches!(state.mode, Mode::Browser)
+        && state.browser.rows.is_empty()
+        && state.stream.is_none()
+}
+
+fn auto_attach_selected_browser_thread_if_active(
+    state: &mut TuiState,
+    target: Target,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !matches!(state.mode, Mode::Browser) || state.stream.is_some() {
+        return;
+    }
+    let Some(row) = state.browser.rows.get(state.browser.selected) else {
+        return;
+    };
+    if !row.is_running() {
+        return;
+    }
+    let thread_id = row.id.clone();
+    let stream_id = state.allocate_stream_id();
+    state.stream = Some(StreamState::new_with_id(
+        stream_id,
+        thread_id.clone(),
+        None,
+        StreamStatus::Starting,
+        true,
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    state.stream_control = Some(control_tx);
+    spawn_browser_attach_task(target, thread_id, yolo, control_rx, stream_id, app_tx);
+}
+
+fn stream_finish_detail_thread(event: &AppEvent, state: &TuiState) -> Option<String> {
+    if !matches!(event, AppEvent::StreamFinished { .. }) {
+        return None;
+    }
+    let detail = state.detail.as_ref()?;
+    let stream = state.stream.as_ref()?;
+    if detail.thread_id == stream.thread_id {
+        Some(detail.thread_id.clone())
+    } else {
+        None
+    }
+}
+
+fn detail_follow_refresh_thread(state: &TuiState) -> Option<String> {
+    if !matches!(state.mode, Mode::Detail) || stream_is_running(state) {
+        return None;
+    }
+    let detail = state.detail.as_ref()?;
+    if detail.loading {
+        return None;
+    }
+    if detail
+        .last_refresh_at
+        .is_none_or(|last| last.elapsed() >= Duration::from_secs(DETAIL_FOLLOW_REFRESH_SECS))
+    {
+        Some(detail.thread_id.clone())
+    } else {
+        None
+    }
+}
+
+fn append_detail_message(
+    state: &mut TuiState,
+    thread_id: &str,
+    turn_id: Option<String>,
+    role: &str,
+    timestamp: Option<String>,
+    text: &str,
+) {
+    let Some(detail) = &mut state.detail else {
+        return;
+    };
+    if detail.thread_id != thread_id {
+        return;
+    }
+    detail
+        .messages
+        .push(message_block(turn_id, None, role, timestamp, text, 100));
+    detail.scroll = detail.bottom_scroll_position();
+    if !detail.search_query.is_empty() {
+        let query = detail.search_query.clone();
+        state.update_message_search(query);
+    }
+}
+
+fn preview_matches_thread(state: &TuiState, thread_id: &str) -> bool {
+    state.browser.preview.thread_id.as_deref() == Some(thread_id)
+        || (matches!(state.mode, Mode::Browser) && state.selected_thread_id() == Some(thread_id))
+}
+
+fn ensure_preview_thread(state: &mut TuiState, thread_id: &str) {
+    if state.browser.preview.thread_id.as_deref() != Some(thread_id) {
+        state.browser.preview.thread_id = Some(thread_id.to_string());
+        state.browser.preview.loading = false;
+        state.browser.preview.messages.clear();
+        state.browser.preview.error = None;
+    }
+}
+
+fn append_preview_message(
+    state: &mut TuiState,
+    thread_id: &str,
+    turn_id: Option<String>,
+    role: &str,
+    timestamp: Option<String>,
+    text: &str,
+) {
+    if !preview_matches_thread(state, thread_id) {
+        return;
+    }
+    ensure_preview_thread(state, thread_id);
+    state
+        .browser
+        .preview
+        .messages
+        .push(message_block(turn_id, None, role, timestamp, text, 100));
+}
+
+fn fill_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
+    let Some(detail) = &mut state.detail else {
+        return;
+    };
+    for message in &mut detail.messages {
+        if message.turn_id.is_none() {
+            message.turn_id = Some(turn_id.to_string());
+        }
+    }
+}
+
+fn fill_preview_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
+    for message in &mut state.browser.preview.messages {
+        if message.turn_id.is_none() {
+            message.turn_id = Some(turn_id.to_string());
+        }
+    }
+}
+
+fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
+    let Some(thread) = event.get("thread") else {
+        return;
+    };
+    let Some(thread_id) = thread["id"].as_str().or_else(|| event["threadId"].as_str()) else {
+        return;
+    };
+    if !preview_matches_thread(state, thread_id) || thread["turns"].as_array().is_none() {
+        return;
+    }
+    let output = json!({
+        "thread": thread,
+        "turns": {
+            "data": thread["turns"].clone(),
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null
+        }
+    });
+    let status_output = event["turnId"]
+        .as_str()
+        .map(|turn_id| json!({"activeTurnId": turn_id}));
+    let detail = detail_state(output, status_output, thread_id.to_string(), 0, None);
+    ensure_preview_thread(state, thread_id);
+    state.browser.preview.messages = detail.messages;
+}
+
+fn append_stream_assistant_delta(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    delta: &str,
+) -> StreamAssistantItem {
+    let item = stream_assistant_item_mut(stream, turn_id, item_id);
+    item.text.push_str(delta);
+    item.clone()
+}
+
+fn set_stream_assistant_text(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+) {
+    stream_assistant_item_mut(stream, turn_id, item_id).text = text.to_string();
+}
+
+fn stream_assistant_item_mut(
+    stream: &mut StreamState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+) -> &mut StreamAssistantItem {
+    if let Some(index) = stream
+        .assistant_items
+        .iter()
+        .position(|item| assistant_item_exact_match(item, turn_id.as_deref(), item_id.as_deref()))
+    {
+        return &mut stream.assistant_items[index];
+    }
+    if item_id.is_some()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .position(|item| assistant_item_provisional_match(item, turn_id.as_deref()))
+    {
+        let item = &mut stream.assistant_items[index];
+        item.item_id = item_id;
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
+    }
+    if item_id.is_none()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .rposition(|item| turns_compatible(item.turn_id.as_deref(), turn_id.as_deref()))
+    {
+        let item = &mut stream.assistant_items[index];
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
+    }
+    stream.assistant_items.push(StreamAssistantItem {
+        turn_id,
+        item_id,
+        text: String::new(),
+    });
+    stream
+        .assistant_items
+        .last_mut()
+        .expect("stream assistant item just pushed")
+}
+
+fn assistant_item_exact_match(
+    item: &StreamAssistantItem,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> bool {
+    if let Some(item_id) = item_id {
+        item.item_id.as_deref() == Some(item_id)
+            && turns_compatible(item.turn_id.as_deref(), turn_id)
+    } else {
+        item.item_id.is_none() && item.turn_id.as_deref() == turn_id
+    }
+}
+
+fn assistant_item_provisional_match(item: &StreamAssistantItem, turn_id: Option<&str>) -> bool {
+    item.item_id.is_none()
+        && turn_id.is_some()
+        && turns_compatible(item.turn_id.as_deref(), turn_id)
+}
+
+fn turns_compatible(existing: Option<&str>, incoming: Option<&str>) -> bool {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
+    }
+}
+
+fn upsert_streaming_assistant_message(
+    state: &mut TuiState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+    finalized: bool,
+) {
+    let Some(stream) = &state.stream else {
+        return;
+    };
+    let Some(detail) = &mut state.detail else {
+        return;
+    };
+    if detail.thread_id != stream.thread_id {
+        return;
+    }
+    let was_at_bottom = detail.is_at_bottom();
+    let match_index = detail.messages.iter().rposition(|message| {
+        streaming_message_exact_match(message, turn_id.as_deref(), item_id.as_deref())
+    });
+    let provisional_index = if item_id.is_some() && match_index.is_none() {
+        detail
+            .messages
+            .iter()
+            .rposition(|message| streaming_message_provisional_match(message, turn_id.as_deref()))
+    } else {
+        None
+    };
+    if let Some(message) = match_index
+        .or(provisional_index)
+        .and_then(|index| detail.messages.get_mut(index))
+    {
+        message.lines = markdown_lines(text, 100);
+        if message.turn_id.is_none() {
+            message.turn_id = turn_id.clone();
+        }
+        if message.item_id.is_none() {
+            message.item_id = item_id.clone();
+        }
+        if finalized {
+            message.timestamp = Some(format_current_epoch());
+        }
+    } else {
+        detail.messages.push(message_block(
+            turn_id,
+            item_id,
+            "assistant",
+            Some(if finalized {
+                format_current_epoch()
+            } else {
+                "streaming".to_string()
+            }),
+            text,
+            100,
+        ));
+    }
+    if was_at_bottom {
+        detail.scroll = detail.bottom_scroll_position();
+    }
+    if !detail.search_query.is_empty() {
+        let query = detail.search_query.clone();
+        state.update_message_search(query);
+    }
+}
+
+fn upsert_preview_assistant_message(
+    state: &mut TuiState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+    finalized: bool,
+) {
+    let Some(stream) = &state.stream else {
+        return;
+    };
+    if !preview_matches_thread(state, &stream.thread_id) {
+        return;
+    }
+    let thread_id = stream.thread_id.clone();
+    ensure_preview_thread(state, &thread_id);
+    let messages = &mut state.browser.preview.messages;
+    let match_index = messages.iter().rposition(|message| {
+        streaming_message_exact_match(message, turn_id.as_deref(), item_id.as_deref())
+    });
+    let provisional_index = if item_id.is_some() && match_index.is_none() {
+        messages
+            .iter()
+            .rposition(|message| streaming_message_provisional_match(message, turn_id.as_deref()))
+    } else {
+        None
+    };
+    if let Some(message) = match_index
+        .or(provisional_index)
+        .and_then(|index| messages.get_mut(index))
+    {
+        message.lines = markdown_lines(text, 100);
+        if message.turn_id.is_none() {
+            message.turn_id = turn_id.clone();
+        }
+        if message.item_id.is_none() {
+            message.item_id = item_id.clone();
+        }
+        if finalized {
+            message.timestamp = Some(format_current_epoch());
+        }
+    } else {
+        messages.push(message_block(
+            turn_id,
+            item_id,
+            "assistant",
+            Some(if finalized {
+                format_current_epoch()
+            } else {
+                "streaming".to_string()
+            }),
+            text,
+            100,
+        ));
+    }
+}
+
+fn streaming_message_exact_match(
+    message: &MessageBlock,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> bool {
+    if message.role != "assistant" {
+        return false;
+    }
+    if let Some(item_id) = item_id {
+        message.item_id.as_deref() == Some(item_id)
+            && turns_compatible(message.turn_id.as_deref(), turn_id)
+    } else {
+        message.item_id.is_none() && message.turn_id.as_deref() == turn_id
+    }
+}
+
+fn streaming_message_provisional_match(message: &MessageBlock, turn_id: Option<&str>) -> bool {
+    message.role == "assistant"
+        && message.item_id.is_none()
+        && turn_id.is_some()
+        && turns_compatible(message.turn_id.as_deref(), turn_id)
+}
+
+fn active_thread_id(state: &TuiState) -> Option<String> {
+    match state.mode {
+        Mode::Detail => state.detail.as_ref().map(|detail| detail.thread_id.clone()),
+        _ => state.selected_thread_id().map(str::to_string),
+    }
+}
+
+fn active_thread_is_archived(state: &TuiState) -> bool {
+    match state.mode {
+        Mode::Detail => state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.status == "archived" || state.browser.archived),
+        _ => state
+            .browser
+            .rows
+            .get(state.browser.selected)
+            .is_some_and(|row| row.status == "archived" || state.browser.archived),
+    }
+}
+
+fn active_annotation(state: &TuiState) -> Option<String> {
+    match state.mode {
+        Mode::Detail => state
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.annotation.clone()),
+        _ => state.selected_thread_annotation().map(str::to_string),
+    }
+}
+
+fn active_thread_title(state: &TuiState) -> Option<String> {
+    match state.mode {
+        Mode::Detail => state.detail.as_ref().map(|detail| detail.title.clone()),
+        _ => state
+            .browser
+            .rows
+            .get(state.browser.selected)
+            .map(|row| row.title.clone()),
+    }
+}
+
+fn adjust_auto_refresh_interval(state: &mut TuiState, delta_seconds: i64) -> bool {
+    let current = state.browser.auto_refresh_seconds as i64;
+    let next = current
+        .saturating_add(delta_seconds)
+        .clamp(AUTO_REFRESH_MIN_SECS as i64, AUTO_REFRESH_MAX_SECS as i64) as u64;
+    if state.browser.auto_refresh_seconds == next {
+        return false;
+    }
+    state.browser.auto_refresh_seconds = next;
+    state.prefs.refresh.interval_seconds = next;
+    true
+}
+
+fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let updated = format_browser_updated_epoch(now, state.prefs.browser.relative_updated);
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.updated = updated.clone();
+            if let Some(raw_thread) = row.raw.get_mut("thread") {
+                raw_thread["updatedAt"] = json!(now);
+            } else {
+                row.raw["updatedAt"] = json!(now);
+            }
+        }
+    }
+}
+
+fn set_browser_thread_status(state: &mut TuiState, thread_id: &str, status: &str) {
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.set_status(status);
+        }
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.status = status.to_string();
+    }
+}
+
+fn apply_thread_load_status(state: &mut TuiState, thread_id: &str, status: &Value) {
+    let thread = &status["thread"];
+    let lifecycle = thread_status_label(thread);
+    let title = thread["name"]
+        .as_str()
+        .or_else(|| thread["preview"].as_str())
+        .map(str::to_string);
+    let cwd = thread["cwd"].as_str().map(str::to_string);
+    let updated = thread["updatedAt"].as_i64().map(|updated_at| {
+        format_browser_updated_epoch(updated_at, state.prefs.browser.relative_updated)
+    });
+    for row in &mut state.browser.rows {
+        if row.id != thread_id {
+            continue;
+        }
+        if let Some(title) = &title {
+            row.title = title.clone();
+        }
+        if let Some(cwd) = &cwd {
+            row.cwd = cwd.clone();
+        }
+        if let Some(updated) = &updated {
+            row.updated = updated.clone();
+        }
+        if !thread.is_null() {
+            if row.raw.get("thread").is_some() {
+                row.raw["thread"] = thread.clone();
+            } else {
+                row.raw = thread.clone();
+            }
+        }
+        row.set_status(lifecycle.clone());
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        if let Some(title) = title {
+            detail.title = title;
+        }
+        detail.status = lifecycle;
+        detail.active_turn_id = status["activeTurnId"].as_str().map(str::to_string);
+    }
+}
+
+fn reset_preview_for_thread(state: &mut TuiState, thread_id: &str) {
+    if state.browser.preview.thread_id.as_deref() == Some(thread_id) {
+        state.browser.preview = Default::default();
+    }
+}
+
+fn set_thread_name_in_state(state: &mut TuiState, thread_id: &str, name: &str, thread: &Value) {
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.title = name.to_string();
+            if !thread.is_null() {
+                if let Some(raw_thread) = row.raw.get_mut("thread") {
+                    raw_thread["name"] = json!(name);
+                } else {
+                    row.raw["name"] = json!(name);
+                }
+            }
+        }
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.title = name.to_string();
+    }
+}
+
+fn apply_archive_change(state: &mut TuiState, thread_id: &str, archived: bool, thread: &Value) {
+    let status = if archived {
+        "archived".to_string()
+    } else {
+        thread_status_label(thread)
+    };
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.status = status.clone();
+            if !thread.is_null() {
+                row.raw = thread.clone();
+            }
+        }
+    }
+    if state.browser.archived != archived {
+        state.browser.rows.retain(|row| row.id != thread_id);
+        state.browser.selected = state
+            .browser
+            .selected
+            .min(state.browser.rows.len().saturating_sub(1));
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.status = status;
+    }
+}
+
+fn copy_active_thread_id(state: &mut TuiState) -> Result<()> {
+    let Some(thread_id) = active_thread_id(state) else {
+        state.set_notice("no thread selected");
+        return Ok(());
+    };
+    write_osc52_clipboard(&thread_id)?;
+    state.set_notice(format!("copied {thread_id}"));
+    Ok(())
+}
+
+fn write_osc52_clipboard(text: &str) -> Result<()> {
+    let sequence = osc52_clipboard_sequence(text);
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(sequence.as_bytes())
+        .context("failed to write OSC 52 clipboard sequence")?;
+    stdout
+        .flush()
+        .context("failed to flush OSC 52 clipboard sequence")
+}
+
+fn osc52_clipboard_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn normalize_detail_turns_for_display(output: &mut Value) {
+    if let Some(turns) = output["turns"]["data"].as_array_mut() {
+        turns.reverse();
+    }
+}
+
+fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> ThreadRow {
+    let thread = match source {
+        BrowserSource::List => &item,
+        BrowserSource::Search => item.get("thread").unwrap_or(&item),
+    };
+    let id = thread["id"].as_str().unwrap_or("").to_string();
+    let title = thread["name"]
+        .as_str()
+        .or_else(|| thread["preview"].as_str())
+        .unwrap_or(&id)
+        .to_string();
+    let status = thread_status_label(thread);
+    let updated = thread["updatedAt"]
+        .as_i64()
+        .map(|updated_at| format_browser_updated_epoch(updated_at, relative_updated))
+        .unwrap_or_default();
+    let cwd = thread["cwd"].as_str().unwrap_or("").to_string();
+    let annotation = thread["annotation"]["text"].as_str().map(str::to_string);
+    let snippet = match source {
+        BrowserSource::Search => item["snippet"].as_str().map(str::to_string),
+        BrowserSource::List => None,
+    };
+    ThreadRow {
+        id,
+        title,
+        status,
+        updated,
+        cwd,
+        annotation,
+        snippet,
+        raw: item,
+    }
+}
+
+fn thread_status_label(thread: &Value) -> String {
+    thread["status"]["type"]
+        .as_str()
+        .or_else(|| thread["status"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn detail_state(
+    output: Value,
+    status_output: Option<Value>,
+    thread_id: String,
+    epoch: u64,
+    current_cursor: Option<String>,
+) -> DetailState {
+    let thread = &output["thread"];
+    let title = thread["name"]
+        .as_str()
+        .or_else(|| thread["preview"].as_str())
+        .unwrap_or(&thread_id)
+        .to_string();
+    let status = thread["status"]["type"]
+        .as_str()
+        .or_else(|| thread["status"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let annotation = thread["annotation"]["text"].as_str().map(str::to_string);
+    let width = 100;
+    let mut messages = Vec::new();
+    for turn in output["turns"]["data"].as_array().unwrap_or(&Vec::new()) {
+        let turn_id = turn["id"].as_str().map(str::to_string);
+        let timestamp = turn["startedAt"]
+            .as_i64()
+            .or_else(|| turn["completedAt"].as_i64())
+            .map(format_epoch);
+        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
+            match item["type"].as_str() {
+                Some("userMessage") => {
+                    let text = item["content"]
+                        .as_array()
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .filter_map(|input| input["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    messages.push(message_block(
+                        turn_id.clone(),
+                        item["id"].as_str().map(str::to_string),
+                        "user",
+                        timestamp.clone(),
+                        &text,
+                        width,
+                    ));
+                }
+                Some("agentMessage") => {
+                    messages.push(message_block(
+                        turn_id.clone(),
+                        item["id"].as_str().map(str::to_string),
+                        "assistant",
+                        timestamp.clone(),
+                        item["text"].as_str().unwrap_or(""),
+                        width,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    DetailState {
+        thread_id,
+        title,
+        status,
+        annotation,
+        messages,
+        scroll: 0,
+        search_query: String::new(),
+        matches: Vec::new(),
+        match_index: 0,
+        next_cursor: output["turns"]["nextCursor"].as_str().map(str::to_string),
+        backwards_cursor: output["turns"]["backwardsCursor"]
+            .as_str()
+            .map(str::to_string),
+        current_cursor,
+        active_turn_id: status_output
+            .as_ref()
+            .and_then(|value| value["activeTurnId"].as_str())
+            .map(str::to_string),
+        loading: false,
+        epoch,
+        last_refresh_at: Some(std::time::Instant::now()),
+        viewport_height: None,
+        viewport_width: None,
+        last_error: None,
+    }
+}
+
+fn message_block(
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    role: &str,
+    timestamp: Option<String>,
+    text: &str,
+    width: usize,
+) -> MessageBlock {
+    MessageBlock {
+        turn_id,
+        item_id,
+        role: role.to_string(),
+        timestamp,
+        lines: markdown_lines(text, width),
+        is_match: false,
+    }
+}
+
+fn markdown_lines(text: &str, width: usize) -> Vec<MessageLine> {
+    let mut lines = Vec::new();
+    if text.is_empty() {
+        lines.push(MessageLine {
+            kind: MessageLineKind::Text,
+            text: String::new(),
+            spans: Vec::new(),
+        });
+        return lines;
+    }
+    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH);
+    let mut kind = MessageLineKind::Text;
+    let mut buffer = String::new();
+    let mut list_depth = 0usize;
+    let mut item_open = false;
+    let mut code_language: Option<String> = None;
+
+    for event in parser {
+        match event {
+            MarkdownEvent::Start(Tag::Heading { .. }) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                kind = MessageLineKind::Heading;
+            }
+            MarkdownEvent::End(TagEnd::Heading(_)) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                kind = MessageLineKind::Text;
+            }
+            MarkdownEvent::Start(Tag::BlockQuote(_)) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                kind = MessageLineKind::Quote;
+            }
+            MarkdownEvent::End(TagEnd::BlockQuote(_)) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                kind = MessageLineKind::Text;
+            }
+            MarkdownEvent::Start(Tag::CodeBlock(block_kind)) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                let label = match block_kind {
+                    CodeBlockKind::Fenced(info) if !info.trim().is_empty() => {
+                        code_language = Some(info.trim().to_string());
+                        format!("code {}", info.trim())
+                    }
+                    _ => "code".to_string(),
+                };
+                lines.push(MessageLine {
+                    kind: MessageLineKind::Code,
+                    text: label,
+                    spans: Vec::new(),
+                });
+                kind = MessageLineKind::Code;
+            }
+            MarkdownEvent::End(TagEnd::CodeBlock) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                code_language = None;
+                kind = MessageLineKind::Text;
+            }
+            MarkdownEvent::Start(Tag::List(_)) => {
+                list_depth += 1;
+            }
+            MarkdownEvent::End(TagEnd::List(_)) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                list_depth = list_depth.saturating_sub(1);
+            }
+            MarkdownEvent::Start(Tag::Item) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                if list_depth > 0 {
+                    buffer.push_str("- ");
+                }
+                item_open = true;
+            }
+            MarkdownEvent::End(TagEnd::Item) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                item_open = false;
+            }
+            MarkdownEvent::Text(value) | MarkdownEvent::Code(value) => {
+                buffer.push_str(&value);
+            }
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                if item_open && list_depth > 0 {
+                    buffer.push_str("  ");
+                }
+            }
+            MarkdownEvent::End(TagEnd::Paragraph) => {
+                flush_markdown_buffer(
+                    &mut lines,
+                    &mut buffer,
+                    kind,
+                    width,
+                    code_language.as_deref(),
+                );
+                if list_depth == 0 {
+                    push_blank_line(&mut lines, kind);
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_markdown_buffer(
+        &mut lines,
+        &mut buffer,
+        kind,
+        width,
+        code_language.as_deref(),
+    );
+    if lines.is_empty() {
+        lines.push(MessageLine {
+            kind: MessageLineKind::Text,
+            text: String::new(),
+            spans: Vec::new(),
+        });
+    }
+    while lines.len() > 1 && lines.last().is_some_and(|line| line.text.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+fn flush_markdown_buffer(
+    lines: &mut Vec<MessageLine>,
+    buffer: &mut String,
+    kind: MessageLineKind,
+    width: usize,
+    code_language: Option<&str>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    if kind == MessageLineKind::Code {
+        flush_code_buffer(lines, buffer, width, code_language);
+        return;
+    }
+    for raw_line in buffer.lines() {
+        if raw_line.is_empty() {
+            push_blank_line(lines, kind);
+            continue;
+        }
+        for wrapped in textwrap::wrap(raw_line, width) {
+            lines.push(MessageLine {
+                kind,
+                text: wrapped.to_string(),
+                spans: Vec::new(),
+            });
+        }
+    }
+    buffer.clear();
+}
+
+fn flush_code_buffer(
+    lines: &mut Vec<MessageLine>,
+    buffer: &mut String,
+    width: usize,
+    code_language: Option<&str>,
+) {
+    if let Some(highlighted) = highlighted_code_lines(code_language, buffer) {
+        for spans in highlighted {
+            let text = spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            lines.push(MessageLine {
+                kind: MessageLineKind::Code,
+                text,
+                spans,
+            });
+        }
+        buffer.clear();
+        return;
+    }
+    for raw_line in buffer.lines() {
+        if raw_line.is_empty() {
+            push_blank_line(lines, MessageLineKind::Code);
+            continue;
+        }
+        for wrapped in textwrap::wrap(raw_line, width) {
+            lines.push(MessageLine {
+                kind: MessageLineKind::Code,
+                text: wrapped.to_string(),
+                spans: Vec::new(),
+            });
+        }
+    }
+    buffer.clear();
+}
+
+fn push_blank_line(lines: &mut Vec<MessageLine>, kind: MessageLineKind) {
+    if lines.last().is_some_and(|line| line.text.is_empty()) {
+        return;
+    }
+    lines.push(MessageLine {
+        kind,
+        text: String::new(),
+        spans: Vec::new(),
+    });
+}
+
+#[cfg(feature = "tui-syntax-highlighting")]
+fn highlighted_code_lines(language: Option<&str>, code: &str) -> Option<Vec<Vec<MessageSpan>>> {
+    highlight::highlight_code_lines(language, code)
+}
+
+#[cfg(not(feature = "tui-syntax-highlighting"))]
+fn highlighted_code_lines(_language: Option<&str>, _code: &str) -> Option<Vec<Vec<MessageSpan>>> {
+    None
+}
+
+fn filter_search_cwd(output: &mut Value, cwd: &str) {
+    let Some(data) = output["data"].as_array_mut() else {
+        return;
+    };
+    data.retain(|item| item["thread"]["cwd"].as_str() == Some(cwd));
+}
+
+fn format_epoch(value: i64) -> String {
+    chrono::DateTime::from_timestamp(value, 0)
+        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn format_current_epoch() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_epoch(now)
+}
+
+fn format_browser_updated_epoch(value: i64, relative: bool) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_browser_updated_epoch_at(value, now, relative)
+}
+
+fn format_browser_updated_epoch_at(value: i64, now: i64, relative: bool) -> String {
+    if !relative || value > now {
+        return format_epoch(value);
+    }
+    let age = now.saturating_sub(value);
+    if age < 60 {
+        return format!("{} ago", plural_duration(age, "second"));
+    }
+    if age < 60 * 60 {
+        return format!("{} ago", plural_duration(age / 60, "minute"));
+    }
+    if age < 24 * 60 * 60 {
+        return format!("{} ago", plural_duration(age / (60 * 60), "hour"));
+    }
+    let days = age / (24 * 60 * 60);
+    let hours = (age % (24 * 60 * 60)) / (60 * 60);
+    if hours == 0 {
+        format!("{} ago", plural_duration(days, "day"))
+    } else {
+        format!(
+            "{}, {} ago",
+            plural_duration(days, "day"),
+            plural_duration(hours, "hour")
+        )
+    }
+}
+
+fn plural_duration(value: i64, unit: &str) -> String {
+    if value == 1 {
+        format!("{value} {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::tui::prefs::TuiPrefs;
+
+    fn stream_event(event: Value) -> AppEvent {
+        AppEvent::StreamEvent {
+            stream_id: None,
+            event,
+        }
+    }
+
+    fn stream_event_for(stream_id: u64, event: Value) -> AppEvent {
+        AppEvent::StreamEvent {
+            stream_id: Some(stream_id),
+            event,
+        }
+    }
+
+    fn stream_finished(
+        stream_id: u64,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        status: StreamStatus,
+    ) -> AppEvent {
+        AppEvent::StreamFinished {
+            stream_id,
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.map(str::to_string),
+            status,
+        }
+    }
+
+    fn stream_failed(
+        stream_id: u64,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        error: &str,
+    ) -> AppEvent {
+        AppEvent::StreamFailed {
+            stream_id: Some(stream_id),
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.map(str::to_string),
+            error: error.to_string(),
+        }
+    }
+
+    #[test]
+    fn search_clearing_switches_back_to_list_mode() {
+        let mut state = TuiState::new(TuiInit {
+            query: Some("abc".to_string()),
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        assert_eq!(state.browser.source, BrowserSource::Search);
+        state.update_query(String::new());
+        assert_eq!(state.browser.source, BrowserSource::List);
+    }
+
+    #[test]
+    fn stale_browser_results_are_ignored() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.epoch = 2;
+        state.set_browser_rows(
+            1,
+            vec![ThreadRow {
+                id: "old".to_string(),
+                title: "old".to_string(),
+                status: String::new(),
+                updated: String::new(),
+                cwd: String::new(),
+                annotation: None,
+                snippet: None,
+                raw: serde_json::json!({}),
+            }],
+            None,
+            None,
+            None,
+        );
+        assert!(state.browser.rows.is_empty());
+    }
+
+    #[test]
+    fn notices_clear_after_expiry() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        state.set_notice("copied thread-1");
+        assert_eq!(
+            state.notice.as_ref().map(|notice| notice.message.as_str()),
+            Some("copied thread-1")
+        );
+        state.notice.as_mut().expect("notice").expires_at =
+            std::time::Instant::now() - Duration::from_secs(1);
+
+        state.clear_expired_notice();
+
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn browser_rows_store_current_cursor_for_refresh() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.epoch = 1;
+        state.set_browser_rows(
+            1,
+            vec![ThreadRow {
+                id: "current".to_string(),
+                title: "current".to_string(),
+                status: String::new(),
+                updated: String::new(),
+                cwd: String::new(),
+                annotation: None,
+                snippet: None,
+                raw: serde_json::json!({}),
+            }],
+            Some("older".to_string()),
+            Some("newer".to_string()),
+            Some("page-2".to_string()),
+        );
+        assert_eq!(state.browser.current_cursor.as_deref(), Some("page-2"));
+        assert_eq!(state.browser.next_cursor.as_deref(), Some("older"));
+        assert_eq!(state.browser.backwards_cursor.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn browser_refresh_preserves_locally_known_status_over_not_loaded() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+        set_browser_thread_status(&mut state, "t1", "idle");
+        state.browser.epoch = 1;
+
+        state.set_browser_rows(
+            1,
+            vec![test_thread_row("t1", "notLoaded")],
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn browser_updated_time_is_toggleable_and_relative_for_all_past_times() {
+        let now = 1_700_000_000;
+
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 30, now, true),
+            "30 seconds ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 5 * 60, now, true),
+            "5 minutes ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 2 * 60 * 60, now, true),
+            "2 hours ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 24 * 60 * 60, now, true),
+            "1 day ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - (3 * 24 * 60 * 60 + 4 * 60 * 60), now, true),
+            "3 days, 4 hours ago"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now - 30, now, false),
+            "2023-11-14 22:12"
+        );
+        assert_eq!(
+            format_browser_updated_epoch_at(now + 60, now, true),
+            "2023-11-14 22:14"
+        );
+    }
+
+    #[test]
+    fn auto_refresh_interval_adjustment_clamps_and_updates_prefs() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        adjust_auto_refresh_interval(&mut state, -(AUTO_REFRESH_MAX_SECS as i64));
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MIN_SECS);
+        assert_eq!(state.prefs.refresh.interval_seconds, AUTO_REFRESH_MIN_SECS);
+
+        adjust_auto_refresh_interval(&mut state, AUTO_REFRESH_MAX_SECS as i64);
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MAX_SECS);
+        assert_eq!(state.prefs.refresh.interval_seconds, AUTO_REFRESH_MAX_SECS);
+    }
+
+    #[test]
+    fn tui_init_clamps_loaded_auto_refresh_interval() {
+        let mut prefs = TuiPrefs::default();
+        prefs.refresh.interval_seconds = 1;
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MIN_SECS);
+
+        let mut prefs = TuiPrefs::default();
+        prefs.refresh.interval_seconds = AUTO_REFRESH_MAX_SECS + 1;
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MAX_SECS);
+    }
+
+    #[test]
+    fn browser_rows_group_running_threads_first_and_preserve_selection() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.epoch = 1;
+        state.browser.rows = vec![
+            test_thread_row("idle-1", "idle"),
+            test_thread_row("active-1", "active"),
+            test_thread_row("idle-2", "idle"),
+        ];
+        state.browser.selected = 2;
+
+        state.set_browser_rows(
+            1,
+            vec![
+                test_thread_row("idle-1", "idle"),
+                test_thread_row("active-1", "active"),
+                test_thread_row("idle-2", "idle"),
+            ],
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            state
+                .browser
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active-1", "idle-1", "idle-2"]
+        );
+        assert_eq!(state.selected_thread_id(), Some("idle-2"));
+    }
+
+    #[test]
+    fn detail_state_builds_message_blocks() {
+        let detail = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "startedAt": 1780680000, "items": [
+                        {"id": "item-user", "type": "userMessage", "content": [{"text": "hello"}]},
+                        {"id": "item-agent", "type": "agentMessage", "text": "# Summary\n> note\n```rust\nfn main() {}\n```"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].role, "user");
+        assert_eq!(detail.messages[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("item-user"));
+        assert_eq!(detail.messages[0].lines[0].text, "hello");
+        assert_eq!(detail.messages[1].role, "assistant");
+        assert_eq!(detail.messages[1].lines.len(), 5);
+        assert_eq!(detail.messages[1].lines[0].kind, MessageLineKind::Heading);
+        assert_eq!(detail.messages[1].lines[1].kind, MessageLineKind::Quote);
+        assert_eq!(detail.messages[1].lines[2].text, "");
+        assert_eq!(detail.messages[1].lines[3].kind, MessageLineKind::Code);
+        assert_eq!(detail.messages[1].lines[4].kind, MessageLineKind::Code);
+        assert_eq!(detail.messages[1].lines[3].text, "code rust");
+    }
+
+    #[test]
+    fn detail_output_normalizes_descending_turns_for_display() {
+        let mut output = serde_json::json!({
+            "thread": {"id": "t1"},
+            "turns": {"data": [
+                {"id": "new"},
+                {"id": "middle"},
+                {"id": "old"}
+            ]}
+        });
+
+        normalize_detail_turns_for_display(&mut output);
+
+        let ids = output["turns"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|turn| turn["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["old", "middle", "new"]);
+    }
+
+    #[test]
+    fn preview_detail_state_keeps_recent_user_and_assistant_messages() {
+        let detail = detail_state(
+            serde_json::json!({
+            "thread": {"id": "t1"},
+            "turns": {"data": [
+                {"id": "old", "items": [
+                    {"id": "u1", "type": "userMessage", "content": [{"text": "older user"}]},
+                    {"id": "a1", "type": "agentMessage", "text": "older assistant"}
+                ]},
+                {"id": "new", "items": [
+                    {"id": "u2", "type": "userMessage", "content": [{"text": "latest user"}]},
+                    {"id": "a2", "type": "agentMessage", "text": "latest\nassistant"}
+                ]}
+            ]}
+            }),
+            None,
+            "t1".to_string(),
+            0,
+            None,
+        );
+
+        let roles = detail
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(detail.messages[2].lines[0].text, "latest user");
+        assert_eq!(detail.messages[3].lines[0].text, "latest");
+        assert_eq!(detail.messages[3].lines[1].text, "assistant");
+    }
+
+    #[tokio::test]
+    async fn selected_preview_schedules_and_ignores_stale_results() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        let (preview_tx, mut preview_rx) = mpsc::channel(1);
+
+        schedule_selected_preview_if_needed(&mut state, &preview_tx)
+            .await
+            .unwrap();
+
+        let request = preview_rx.recv().await.expect("preview request");
+        assert_eq!(request.thread_id, "t1");
+        assert_eq!(request.epoch, 1);
+        assert!(state.browser.preview.loading);
+
+        handle_app_event(
+            AppEvent::PreviewLoaded {
+                epoch: 0,
+                thread_id: "t1".to_string(),
+                messages: vec![message_block(None, None, "assistant", None, "stale", 100)],
+            },
+            &mut state,
+        );
+        assert!(state.browser.preview.messages.is_empty());
+
+        handle_app_event(
+            AppEvent::PreviewLoaded {
+                epoch: 1,
+                thread_id: "t1".to_string(),
+                messages: vec![message_block(None, None, "assistant", None, "fresh", 100)],
+            },
+            &mut state,
+        );
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(state.browser.preview.messages[0].lines[0].text, "fresh");
+    }
+
+    #[test]
+    fn markdown_lines_preserve_paragraph_and_code_gaps() {
+        let lines = markdown_lines(
+            "first paragraph\n\nsecond paragraph\n\n```text\none\n\ntwo\n```",
+            100,
+        );
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "first paragraph",
+                "",
+                "second paragraph",
+                "",
+                "code text",
+                "one",
+                "",
+                "two"
+            ]
+        );
+    }
+
+    #[cfg(feature = "tui-syntax-highlighting")]
+    #[test]
+    fn markdown_code_blocks_include_highlight_spans_when_feature_enabled() {
+        let lines = markdown_lines("```rust\nfn main() {}\n```", 100);
+        assert_eq!(lines[0].text, "code rust");
+        assert_eq!(lines[1].kind, MessageLineKind::Code);
+        assert_eq!(lines[1].text, "fn main() {}");
+        assert!(!lines[1].spans.is_empty());
+    }
+
+    #[test]
+    fn message_search_marks_blocks_and_navigates_matches() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "first prune match"},
+                        {"id": "b", "type": "agentMessage", "text": "no hit"},
+                        {"id": "c", "type": "agentMessage", "text": "second prune match"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.update_message_search("prune".to_string());
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.matches, vec![0, 2]);
+        assert_eq!(detail.match_index, 0);
+        assert_eq!(detail.scroll, 0);
+        assert!(detail.messages[0].is_match);
+        assert!(!detail.messages[1].is_match);
+
+        state.next_message_match();
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.match_index, 1);
+        assert_eq!(detail.scroll as usize, detail.message_scroll_offset(2));
+
+        state.previous_message_match();
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.match_index, 0);
+    }
+
+    #[test]
+    fn detail_pages_append_and_prepend_without_duplicates() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": "older", "backwardsCursor": "newer", "data": [
+                    {"id": "turn-2", "items": [
+                        {"id": "middle", "type": "agentMessage", "text": "middle"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        let older = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": "newer", "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "old", "type": "agentMessage", "text": "old"}
+                    ]},
+                    {"id": "turn-2", "items": [
+                        {"id": "middle", "type": "agentMessage", "text": "middle"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            Some("older".to_string()),
+        );
+        state.extend_detail_older(1, older);
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("old"));
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("middle"));
+
+        let newer = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": "older", "backwardsCursor": null, "data": [
+                    {"id": "turn-2", "items": [
+                        {"id": "middle", "type": "agentMessage", "text": "middle"}
+                    ]},
+                    {"id": "turn-3", "items": [
+                        {"id": "new", "type": "agentMessage", "text": "new"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            Some("newer".to_string()),
+        );
+        state.extend_detail_newer(1, newer);
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 3);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("old"));
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("middle"));
+        assert_eq!(detail.messages[2].item_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn stream_delta_updates_detail_transcript_and_search() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        append_detail_message(
+            &mut state,
+            "t1",
+            None,
+            "user",
+            Some("2026-06-05 09:00".to_string()),
+            "please stream",
+        );
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "delta",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": "first prune"
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "delta",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": " chunk"
+            })),
+            &mut state,
+        );
+
+        state.update_message_search("prune".to_string());
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(detail.messages[1].role, "assistant");
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[1].timestamp.as_deref(), Some("streaming"));
+        assert_eq!(detail.messages[1].lines[0].text, "first prune chunk");
+        assert_eq!(detail.matches, vec![1]);
+    }
+
+    #[test]
+    fn stream_deltas_for_distinct_assistant_items_render_separate_messages() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        for event in [
+            serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": "first"
+            }),
+            serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": " message"
+            }),
+            serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-2",
+                "delta": "second"
+            }),
+            serde_json::json!({
+                "type": "assistantMessage",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-2",
+                "text": "second corrected"
+            }),
+        ] {
+            handle_app_event(stream_event(event), &mut state);
+        }
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[0].lines[0].text, "first message");
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-2"));
+        assert_eq!(detail.messages[1].lines[0].text, "second corrected");
+    }
+
+    #[test]
+    fn terminal_response_adopts_provisional_stream_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": "Verification passed. I'm"
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "server": "work",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "completed",
+                "assistantResponses": [
+                    {
+                        "itemId": "assistant-1",
+                        "text": "Verification passed. I'm installing the rebuilt binary."
+                    }
+                ],
+                "finalAssistantText": "Verification passed. I'm installing the rebuilt binary."
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_ne!(detail.messages[0].timestamp.as_deref(), Some("streaming"));
+        assert!(detail.messages[0].timestamp.is_some());
+        assert_eq!(
+            detail.messages[0].lines[0].text,
+            "Verification passed. I'm installing the rebuilt binary."
+        );
+    }
+
+    #[test]
+    fn terminal_response_does_not_leave_punctuation_fragment() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": "."
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "server": "work",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "completed",
+                "assistantResponses": [
+                    {"itemId": "assistant-1", "text": "Done."}
+                ],
+                "finalAssistantText": "Done."
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_ne!(detail.messages[0].timestamp.as_deref(), Some("streaming"));
+        assert!(detail.messages[0].timestamp.is_some());
+        assert_eq!(detail.messages[0].lines[0].text, "Done.");
+    }
+
+    #[test]
+    fn streaming_updates_follow_bottom_when_detail_was_at_bottom() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "userMessage", "content": [{"type": "input_text", "text": "one\ntwo\nthree\nfour"}]}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let detail = state.detail.as_mut().expect("detail");
+        detail.set_viewport_size(4, 100);
+        detail.scroll = detail.bottom_scroll_position();
+        let before = detail.scroll;
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "delta",
+                "threadId": "t1",
+                "turnId": "turn-2",
+                "delta": "assistant\nresponse\nkeeps\ngrowing"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.scroll, detail.bottom_scroll_position());
+        assert!(detail.scroll > before);
+    }
+
+    #[test]
+    fn stream_finish_and_detach_update_local_state() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+        state.stream = Some(StreamState::new_with_id(
+            0,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        detach_stream(&mut state);
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.status, StreamStatus::Detached);
+        assert!(stream.detached);
+        assert!(state.stream_control.is_none());
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+
+        handle_app_event(
+            stream_finished(0, "t1", Some("turn-1"), StreamStatus::Completed),
+            &mut state,
+        );
+        assert_eq!(
+            state.stream.as_ref().expect("stream").status,
+            StreamStatus::Completed
+        );
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn stale_stream_events_do_not_poison_next_browser_send() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle"), test_thread_row("t2", "idle")];
+        let first_stream_id = state.allocate_stream_id();
+        state.stream = Some(StreamState::new_with_id(
+            first_stream_id,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
+
+        handle_app_event(
+            stream_finished(
+                first_stream_id,
+                "t1",
+                Some("turn-1"),
+                StreamStatus::Completed,
+            ),
+            &mut state,
+        );
+        state.move_selection(1);
+        detach_stream_if_browser_selection_changed(&mut state, Some("t1".to_string()));
+        assert!(state.stream.is_none());
+
+        state.move_selection(-1);
+        let second_stream_id = state.allocate_stream_id();
+        state.stream = Some(StreamState::new_with_id(
+            second_stream_id,
+            "t1".to_string(),
+            Some("turn-2".to_string()),
+            StreamStatus::Starting,
+            false,
+        ));
+        handle_app_event(
+            stream_failed(first_stream_id, "t1", Some("turn-1"), "late old failure"),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event_for(
+                first_stream_id,
+                serde_json::json!({
+                    "type": "delta",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "delta": "stale"
+                }),
+            ),
+            &mut state,
+        );
+
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.id, second_stream_id);
+        assert_eq!(stream.status, StreamStatus::Starting);
+        assert!(stream.assistant_items.is_empty());
+    }
+
+    #[test]
+    fn unlink_detail_session_detaches_and_clears_local_thread_state() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        unlink_detail_session(&mut state);
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.detail.is_none());
+        assert!(state.stream.is_none());
+        assert!(state.stream_control.is_none());
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+    }
+
+    #[test]
+    fn detail_follow_refresh_tracks_open_idle_detail_only() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.detail.as_mut().unwrap().last_refresh_at =
+            Some(std::time::Instant::now() - Duration::from_secs(DETAIL_FOLLOW_REFRESH_SECS));
+
+        assert_eq!(detail_follow_refresh_thread(&state).as_deref(), Some("t1"));
+
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        assert!(detail_follow_refresh_thread(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn detail_refresh_preserves_existing_transcript_while_loading() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "existing"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            3,
+            Some("current".to_string()),
+        ));
+        state.detail.as_mut().unwrap().scroll = 4;
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+
+        schedule_detail_refresh(&mut state, &fetch_tx, "t1".to_string())
+            .await
+            .unwrap();
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert!(detail.loading);
+        assert_eq!(detail.epoch, 4);
+        assert_eq!(detail.scroll, 4);
+        assert_eq!(detail.messages[0].lines[0].text, "existing");
+
+        let request = fetch_rx.recv().await.expect("request");
+        let FetchRequest::Detail {
+            epoch,
+            thread_id,
+            cursor,
+            page_direction,
+        } = request
+        else {
+            panic!("expected detail request");
+        };
+        assert_eq!(epoch, 4);
+        assert_eq!(thread_id, "t1");
+        assert_eq!(cursor.as_deref(), Some("current"));
+        assert_eq!(page_direction, DetailPageDirection::Replace);
+    }
+
+    #[test]
+    fn initial_detail_load_scrolls_to_bottom_after_loaded() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(DetailState {
+            thread_id: "t1".to_string(),
+            title: "t1".to_string(),
+            status: "loading".to_string(),
+            annotation: None,
+            messages: Vec::new(),
+            scroll: u16::MAX,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: None,
+            active_turn_id: None,
+            loading: true,
+            epoch: 1,
+            last_refresh_at: None,
+            viewport_height: None,
+            viewport_width: None,
+            last_error: None,
+        });
+        let loaded = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+        state.detail.as_mut().unwrap().set_viewport_size(4, 100);
+
+        state.replace_detail(1, loaded);
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.scroll as usize, detail.transcript_line_count() - 4);
+        let bottom = detail.scroll;
+        scroll_detail(&mut state, -1);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, bottom - 1);
+    }
+
+    #[test]
+    fn detail_refresh_follows_bottom_when_new_messages_arrive() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let detail = state.detail.as_mut().expect("detail");
+        detail.set_viewport_size(4, 100);
+        detail.scroll = detail.bottom_scroll_position();
+        let before = detail.scroll;
+        let refreshed = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"},
+                        {"id": "b", "type": "agentMessage", "text": "five\nsix\nseven\neight"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+
+        state.replace_detail(1, refreshed);
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.scroll, detail.bottom_scroll_position());
+        assert!(detail.scroll > before);
+    }
+
+    #[test]
+    fn detail_refresh_preserves_compose_overlay() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Compose(ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "t1".to_string(),
+            },
+            text: "draft in progress".to_string(),
+            send_mode: SendMode::Stream,
+            return_to_detail: true,
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let refreshed = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "new update"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+
+        state.replace_detail(1, refreshed);
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose overlay");
+        };
+        assert_eq!(compose.text, "draft in progress");
+        assert_eq!(state.detail.as_ref().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn detail_refresh_preserves_annotation_overlay() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::AnnotationInput {
+            thread_id: "t1".to_string(),
+            draft: "annotation draft".to_string(),
+            return_to_detail: true,
+        };
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let refreshed = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "new update"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+
+        state.replace_detail(1, refreshed);
+
+        let Mode::AnnotationInput { draft, .. } = &state.mode else {
+            panic!("expected annotation overlay");
+        };
+        assert_eq!(draft, "annotation draft");
+        assert_eq!(state.detail.as_ref().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn detail_enter_opens_same_message_action_as_m() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        open_message_action(&mut state, "t1".to_string());
+
+        assert!(matches!(
+            state.mode,
+            Mode::ActiveTurnPrompt {
+                ref thread_id,
+                ref turn_id
+            } if thread_id == "t1" && turn_id == "turn-1"
+        ));
+
+        state.mode = Mode::Detail;
+        state.detail.as_mut().unwrap().active_turn_id = None;
+        open_message_action(&mut state, "t1".to_string());
+
+        assert!(matches!(
+            state.mode,
+            Mode::Compose(ComposeState {
+                target: ComposeTarget::NewTurn { ref thread_id },
+                send_mode: SendMode::Stream,
+                return_to_detail: true,
+                ..
+            }) if thread_id == "t1"
+        ));
+    }
+
+    #[test]
+    fn attached_resume_snapshot_seeds_active_turn_text_for_future_deltas() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "attached",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "attached",
+                "thread": {
+                    "id": "t1",
+                    "name": "Thread",
+                    "status": {"type": "active"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "completedAt": null,
+                            "items": [
+                                {
+                                    "id": "user-1",
+                                    "type": "userMessage",
+                                    "content": [{"type": "input_text", "text": "continue"}]
+                                },
+                                {
+                                    "id": "assistant-1",
+                                    "type": "agentMessage",
+                                    "text": "Already streamed"
+                                }
+                            ],
+                            "itemsView": "full"
+                        }
+                    ]
+                }
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[1].lines[0].text, "Already streamed");
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": " plus new"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(
+            detail.messages[1].lines[0].text,
+            "Already streamed plus new"
+        );
+    }
+
+    #[test]
+    fn anonymous_delta_after_snapshot_updates_existing_assistant_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "attached",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "attached",
+                "thread": {
+                    "id": "t1",
+                    "name": "Thread",
+                    "status": {"type": "active"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "items": [
+                                {
+                                    "id": "assistant-1",
+                                    "type": "agentMessage",
+                                    "text": "Already streamed"
+                                }
+                            ],
+                            "itemsView": "full"
+                        }
+                    ]
+                }
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": " plus anonymous"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(
+            detail.messages[0].lines[0].text,
+            "Already streamed plus anonymous"
+        );
+    }
+
+    #[test]
+    fn shutdown_signal_detaches_stream_and_quits() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        handle_app_event(AppEvent::ShutdownSignal, &mut state);
+        assert!(state.should_quit);
+        assert!(state.stream.as_ref().expect("stream").detached);
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+    }
+
+    #[test]
+    fn annotation_state_updates_browser_and_detail() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows.push(ThreadRow {
+            id: "t1".to_string(),
+            title: "Thread".to_string(),
+            status: String::new(),
+            updated: String::new(),
+            cwd: String::new(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        set_annotation_in_state(&mut state, "t1", Some("note".to_string()));
+        assert_eq!(state.browser.rows[0].annotation.as_deref(), Some("note"));
+        assert_eq!(
+            state.detail.as_ref().unwrap().annotation.as_deref(),
+            Some("note")
+        );
+        set_annotation_in_state(&mut state, "t1", None);
+        assert!(state.browser.rows[0].annotation.is_none());
+        assert!(state.detail.as_ref().unwrap().annotation.is_none());
+    }
+
+    #[test]
+    fn annotation_input_ignores_control_s_instead_of_inserting_text() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_annotation_input(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &target,
+            &mut state,
+            "t1".to_string(),
+            "note".to_string(),
+            false,
+        )
+        .unwrap();
+
+        let Mode::AnnotationInput { draft, .. } = &state.mode else {
+            panic!("expected annotation input");
+        };
+        assert_eq!(draft, "note");
+    }
+
+    #[test]
+    fn rename_state_updates_browser_and_detail_title() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Old", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        set_thread_name_in_state(
+            &mut state,
+            "t1",
+            "New name",
+            &serde_json::json!({"id": "t1", "name": "New name"}),
+        );
+
+        assert_eq!(state.browser.rows[0].title, "New name");
+        assert_eq!(state.browser.rows[0].raw["name"], "New name");
+        assert_eq!(state.detail.as_ref().unwrap().title, "New name");
+        assert_eq!(active_thread_title(&state).as_deref(), Some("New name"));
+    }
+
+    #[test]
+    fn rename_input_rejects_empty_names() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_rename_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &target,
+            &mut state,
+            "t1".to_string(),
+            "   ".to_string(),
+            false,
+            &app_tx,
+        )
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::RenameInput { .. }));
+        assert!(state.notice.as_ref().unwrap().message.contains("empty"));
+        assert!(app_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rename_input_ctrl_d_clears_draft_only() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_rename_input(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &target,
+            &mut state,
+            "t1".to_string(),
+            "Custom name".to_string(),
+            false,
+            &app_tx,
+        )
+        .unwrap();
+
+        let Mode::RenameInput { draft, .. } = &state.mode else {
+            panic!("expected rename input");
+        };
+        assert!(draft.is_empty());
+        assert!(app_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_clears_thread_search_and_refreshes_browser() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut state = TuiState::new(TuiInit {
+            query: Some("needle".to_string()),
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_text_input(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            "needle".to_string(),
+            ModeKind::Search,
+            |value, state| {
+                state.update_query(value);
+                Ok(InputAction::RefreshBrowser)
+            },
+            &mut state,
+            &fetch_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.browser.query.is_empty());
+        assert!(matches!(
+            fetch_rx.try_recv().unwrap(),
+            FetchRequest::Browser { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_clears_message_search_without_browser_refresh() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "needle"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.update_message_search("needle".to_string());
+
+        handle_text_input(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            "needle".to_string(),
+            ModeKind::MessageSearch,
+            |value, state| {
+                state.update_message_search(value);
+                Ok(InputAction::None)
+            },
+            &mut state,
+            &fetch_tx,
+        )
+        .await
+        .unwrap();
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert!(matches!(state.mode, Mode::Detail));
+        assert!(detail.search_query.is_empty());
+        assert!(detail.matches.is_empty());
+        assert!(fetch_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn load_shortcut_schedules_selected_browser_thread_load() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::LoadThread { thread_id } = fetch_rx.recv().await.unwrap() else {
+            panic!("expected load thread request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert!(
+            state
+                .notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("loading t1")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_shortcut_schedules_open_detail_thread_load() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "notLoaded"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::LoadThread { thread_id } = fetch_rx.recv().await.unwrap() else {
+            panic!("expected load thread request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert!(matches!(state.mode, Mode::Detail));
+    }
+
+    #[test]
+    fn thread_loaded_event_updates_visible_state_and_invalidates_preview() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+        state.browser.preview.thread_id = Some("t1".to_string());
+        state.browser.preview.messages = vec![message_block(
+            Some("turn-old".to_string()),
+            None,
+            "assistant",
+            None,
+            "old",
+            100,
+        )];
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Old", "status": {"type": "notLoaded"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            AppEvent::ThreadLoaded {
+                thread_id: "t1".to_string(),
+                status: serde_json::json!({
+                    "threadId": "t1",
+                    "thread": {
+                        "id": "t1",
+                        "name": "Loaded title",
+                        "cwd": "/tmp/repo",
+                        "updatedAt": 1_700_000_000,
+                        "status": {"type": "idle"}
+                    },
+                    "activeTurnId": null,
+                    "truncated": false
+                }),
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.browser.rows[0].title, "Loaded title");
+        assert_eq!(state.browser.rows[0].cwd, "/tmp/repo");
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
+        );
+        assert_eq!(state.detail.as_ref().unwrap().title, "Loaded title");
+        assert_eq!(state.detail.as_ref().unwrap().status, "idle");
+        assert!(state.browser.preview.thread_id.is_none());
+        assert!(state.browser.preview.messages.is_empty());
+    }
+
+    #[test]
+    fn archive_change_updates_visible_rows_and_detail_status() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle"), test_thread_row("t2", "idle")];
+        state.browser.selected = 1;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        apply_archive_change(
+            &mut state,
+            "t1",
+            true,
+            &serde_json::json!({"id": "t1", "status": {"type": "archived"}}),
+        );
+
+        assert_eq!(
+            state
+                .browser
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t2"]
+        );
+        assert_eq!(state.browser.selected, 0);
+        assert_eq!(state.detail.as_ref().unwrap().status, "archived");
+    }
+
+    #[test]
+    fn archive_toggle_direction_follows_current_archived_context() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        assert!(!active_thread_is_archived(&state));
+
+        state.browser.archived = true;
+        assert!(active_thread_is_archived(&state));
+
+        apply_archive_change(
+            &mut state,
+            "t1",
+            false,
+            &serde_json::json!({"id": "t1", "status": {"type": "idle"}}),
+        );
+        assert!(state.browser.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_shortcut_opens_confirmation_before_rpc() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmArchive {
+                ref thread_id,
+                archived: true,
+                return_to_detail: false,
+            } if thread_id == "t1"
+        ));
+        assert!(app_rx.try_recv().is_err());
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(app_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn archive_confirmation_preserves_detail_return_mode() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "archived"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmArchive {
+                ref thread_id,
+                archived: false,
+                return_to_detail: true,
+            } if thread_id == "t1"
+        ));
+    }
+
+    #[test]
+    fn mouse_wheel_moves_browser_selection() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        for index in 0..5 {
+            state.browser.rows.push(ThreadRow {
+                id: format!("t{index}"),
+                title: format!("Thread {index}"),
+                status: String::new(),
+                updated: String::new(),
+                cwd: String::new(),
+                annotation: None,
+                snippet: None,
+                raw: serde_json::json!({}),
+            });
+        }
+
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollDown), &mut state);
+        assert_eq!(state.browser.selected, 3);
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollUp), &mut state);
+        assert_eq!(state.browser.selected, 0);
+    }
+
+    #[test]
+    fn browser_selection_change_detaches_stream_for_previous_thread() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![
+            test_thread_row("t1", "active"),
+            test_thread_row("t2", "idle"),
+        ];
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+
+        state.move_selection(1);
+        detach_stream_if_browser_selection_changed(&mut state, Some("t1".to_string()));
+
+        assert!(state.stream.is_none());
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_detail_transcript() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollDown), &mut state);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 3);
+        handle_mouse_event(mouse_wheel(MouseEventKind::ScrollUp), &mut state);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn vim_goto_shortcuts_jump_browser_and_detail() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        for index in 0..4 {
+            state.browser.rows.push(ThreadRow {
+                id: format!("t{index}"),
+                title: format!("Thread {index}"),
+                status: String::new(),
+                updated: String::new(),
+                cwd: String::new(),
+                annotation: None,
+                snippet: None,
+                raw: serde_json::json!({}),
+            });
+        }
+        handle_goto_key(KeyCode::Char('G'), &mut state);
+        assert_eq!(state.browser.selected, 3);
+        handle_goto_key(KeyCode::Char('g'), &mut state);
+        assert!(state.pending_goto_top);
+        handle_goto_key(KeyCode::Char('g'), &mut state);
+        assert_eq!(state.browser.selected, 0);
+        assert!(!state.pending_goto_top);
+
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "a", "type": "agentMessage", "text": "one\ntwo\nthree\nfour"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        handle_goto_key(KeyCode::Char('G'), &mut state);
+        assert!(state.detail.as_ref().unwrap().scroll > 0);
+        handle_goto_key(KeyCode::Home, &mut state);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn osc52_clipboard_sequence_encodes_thread_id() {
+        assert_eq!(
+            osc52_clipboard_sequence("thread-1"),
+            "\x1b]52;c;dGhyZWFkLTE=\x07"
+        );
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+        assert_eq!(base64_encode(b"a"), "YQ==");
+    }
+
+    #[tokio::test]
+    async fn compose_enter_submits_and_ctrl_j_inserts_newline() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "hello".to_string(),
+                send_mode: SendMode::NoWait,
+                return_to_detail: false,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.text, "hello\n");
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "send me".to_string(),
+                send_mode: SendMode::NoWait,
+                return_to_detail: false,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_compose_origin_ignores_loaded_detail() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Browser;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "old", "name": "Old", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "old".to_string(),
+            1,
+            None,
+        ));
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "new".to_string(),
+                },
+                text: "send me".to_string(),
+                send_mode: SendMode::NoWait,
+                return_to_detail: false,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(state.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_stream_compose_sets_stream_and_preview_draft() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        state.browser.preview.thread_id = Some("t1".to_string());
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "send me".to_string(),
+                send_mode: SendMode::Stream,
+                return_to_detail: false,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert_eq!(
+            state
+                .stream
+                .as_ref()
+                .map(|stream| stream.thread_id.as_str()),
+            Some("t1")
+        );
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(state.browser.preview.messages[0].role, "user");
+        assert_eq!(state.browser.preview.messages[0].lines[0].text, "send me");
+    }
+
+    #[tokio::test]
+    async fn browser_compose_defaults_stream_and_tab_toggles_no_wait() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        open_message_action(&mut state, "t1".to_string());
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::Stream);
+        assert!(!compose.return_to_detail);
+        let compose = compose.clone();
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            compose,
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::NoWait);
+    }
+
+    #[test]
+    fn browser_send_probe_active_only_for_running_rows() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![
+            test_thread_row("idle-thread", "notLoaded"),
+            test_thread_row("active-thread", "active"),
+        ];
+        let idle_compose = ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "idle-thread".to_string(),
+            },
+            text: String::new(),
+            send_mode: SendMode::Stream,
+            return_to_detail: false,
+        };
+        assert!(!should_probe_active_turn_for_compose(
+            &state,
+            idle_compose.return_to_detail,
+            "idle-thread",
+            None
+        ));
+
+        state.stream = Some(StreamState::new_with_id(
+            1,
+            "idle-thread".to_string(),
+            Some("turn-local".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
+        assert!(active_turn_hint_for_compose(&state, "idle-thread").is_some());
+        assert!(should_probe_active_turn_for_compose(
+            &state,
+            idle_compose.return_to_detail,
+            "idle-thread",
+            active_turn_hint_for_compose(&state, "idle-thread").as_deref()
+        ));
+        state.stream = None;
+
+        state.browser.selected = 1;
+        let active_compose = ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "active-thread".to_string(),
+            },
+            text: String::new(),
+            send_mode: SendMode::Stream,
+            return_to_detail: false,
+        };
+        assert!(should_probe_active_turn_for_compose(
+            &state,
+            active_compose.return_to_detail,
+            "active-thread",
+            None
+        ));
+    }
+
+    #[test]
+    fn initial_browser_load_needs_auto_attach_only_for_empty_browser() {
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let event = AppEvent::BrowserLoaded {
+            epoch: 1,
+            rows: vec![test_thread_row("active-thread", "active")],
+            next_cursor: None,
+            backwards_cursor: None,
+        };
+        assert!(initial_browser_load_needs_auto_attach(&event, &state));
+
+        let mut loaded = state.clone();
+        loaded.browser.rows = vec![test_thread_row("active-thread", "active")];
+        assert!(!initial_browser_load_needs_auto_attach(&event, &loaded));
+    }
+
+    #[tokio::test]
+    async fn initial_active_browser_selection_auto_attaches() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("active-thread", "active")];
+
+        auto_attach_selected_browser_thread_if_active(&mut state, target, true, app_tx);
+
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.thread_id, "active-thread");
+        assert_eq!(stream.status, StreamStatus::Starting);
+        assert!(stream.attached);
+        assert!(state.stream_control.is_some());
+    }
+
+    #[test]
+    fn browser_stream_activity_touches_updated_timestamp() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![ThreadRow {
+            id: "t1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            updated: "old".to_string(),
+            cwd: String::new(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({"id": "t1", "updatedAt": 1}),
+        }];
+
+        touch_browser_thread_updated(&mut state, "t1");
+
+        assert_ne!(state.browser.rows[0].updated, "old");
+        assert!(
+            state.browser.rows[0].raw["updatedAt"]
+                .as_i64()
+                .unwrap_or_default()
+                > 1
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_compose_can_toggle_stream_mode() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        open_message_action(&mut state, "t1".to_string());
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::Stream);
+        assert!(compose.return_to_detail);
+        let compose = compose.clone();
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            compose,
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::NoWait);
+    }
+
+    #[test]
+    fn preview_toggle_updates_pref_state() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        assert!(state.prefs.browser.preview_pane);
+        state.prefs.browser.preview_pane = !state.prefs.browser.preview_pane;
+        assert!(!state.prefs.browser.preview_pane);
+    }
+
+    fn mouse_wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn test_thread_row(id: &str, status: &str) -> ThreadRow {
+        ThreadRow {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: status.to_string(),
+            updated: String::new(),
+            cwd: String::new(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }
+    }
+}
