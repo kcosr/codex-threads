@@ -28,6 +28,11 @@ pub enum Mode {
         thread_id: String,
         turn_id: String,
     },
+    ConfirmArchive {
+        thread_id: String,
+        archived: bool,
+        return_to_detail: bool,
+    },
     AnnotationInput {
         thread_id: String,
         draft: String,
@@ -602,7 +607,11 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
             ..
         })
         | Mode::ActiveTurnPrompt { .. }
-        | Mode::ConfirmInterrupt { .. } => previous_mode,
+        | Mode::ConfirmInterrupt { .. }
+        | Mode::ConfirmArchive {
+            return_to_detail: true,
+            ..
+        } => previous_mode,
         _ => Mode::Detail,
     }
 }

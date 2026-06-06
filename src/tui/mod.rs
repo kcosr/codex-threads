@@ -841,6 +841,36 @@ async fn handle_terminal_event(
             }
             return Ok(());
         }
+        Mode::ConfirmArchive {
+            thread_id,
+            archived,
+            return_to_detail,
+        } => {
+            let return_mode = if return_to_detail {
+                Mode::Detail
+            } else {
+                Mode::Browser
+            };
+            match key.code {
+                KeyCode::Esc => state.mode = return_mode,
+                KeyCode::Enter => {
+                    state.mode = return_mode;
+                    state.set_notice(format!(
+                        "{} {thread_id}...",
+                        if archived { "archiving" } else { "unarchiving" }
+                    ));
+                    spawn_archive_task(target.clone(), thread_id, archived, app_tx.clone());
+                }
+                _ => {
+                    state.mode = Mode::ConfirmArchive {
+                        thread_id,
+                        archived,
+                        return_to_detail,
+                    }
+                }
+            }
+            return Ok(());
+        }
         Mode::Help => {
             state.mode = Mode::Browser;
             return Ok(());
@@ -971,11 +1001,12 @@ async fn handle_terminal_event(
         KeyCode::Char('A') => {
             if let Some(thread_id) = active_thread_id(state) {
                 let archived = !active_thread_is_archived(state);
-                state.set_notice(format!(
-                    "{} {thread_id}...",
-                    if archived { "archiving" } else { "unarchiving" }
-                ));
-                spawn_archive_task(target.clone(), thread_id, archived, app_tx.clone());
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode = Mode::ConfirmArchive {
+                    thread_id,
+                    archived,
+                    return_to_detail,
+                };
             }
         }
         KeyCode::Char('e') => {
@@ -1177,13 +1208,21 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         | Mode::MessageSearchInput { .. }
         | Mode::Compose(_)
         | Mode::ActiveTurnPrompt { .. }
-        | Mode::ConfirmInterrupt { .. } => scroll_detail(state, delta),
+        | Mode::ConfirmInterrupt { .. }
+        | Mode::ConfirmArchive {
+            return_to_detail: true,
+            ..
+        } => scroll_detail(state, delta),
         Mode::Browser
         | Mode::SearchInput { .. }
         | Mode::FilterMenu
         | Mode::SortMenu
         | Mode::ColumnsMenu
-        | Mode::Help => state.move_selection(delta),
+        | Mode::Help
+        | Mode::ConfirmArchive {
+            return_to_detail: false,
+            ..
+        } => state.move_selection(delta),
         Mode::AnnotationInput {
             return_to_detail: true,
             ..
@@ -4644,6 +4683,121 @@ mod tests {
             &serde_json::json!({"id": "t1", "status": {"type": "idle"}}),
         );
         assert!(state.browser.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_shortcut_opens_confirmation_before_rpc() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmArchive {
+                ref thread_id,
+                archived: true,
+                return_to_detail: false,
+            } if thread_id == "t1"
+        ));
+        assert!(app_rx.try_recv().is_err());
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert!(app_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn archive_confirmation_preserves_detail_return_mode() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "archived"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmArchive {
+                ref thread_id,
+                archived: false,
+                return_to_detail: true,
+            } if thread_id == "t1"
+        ));
     }
 
     #[test]

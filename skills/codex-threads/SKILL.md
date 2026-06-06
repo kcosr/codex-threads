@@ -107,7 +107,7 @@ Useful TUI keys:
 - `a` edits the local annotation with `Enter` save and `Ctrl-D` clear.
 - `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
   but app-server does not expose a clear-name operation.
-- `A` archives or unarchives the active thread.
+- `A` opens confirmation to archive or unarchive the active thread.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
 - `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and

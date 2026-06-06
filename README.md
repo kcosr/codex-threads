@@ -208,9 +208,8 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `Enter` to open a thread, `]` and `[` to page when cursors are available, `p`
 to toggle the lazy recent-message preview pane, `f` for filters, `s` for sort,
 `c` for visible columns and updated-time display, `a` to annotate, `e` to
-rename, `A` to archive
-or unarchive, `r` to refresh, `y` to copy the active thread id with OSC 52, and
-`m` to compose.
+rename, `A` to confirm archive or unarchive, `r` to refresh, `y` to copy the
+active thread id with OSC 52, and `m` to compose.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing

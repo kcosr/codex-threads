@@ -28,6 +28,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             | Mode::Compose(_)
             | Mode::ActiveTurnPrompt { .. }
             | Mode::ConfirmInterrupt { .. }
+            | Mode::ConfirmArchive {
+                return_to_detail: true,
+                ..
+            }
     ) || (matches!(
         state.mode,
         Mode::AnnotationInput { .. } | Mode::RenameInput { .. }
@@ -83,6 +87,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         }
         Mode::ConfirmInterrupt { thread_id, turn_id } => {
             draw_confirm_interrupt(frame, area, thread_id, turn_id);
+        }
+        Mode::ConfirmArchive {
+            thread_id,
+            archived,
+            ..
+        } => {
+            draw_confirm_archive(frame, area, thread_id, *archived);
         }
         Mode::Compose(compose) => {
             let label = match compose.target {
@@ -515,6 +526,10 @@ fn draws_detail_background(state: &TuiState) -> bool {
             | Mode::Compose(_)
             | Mode::ActiveTurnPrompt { .. }
             | Mode::ConfirmInterrupt { .. }
+            | Mode::ConfirmArchive {
+                return_to_detail: true,
+                ..
+            }
     ) || (matches!(
         state.mode,
         Mode::AnnotationInput { .. } | Mode::RenameInput { .. }
@@ -770,6 +785,20 @@ fn draw_confirm_interrupt(frame: &mut Frame<'_>, area: Rect, thread_id: &str, tu
     );
 }
 
+fn draw_confirm_archive(frame: &mut Frame<'_>, area: Rect, thread_id: &str, archived: bool) {
+    let verb = if archived { "Archive" } else { "Unarchive" };
+    draw_static_modal(
+        frame,
+        area,
+        &format!("{verb} Thread"),
+        &[
+            format!("{verb} {thread_id}?"),
+            format!("Enter {}", verb.to_lowercase()),
+            "Esc cancel".to_string(),
+        ],
+    );
+}
+
 fn draw_static_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String]) {
     let height = (lines.len() as u16 + 2).max(5);
     let area = centered_rect(area, 70, height);
@@ -799,13 +828,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "",
         "Browser",
         "  Enter open detail  m compose message  / search threads",
-        "  a annotate  e rename  A archive/unarchive",
+        "  a annotate  e rename  A confirm archive/unarchive",
         "  f filters  s sort  c columns/time format  p preview  t auto-refresh",
         "",
         "Detail",
         "  Esc browser/detach detail session  Enter or m compose/message action",
         "  / search loaded transcript  n/N next/previous match",
-        "  a annotate  e rename  A archive/unarchive  T attach  S steer  i interrupt",
+        "  a annotate  e rename  A confirm archive/unarchive  T attach  S steer  i interrupt",
         "",
         "Compose and Text Inputs",
         "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
@@ -818,6 +847,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Columns: 1 status, 2 updated, 3 cwd, 4 annotation, 5 relative time",
         "  Active turn: Enter/T attach, s steer, i interrupt, Esc cancel",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
+        "  Archive confirmation: Enter archive/unarchive, Esc cancel",
     ];
     frame.render_widget(
         Paragraph::new(items.join("\n"))
