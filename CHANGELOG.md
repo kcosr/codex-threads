@@ -12,6 +12,9 @@
 
 - Keep TUI browser row status from falling back to stale `notLoaded` after a
   locally observed send or stream completion.
+- Keep TUI streaming transcript updates from splitting anonymous deltas into
+  separate fragments after an attached snapshot.
+- Show a connected/detach-oriented detail footer while attached to a stream.
 
 ## [0.1.5] - 2026-06-05
 

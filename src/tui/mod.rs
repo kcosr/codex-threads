@@ -2508,13 +2508,18 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 }
                 if let Some(delta) = event["delta"].as_str() {
                     let item_id = event["itemId"].as_str().map(str::to_string);
-                    let text = append_stream_assistant_delta(
+                    let item = append_stream_assistant_delta(
                         stream,
                         event_turn_id.clone(),
                         item_id.clone(),
                         delta,
                     );
-                    assistant_updates.push((event_turn_id.clone(), item_id, text, false));
+                    assistant_updates.push((
+                        item.turn_id.clone(),
+                        item.item_id.clone(),
+                        item.text.clone(),
+                        false,
+                    ));
                 } else if let Some(text) = event["text"].as_str() {
                     let item_id = event["itemId"].as_str().map(str::to_string);
                     set_stream_assistant_text(stream, event_turn_id.clone(), item_id.clone(), text);
@@ -3077,10 +3082,10 @@ fn append_stream_assistant_delta(
     turn_id: Option<String>,
     item_id: Option<String>,
     delta: &str,
-) -> String {
+) -> StreamAssistantItem {
     let item = stream_assistant_item_mut(stream, turn_id, item_id);
     item.text.push_str(delta);
-    item.text.clone()
+    item.clone()
 }
 
 fn set_stream_assistant_text(
@@ -3112,6 +3117,18 @@ fn stream_assistant_item_mut(
     {
         let item = &mut stream.assistant_items[index];
         item.item_id = item_id;
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
+    }
+    if item_id.is_none()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .rposition(|item| turns_compatible(item.turn_id.as_deref(), turn_id.as_deref()))
+    {
+        let item = &mut stream.assistant_items[index];
         if item.turn_id.is_none() {
             item.turn_id = turn_id;
         }
@@ -5525,6 +5542,78 @@ mod tests {
         assert_eq!(
             detail.messages[1].lines[0].text,
             "Already streamed plus new"
+        );
+    }
+
+    #[test]
+    fn anonymous_delta_after_snapshot_updates_existing_assistant_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "attached",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "attached",
+                "thread": {
+                    "id": "t1",
+                    "name": "Thread",
+                    "status": {"type": "active"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "items": [
+                                {
+                                    "id": "assistant-1",
+                                    "type": "agentMessage",
+                                    "text": "Already streamed"
+                                }
+                            ],
+                            "itemsView": "full"
+                        }
+                    ]
+                }
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": " plus anonymous"
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(
+            detail.messages[0].lines[0].text,
+            "Already streamed plus anonymous"
         );
     }
 

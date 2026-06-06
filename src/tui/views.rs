@@ -4,7 +4,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use crate::tui::keymap::{BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_HELP};
+use crate::tui::keymap::{
+    BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
+};
 use crate::tui::state::{BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState};
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
@@ -643,6 +645,7 @@ fn notice_status(state: &TuiState) -> String {
 fn draw_help_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let text = match state.mode {
         Mode::Browser => BROWSER_HELP,
+        Mode::Detail if detail_has_connected_stream(state) => DETAIL_CONNECTED_HELP,
         Mode::Detail => DETAIL_HELP,
         Mode::Compose(_) => COMPOSE_HELP,
         _ => DEFAULT_HELP,
@@ -651,6 +654,16 @@ fn draw_help_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Paragraph::new(text).style(Style::default().fg(Color::Gray)),
         area,
     );
+}
+
+fn detail_has_connected_stream(state: &TuiState) -> bool {
+    matching_detail_stream(state).is_some_and(|stream| {
+        !stream.detached
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+    })
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, footer: &str) {
@@ -1090,6 +1103,63 @@ mod tests {
         assert!(text.contains("r/R refresh/reload"));
         assert!(text.contains("l load"));
         assert!(text.contains("[] page"));
+    }
+
+    #[test]
+    fn detail_footer_shows_connected_state_without_attach_hint() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(DetailState {
+            thread_id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "active".to_string(),
+            annotation: None,
+            messages: Vec::new(),
+            scroll: 0,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: None,
+            active_turn_id: Some("turn-1".to_string()),
+            loading: false,
+            epoch: 1,
+            last_refresh_at: None,
+            viewport_height: None,
+            last_error: None,
+        });
+        state.stream = Some(StreamState::new_with_id(
+            1,
+            "thread-1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        let backend = TestBackend::new(160, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Esc detach/browser"));
+        assert!(text.contains("r poll"));
+        assert!(!text.contains("T/S/i"));
     }
 
     #[test]
