@@ -595,14 +595,18 @@ fn draw_help_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, footer: &str) {
     let area = centered_rect(area, 70, 5);
     frame.render_widget(Clear, area);
-    let text = vec![
-        Line::from(value.to_string()),
-        Line::from(Span::styled(footer, Style::default().fg(Color::Gray))),
-    ];
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(value.to_string())
             .wrap(Wrap { trim: false })
-            .block(Block::default().title(title).borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title(title)
+                    .title_bottom(Line::from(Span::styled(
+                        footer,
+                        Style::default().fg(Color::Gray),
+                    )))
+                    .borders(Borders::ALL),
+            ),
         area,
     );
 }
@@ -950,6 +954,43 @@ mod tests {
         assert!(text.contains("first line"));
         assert!(text.contains("second line"));
         assert!(text.contains("Enter send, Shift-J newline, Tab mode, Esc cancel"));
+    }
+
+    #[test]
+    fn annotation_panel_keeps_footer_on_bottom_border() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::AnnotationInput {
+            thread_id: "thread-1".to_string(),
+            draft: "annotation text".to_string(),
+            return_to_detail: false,
+        };
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("annotation text"));
+        assert!(text.contains("Ctrl-S save, Ctrl-D clear, Esc cancel"));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol() == "C" && cell.style().fg == Some(Color::Gray) })
+        );
     }
 
     #[test]
