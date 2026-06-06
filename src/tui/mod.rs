@@ -1565,6 +1565,8 @@ fn submit_compose(
     }
     match compose.target {
         ComposeTarget::NewTurn { thread_id } => {
+            let probe_active_turn =
+                should_probe_active_turn_for_compose(state, compose.return_to_detail, &thread_id);
             append_detail_message(
                 state,
                 thread_id.as_str(),
@@ -1609,10 +1611,13 @@ fn submit_compose(
                         spawn_browser_watch_send_task(
                             target.clone(),
                             thread_id,
-                            prompt,
-                            yolo,
                             control_rx,
-                            stream_id,
+                            BrowserWatchSendOptions {
+                                prompt,
+                                yolo,
+                                stream_id,
+                                probe_active_turn,
+                            },
                             app_tx.clone(),
                         );
                     }
@@ -1623,6 +1628,7 @@ fn submit_compose(
                         thread_id,
                         prompt,
                         yolo,
+                        probe_active_turn,
                         app_tx.clone(),
                     );
                 }
@@ -1640,6 +1646,23 @@ fn submit_compose(
             );
         }
     }
+}
+
+fn should_probe_active_turn_for_compose(
+    state: &TuiState,
+    return_to_detail: bool,
+    thread_id: &str,
+) -> bool {
+    if return_to_detail {
+        return state.detail.as_ref().is_some_and(|detail| {
+            detail.thread_id == thread_id && detail.active_turn_id.is_some()
+        });
+    }
+    state
+        .browser
+        .rows
+        .get(state.browser.selected)
+        .is_some_and(|row| row.id == thread_id && row.is_running())
 }
 
 fn spawn_attach_task(
@@ -1928,13 +1951,15 @@ fn spawn_no_wait_send_task(
     thread_id: String,
     prompt: String,
     yolo: bool,
+    probe_active_turn: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            if let Some(turn_id) =
-                active_turn_id_for_thread(&target, &mut client, &thread_id).await?
+            if probe_active_turn
+                && let Some(turn_id) =
+                    active_turn_id_for_thread(&target, &mut client, &thread_id).await?
             {
                 steer_turn(
                     &target,
@@ -1993,22 +2018,36 @@ async fn active_turn_id_for_thread(
     Ok(status["activeTurnId"].as_str().map(str::to_string))
 }
 
+struct BrowserWatchSendOptions {
+    prompt: String,
+    yolo: bool,
+    stream_id: u64,
+    probe_active_turn: bool,
+}
+
 fn spawn_browser_watch_send_task(
     target: Target,
     thread_id: String,
-    prompt: String,
-    yolo: bool,
     control_rx: mpsc::UnboundedReceiver<TurnControl>,
-    stream_id: u64,
+    options: BrowserWatchSendOptions,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let BrowserWatchSendOptions {
+            prompt,
+            yolo,
+            stream_id,
+            probe_active_turn,
+        } = options;
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            let active_turn_id =
-                active_turn_id_for_thread(&target, &mut client, &thread_id).await?;
+            let active_turn_id = if probe_active_turn {
+                active_turn_id_for_thread(&target, &mut client, &thread_id).await?
+            } else {
+                None
+            };
             if let Some(turn_id) = active_turn_id {
                 stream_turn_id = Some(turn_id.clone());
                 let accepted = steer_turn(
@@ -5992,6 +6031,52 @@ mod tests {
             panic!("expected compose mode");
         };
         assert_eq!(compose.send_mode, SendMode::NoWait);
+    }
+
+    #[test]
+    fn browser_send_probe_active_only_for_running_rows() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![
+            test_thread_row("idle-thread", "notLoaded"),
+            test_thread_row("active-thread", "active"),
+        ];
+        let idle_compose = ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "idle-thread".to_string(),
+            },
+            text: String::new(),
+            send_mode: SendMode::Stream,
+            return_to_detail: false,
+        };
+        assert!(!should_probe_active_turn_for_compose(
+            &state,
+            idle_compose.return_to_detail,
+            "idle-thread"
+        ));
+
+        state.browser.selected = 1;
+        let active_compose = ComposeState {
+            target: ComposeTarget::NewTurn {
+                thread_id: "active-thread".to_string(),
+            },
+            text: String::new(),
+            send_mode: SendMode::Stream,
+            return_to_detail: false,
+        };
+        assert!(should_probe_active_turn_for_compose(
+            &state,
+            active_compose.return_to_detail,
+            "active-thread"
+        ));
     }
 
     #[tokio::test]
