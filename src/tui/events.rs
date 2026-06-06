@@ -97,8 +97,14 @@ pub(crate) enum AppEvent {
         turn_id: Option<String>,
         status: StreamStatus,
     },
-    TurnSubmitted {
+    StreamIdle {
+        stream_id: u64,
         thread_id: String,
+    },
+    TurnQueued {
+        thread_id: String,
+        turn_id: String,
+        prompt: String,
     },
     TurnSubmitFailed {
         thread_id: String,

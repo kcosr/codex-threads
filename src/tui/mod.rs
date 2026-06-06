@@ -66,6 +66,8 @@ const AUTO_REFRESH_STEP_SECS: u64 = 5;
 const SCHEDULER_TICK_SECS: u64 = 5;
 const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
+const FOLLOW_NEXT_TURN_POLL_ATTEMPTS: usize = 8;
+const FOLLOW_NEXT_TURN_POLL_INTERVAL_MS: u64 = 500;
 
 pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<i32> {
     if !io::stdout().is_terminal() {
@@ -139,6 +141,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 let refresh_after_rename = rename_changed_thread(&event);
                 let refresh_after_submit = turn_submitted_thread(&event);
                 let refresh_after_load = loaded_thread(&event);
+                let follow_after_stream = stream_finish_follow_thread(&event, &state);
                 let detail_loaded = matches!(event, AppEvent::DetailLoaded { .. });
                 handle_app_event(event, &mut state);
                 if detail_loaded && !state.should_quit {
@@ -169,6 +172,17 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 }
                 if refresh_after_submit.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if let Some(thread_id) = follow_after_stream
+                    && !state.should_quit
+                {
+                    follow_thread_stream_if_active(
+                        &mut state,
+                        target.clone(),
+                        yolo,
+                        thread_id,
+                        app_tx.clone(),
+                    );
                 }
                 if let Some(thread_id) = refresh_after_load
                     && !state.should_quit
@@ -1815,26 +1829,40 @@ fn submit_compose(
             state.mode = return_mode;
             match compose.send_mode {
                 SendMode::Stream => {
-                    detach_stream(state);
-                    let (control_tx, control_rx) = mpsc::unbounded_channel();
-                    let stream_id = state.allocate_stream_id();
-                    state.stream = Some(StreamState::new_with_id(
-                        stream_id,
-                        thread_id.clone(),
-                        None,
-                        StreamStatus::Starting,
-                        false,
-                    ));
-                    state.stream_control = Some(control_tx);
-                    spawn_stream_send_task(
-                        target.clone(),
-                        thread_id,
-                        prompt,
-                        yolo,
-                        control_rx,
-                        stream_id,
-                        app_tx.clone(),
-                    );
+                    if active_stream_can_queue_prompt(state, &thread_id) {
+                        if let Some(control) = &state.stream_control {
+                            let _ = control.send(TurnControl::Submit { prompt, yolo });
+                        } else {
+                            spawn_queue_turn_task(
+                                target.clone(),
+                                thread_id,
+                                prompt,
+                                yolo,
+                                app_tx.clone(),
+                            );
+                        }
+                    } else {
+                        detach_stream(state);
+                        let (control_tx, control_rx) = mpsc::unbounded_channel();
+                        let stream_id = state.allocate_stream_id();
+                        state.stream = Some(StreamState::new_with_id(
+                            stream_id,
+                            thread_id.clone(),
+                            None,
+                            StreamStatus::Starting,
+                            false,
+                        ));
+                        state.stream_control = Some(control_tx);
+                        spawn_stream_send_task(
+                            target.clone(),
+                            thread_id,
+                            prompt,
+                            yolo,
+                            control_rx,
+                            stream_id,
+                            app_tx.clone(),
+                        );
+                    }
                 }
                 SendMode::NoWait => {
                     spawn_no_wait_send_task(
@@ -1884,6 +1912,16 @@ fn active_turn_hint_for_compose(state: &TuiState, thread_id: &str) -> Option<Str
         } else {
             None
         }
+    })
+}
+
+fn active_stream_can_queue_prompt(state: &TuiState, thread_id: &str) -> bool {
+    state.stream.as_ref().is_some_and(|stream| {
+        stream.thread_id == thread_id
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
     })
 }
 
@@ -2066,6 +2104,133 @@ fn spawn_browser_attach_task(
     });
 }
 
+fn spawn_thread_follow_task(
+    target: Target,
+    thread_id: String,
+    yolo: bool,
+    mut control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let stream_thread_id = thread_id.clone();
+        let mut stream_turn_id = None;
+        let result: Result<Option<StreamStatus>> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let Some(turn_id) = wait_for_next_active_turn(
+                &target,
+                &mut client,
+                &thread_id,
+                &mut control_rx,
+                stream_id,
+                &app_tx,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            stream_turn_id = Some(turn_id.clone());
+            attach_existing_turn_stream(
+                &target,
+                &mut client,
+                AttachTurnOptions {
+                    thread_id,
+                    turn_id,
+                    yolo,
+                    poll_limit: TURN_SCAN_LIMIT,
+                    timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                },
+                control_rx,
+                stream_id,
+                &app_tx,
+            )
+            .await
+            .map(Some)
+        }
+        .await;
+        match result {
+            Ok(Some(status)) => report_stream_task_result(
+                &app_tx,
+                stream_id,
+                stream_thread_id,
+                stream_turn_id,
+                Ok(status),
+            ),
+            Ok(None) => {
+                let _ = app_tx.send(AppEvent::StreamIdle {
+                    stream_id,
+                    thread_id: stream_thread_id,
+                });
+            }
+            Err(err) => {
+                let _ = app_tx.send(AppEvent::StreamFailed {
+                    stream_id: Some(stream_id),
+                    thread_id: stream_thread_id,
+                    turn_id: stream_turn_id,
+                    error: err.to_string(),
+                });
+            }
+        }
+    });
+}
+
+async fn wait_for_next_active_turn(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: &str,
+    control_rx: &mut mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> Result<Option<String>> {
+    for attempt in 0..=FOLLOW_NEXT_TURN_POLL_ATTEMPTS {
+        if let Some(turn_id) = active_turn_id_for_thread(target, client, thread_id, true).await? {
+            return Ok(Some(turn_id));
+        }
+        if attempt == FOLLOW_NEXT_TURN_POLL_ATTEMPTS {
+            break;
+        }
+        let sleep = tokio::time::sleep(Duration::from_millis(FOLLOW_NEXT_TURN_POLL_INTERVAL_MS));
+        tokio::pin!(sleep);
+        tokio::select! {
+            control = control_rx.recv() => {
+                match control {
+                    Some(TurnControl::PollNow) => {}
+                    Some(TurnControl::Submit { prompt, yolo }) => {
+                        let queued = start_turn_request(
+                            target,
+                            client,
+                            thread_id.to_string(),
+                            prompt.clone(),
+                            TurnStartOptions {
+                                model: None,
+                                effort: None,
+                                service_tier: None,
+                                yolo,
+                            },
+                        )
+                        .await?;
+                        let _ = app_tx.send(AppEvent::StreamEvent {
+                            stream_id: Some(stream_id),
+                            event: json!({
+                                "type": "queued",
+                                "server": target.server,
+                                "threadId": thread_id,
+                                "turnId": queued.turn_id,
+                                "status": "accepted",
+                                "prompt": prompt
+                            }),
+                        });
+                    }
+                    Some(TurnControl::Detach) | None => return Ok(None),
+                    Some(TurnControl::Interrupt) => {}
+                }
+            }
+            _ = &mut sleep => {}
+        }
+    }
+    Ok(None)
+}
+
 fn spawn_steer_task(
     target: Target,
     thread_id: String,
@@ -2222,7 +2387,7 @@ fn spawn_no_wait_send_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        let result: Result<()> = async {
+        let result: Result<StartedTurn> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
             start_turn_request(
                 &target,
@@ -2236,12 +2401,66 @@ fn spawn_no_wait_send_task(
                     yolo,
                 },
             )
-            .await?;
-            Ok(())
+            .await
         }
         .await;
         match result {
-            Ok(()) => app_tx.send(AppEvent::TurnSubmitted { thread_id }).ok(),
+            Ok(started) => {
+                let prompt = started.prompt().unwrap_or_default().to_string();
+                app_tx
+                    .send(AppEvent::TurnQueued {
+                        thread_id,
+                        turn_id: started.turn_id,
+                        prompt,
+                    })
+                    .ok()
+            }
+            Err(err) => app_tx
+                .send(AppEvent::TurnSubmitFailed {
+                    thread_id,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+fn spawn_queue_turn_task(
+    target: Target,
+    thread_id: String,
+    prompt: String,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<StartedTurn> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            start_turn_request(
+                &target,
+                &mut client,
+                thread_id.clone(),
+                prompt,
+                TurnStartOptions {
+                    model: None,
+                    effort: None,
+                    service_tier: None,
+                    yolo,
+                },
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(started) => {
+                let prompt = started.prompt().unwrap_or_default().to_string();
+                app_tx
+                    .send(AppEvent::TurnQueued {
+                        thread_id,
+                        turn_id: started.turn_id,
+                        prompt,
+                    })
+                    .ok()
+            }
             Err(err) => app_tx
                 .send(AppEvent::TurnSubmitFailed {
                     thread_id,
@@ -2285,6 +2504,7 @@ fn spawn_stream_send_task(
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
+            let prompt_for_event = prompt.clone();
             let started = start_turn_request(
                 &target,
                 &mut client,
@@ -2299,7 +2519,9 @@ fn spawn_stream_send_task(
             )
             .await?;
             stream_turn_id = Some(started.turn_id.clone());
-            send_stream_event(&app_tx, stream_id, started.acceptance.clone());
+            let mut acceptance = started.acceptance.clone();
+            acceptance["prompt"] = json!(prompt_for_event);
+            send_stream_event(&app_tx, stream_id, acceptance);
             wait_started_turn_stream(
                 &target,
                 &mut client,
@@ -2361,6 +2583,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         AppEvent::StreamEvent { stream_id, event } => {
             log_stream_event(&event);
             let event_thread_id = event["threadId"].as_str();
+            let event_type = event["type"].as_str();
             if let Some(current_stream) = &state.stream {
                 if let Some(stream_id) = stream_id {
                     if current_stream.id != stream_id {
@@ -2396,6 +2619,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 ));
             }
             let mut pending_turn_id = None;
+            let pending_prompt = event["prompt"].as_str().map(str::to_string);
             let mut assistant_updates = Vec::new();
             let initial_event_turn_id =
                 event["turnId"].as_str().map(str::to_string).or_else(|| {
@@ -2408,8 +2632,12 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 detail_from_resume_snapshot(state, &event, &initial_event_turn_id);
             if let Some(stream) = &mut state.stream {
                 if let Some(turn_id) = event["turnId"].as_str() {
-                    stream.turn_id = Some(turn_id.to_string());
-                    pending_turn_id = Some(turn_id.to_string());
+                    if event_type != Some("queued") {
+                        stream.turn_id = Some(turn_id.to_string());
+                    }
+                    if matches!(event_type, Some("accepted" | "queued")) {
+                        pending_turn_id = Some(turn_id.to_string());
+                    }
                 }
                 let event_turn_id = event["turnId"]
                     .as_str()
@@ -2476,8 +2704,8 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 }
             }
             if let Some(turn_id) = pending_turn_id {
-                fill_pending_turn_ids(state, &turn_id);
-                fill_preview_pending_turn_ids(state, &turn_id);
+                fill_pending_turn_id(state, &turn_id, pending_prompt.as_deref());
+                fill_preview_pending_turn_id(state, &turn_id, pending_prompt.as_deref());
             }
             if let Some(detail) = snapshot_detail {
                 state.replace_detail(detail.epoch, detail);
@@ -2538,9 +2766,38 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
             state.stream_control = None;
         }
-        AppEvent::TurnSubmitted { thread_id } => {
+        AppEvent::StreamIdle {
+            stream_id,
+            thread_id,
+        } => {
+            if state
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.id == stream_id && stream.thread_id == thread_id)
+            {
+                set_browser_thread_status(state, &thread_id, "idle");
+                if let Some(detail) = &mut state.detail
+                    && detail.thread_id == thread_id
+                {
+                    detail.status = "idle".to_string();
+                    detail.active_turn_id = None;
+                }
+                if let Some(stream) = &mut state.stream {
+                    stream.status = StreamStatus::Completed;
+                    stream.turn_id = None;
+                }
+                state.stream_control = None;
+            }
+        }
+        AppEvent::TurnQueued {
+            thread_id,
+            turn_id,
+            prompt,
+        } => {
             set_browser_thread_status(state, &thread_id, "active");
             touch_browser_thread_updated(state, &thread_id);
+            fill_pending_turn_id(state, &turn_id, Some(&prompt));
+            fill_preview_pending_turn_id(state, &turn_id, Some(&prompt));
             state.set_notice(format!("sent {thread_id}"));
         }
         AppEvent::TurnSubmitFailed { thread_id, error } => {
@@ -2605,7 +2862,7 @@ fn rename_changed_thread(event: &AppEvent) -> Option<String> {
 
 fn turn_submitted_thread(event: &AppEvent) -> Option<String> {
     match event {
-        AppEvent::TurnSubmitted { thread_id } => Some(thread_id.clone()),
+        AppEvent::TurnQueued { thread_id, .. } => Some(thread_id.clone()),
         _ => None,
     }
 }
@@ -2868,6 +3125,52 @@ fn stream_finish_detail_thread(event: &AppEvent, state: &TuiState) -> Option<Str
     }
 }
 
+fn stream_finish_follow_thread(event: &AppEvent, state: &TuiState) -> Option<String> {
+    let AppEvent::StreamFinished {
+        stream_id,
+        thread_id,
+        status,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if *status != StreamStatus::Completed {
+        return None;
+    }
+    let stream = state.stream.as_ref()?;
+    if stream.id != *stream_id || stream.thread_id != *thread_id {
+        return None;
+    }
+    if !stream_event_matches_visible_thread(state, thread_id) {
+        return None;
+    }
+    Some(thread_id.clone())
+}
+
+fn follow_thread_stream_if_active(
+    state: &mut TuiState,
+    target: Target,
+    yolo: bool,
+    thread_id: String,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !stream_event_matches_visible_thread(state, &thread_id) {
+        return;
+    }
+    let stream_id = state.allocate_stream_id();
+    state.stream = Some(StreamState::new_with_id(
+        stream_id,
+        thread_id.clone(),
+        None,
+        StreamStatus::Starting,
+        true,
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    state.stream_control = Some(control_tx);
+    spawn_thread_follow_task(target, thread_id, yolo, control_rx, stream_id, app_tx);
+}
+
 fn detail_follow_refresh_thread(state: &TuiState) -> Option<String> {
     if !matches!(state.mode, Mode::Detail) || stream_is_running(state) {
         return None;
@@ -2943,23 +3246,44 @@ fn append_preview_message(
         .push(message_block(turn_id, None, role, timestamp, text, 100));
 }
 
-fn fill_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
+fn fill_pending_turn_id(state: &mut TuiState, turn_id: &str, prompt: Option<&str>) {
     let Some(detail) = &mut state.detail else {
         return;
     };
     for message in &mut detail.messages {
-        if message.turn_id.is_none() {
+        if pending_message_matches(message, prompt) {
             message.turn_id = Some(turn_id.to_string());
+            break;
         }
     }
 }
 
-fn fill_preview_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
+fn fill_preview_pending_turn_id(state: &mut TuiState, turn_id: &str, prompt: Option<&str>) {
     for message in &mut state.browser.preview.messages {
-        if message.turn_id.is_none() {
+        if pending_message_matches(message, prompt) {
             message.turn_id = Some(turn_id.to_string());
+            break;
         }
     }
+}
+
+fn pending_message_matches(message: &MessageBlock, prompt: Option<&str>) -> bool {
+    if message.turn_id.is_some() || message.item_id.is_some() || message.role != "user" {
+        return false;
+    }
+    let Some(prompt) = prompt else {
+        return true;
+    };
+    message_text(message) == prompt
+}
+
+fn message_text(message: &MessageBlock) -> String {
+    message
+        .lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
@@ -4594,6 +4918,16 @@ mod tests {
 
         handle_app_event(
             stream_event(serde_json::json!({
+                "type": "accepted",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "accepted",
+                "prompt": "please stream"
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            stream_event(serde_json::json!({
                 "type": "delta",
                 "threadId": "t1",
                 "turnId": "turn-1",
@@ -4622,6 +4956,296 @@ mod tests {
         assert_eq!(detail.messages[1].timestamp, None);
         assert_eq!(detail.messages[1].lines[0].text, "first prune chunk");
         assert_eq!(detail.matches, vec![1]);
+    }
+
+    #[test]
+    fn stream_compose_queues_prompt_on_active_stream_without_replacing_turn() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "test 1"}]}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        submit_compose(
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "test 2".to_string(),
+                send_mode: SendMode::Stream,
+                return_to_detail: true,
+            },
+            &test_target(),
+            false,
+            &app_tx,
+            Mode::Detail,
+        );
+
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.id, 7);
+        assert_eq!(stream.turn_id.as_deref(), Some("turn-1"));
+        assert!(matches!(stream.status, StreamStatus::Running));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(TurnControl::Submit { prompt, yolo: false }) if prompt == "test 2"
+        ));
+        let detail = state.detail.as_ref().expect("detail");
+        let pending = detail.messages.last().expect("pending user");
+        assert_eq!(pending.role, "user");
+        assert_eq!(pending.turn_id, None);
+        assert_eq!(message_text(pending), "test 2");
+    }
+
+    #[test]
+    fn queued_stream_event_assigns_one_pending_message_without_stealing_active_turn() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        append_detail_message(&mut state, "t1", None, "user", None, "test 2");
+        append_detail_message(&mut state, "t1", None, "user", None, "test 3");
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        handle_app_event(
+            stream_event_for(
+                7,
+                serde_json::json!({
+                    "type": "queued",
+                    "threadId": "t1",
+                    "turnId": "turn-2",
+                    "status": "accepted",
+                    "prompt": "test 2"
+                }),
+            ),
+            &mut state,
+        );
+
+        assert_eq!(
+            state
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.turn_id.as_deref()),
+            Some("turn-1")
+        );
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages[0].turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(message_text(&detail.messages[0]), "test 2");
+        assert_eq!(detail.messages[1].turn_id, None);
+        assert_eq!(message_text(&detail.messages[1]), "test 3");
+    }
+
+    #[test]
+    fn detail_refresh_preserves_queued_optimistic_messages_until_history_contains_them() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "test 1"}]}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        append_detail_message(
+            &mut state,
+            "t1",
+            Some("turn-2".to_string()),
+            "user",
+            None,
+            "test 2",
+        );
+
+        let refreshed_without_turn = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "test 1"}]}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        );
+        state.replace_detail(1, refreshed_without_turn);
+        let detail = state.detail.as_ref().expect("detail");
+        assert!(detail.messages.iter().any(|message| {
+            message.turn_id.as_deref() == Some("turn-2") && message_text(message) == "test 2"
+        }));
+
+        let refreshed_with_turn = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "test 1"}]}
+                    ]},
+                    {"id": "turn-2", "items": [
+                        {"id": "u2", "type": "userMessage", "content": [{"text": "test 2"}]},
+                        {"id": "a2", "type": "agentMessage", "text": "done"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+        state.replace_detail(1, refreshed_with_turn);
+        let detail = state.detail.as_ref().expect("detail");
+        let matching_user_messages = detail
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == "user"
+                    && message.turn_id.as_deref() == Some("turn-2")
+                    && message_text(message) == "test 2"
+            })
+            .count();
+        assert_eq!(matching_user_messages, 1);
+        assert!(detail.messages.iter().any(|message| {
+            message.role == "assistant"
+                && message.turn_id.as_deref() == Some("turn-2")
+                && message_text(message) == "done"
+        }));
+    }
+
+    #[test]
+    fn completed_visible_stream_requests_follow_and_idle_clears_running_state() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        let finished = stream_finished(7, "t1", Some("turn-1"), StreamStatus::Completed);
+        assert_eq!(
+            stream_finish_follow_thread(&finished, &state).as_deref(),
+            Some("t1")
+        );
+        handle_app_event(finished, &mut state);
+        let stream_id = state.allocate_stream_id();
+        state.stream = Some(StreamState::new_with_id(
+            stream_id,
+            "t1".to_string(),
+            None,
+            StreamStatus::Starting,
+            true,
+        ));
+        assert!(matches!(
+            state.stream.as_ref().expect("stream").status,
+            StreamStatus::Starting
+        ));
+
+        handle_app_event(
+            AppEvent::StreamIdle {
+                stream_id,
+                thread_id: "t1".to_string(),
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.browser.rows[0].status, "idle");
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.status, "idle");
+        assert_eq!(detail.active_turn_id, None);
+        assert!(matches!(
+            state.stream.as_ref().expect("stream").status,
+            StreamStatus::Completed
+        ));
     }
 
     #[test]

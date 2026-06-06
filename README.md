@@ -215,8 +215,9 @@ refresh, `y` to copy the active thread id with OSC 52, and `m` to compose. Use
 `status THREAD_ID --load`, then refresh visible metadata and history.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns. Browser compose streams into the preview while the
-thread remains selected, and detaches locally when selection moves away. If the
-initial selected browser row is active, the TUI attaches to it automatically.
+thread remains selected, follows queued turns on that thread, and detaches
+locally when selection moves away. If the initial selected browser row is
+active, the TUI attaches to it automatically.
 Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
 refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing

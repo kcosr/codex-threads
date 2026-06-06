@@ -390,13 +390,14 @@ impl TuiState {
         &mut self,
         epoch: u64,
         thread_id: String,
-        messages: Vec<MessageBlock>,
+        mut messages: Vec<MessageBlock>,
     ) {
         if self.browser.preview.epoch != epoch
             || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
         {
             return;
         }
+        append_unpersisted_messages(&mut messages, &self.browser.preview.messages);
         self.browser.preview.loading = false;
         self.browser.preview.messages = messages;
         self.browser.preview.error = None;
@@ -462,6 +463,7 @@ impl TuiState {
         if current.thread_id == detail.thread_id {
             let was_at_bottom =
                 current.scroll == u16::MAX || current.scroll >= current.max_scroll();
+            append_unpersisted_messages(&mut detail.messages, &current.messages);
             detail.search_query = current.search_query.clone();
             detail.viewport_height = current.viewport_height;
             detail.viewport_width = current.viewport_width;
@@ -827,6 +829,34 @@ fn append_unique_messages(
         if !duplicate {
             target.push(message);
         }
+    }
+}
+
+fn append_unpersisted_messages(target: &mut Vec<MessageBlock>, current: &[MessageBlock]) {
+    for message in current
+        .iter()
+        .filter(|message| is_unpersisted_local_message(message))
+    {
+        if !target
+            .iter()
+            .any(|existing| equivalent_persisted_message(existing, message))
+        {
+            target.push(message.clone());
+        }
+    }
+}
+
+fn is_unpersisted_local_message(message: &MessageBlock) -> bool {
+    message.item_id.is_none() && matches!(message.role.as_str(), "user" | "assistant")
+}
+
+fn equivalent_persisted_message(existing: &MessageBlock, local: &MessageBlock) -> bool {
+    if existing.role != local.role || existing.lines != local.lines {
+        return false;
+    }
+    match (existing.turn_id.as_deref(), local.turn_id.as_deref()) {
+        (Some(existing_turn), Some(local_turn)) => existing_turn == local_turn,
+        _ => existing.item_id.is_none() && local.turn_id.is_none(),
     }
 }
 

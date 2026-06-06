@@ -46,6 +46,13 @@ struct ServerState {
     next_turn: u64,
 }
 
+struct StartedMockTurn {
+    turn_id: String,
+    reply: String,
+    completed_previous_turn_id: Option<String>,
+    stream_now: bool,
+}
+
 struct TuiPty {
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
@@ -329,21 +336,36 @@ impl ServerState {
         })
     }
 
-    fn complete_started_turn(&mut self, thread_id: &str, prompt: &str) -> (String, String) {
+    fn start_turn(&mut self, thread_id: &str, prompt: &str) -> StartedMockTurn {
         let reply = format!("stream reply for {prompt}");
         let thread = self.threads.get_mut(thread_id).expect("thread exists");
         let turn_id = format!("turn_{}", self.next_turn);
         self.next_turn += 1;
         let item_id = format!("item_agent_{}", self.next_turn);
-        thread.status = "idle".to_string();
-        thread.active_turn_id = None;
+        let completed_previous_turn_id = thread.active_turn_id.clone();
+        let stream_now = completed_previous_turn_id.is_none();
+        if let Some(previous_turn_id) = &completed_previous_turn_id
+            && let Some(previous) = thread
+                .turns
+                .iter_mut()
+                .find(|turn| turn["id"].as_str() == Some(previous_turn_id.as_str()))
+        {
+            previous["status"] = json!("completed");
+            previous["completedAt"] = json!(thread.updated_at + 1);
+        }
+        thread.status = if stream_now { "idle" } else { "active" }.to_string();
+        thread.active_turn_id = if stream_now {
+            None
+        } else {
+            Some(turn_id.clone())
+        };
         thread.preview = prompt.to_string();
         thread.updated_at += 1;
         thread.turns.push(json!({
             "id": turn_id,
-            "status": "completed",
+            "status": if stream_now { "completed" } else { "inProgress" },
             "startedAt": thread.updated_at,
-            "completedAt": thread.updated_at + 1,
+            "completedAt": if stream_now { json!(thread.updated_at + 1) } else { Value::Null },
             "items": [
                 {
                     "id": format!("item_user_{}", self.next_turn),
@@ -353,11 +375,56 @@ impl ServerState {
                 {
                     "id": item_id,
                     "type": "agentMessage",
-                    "text": reply
+                    "text": if stream_now { reply.clone() } else { String::new() }
                 }
             ]
         }));
-        (turn_id, reply)
+        StartedMockTurn {
+            turn_id,
+            reply,
+            completed_previous_turn_id,
+            stream_now,
+        }
+    }
+
+    fn complete_generated_active_turn(&mut self, thread_id: &str) -> Option<(String, String)> {
+        let thread = self.threads.get_mut(thread_id)?;
+        let active_turn_id = thread.active_turn_id.clone()?;
+        if active_turn_id == "turn_active" {
+            return None;
+        }
+        let turn = thread
+            .turns
+            .iter_mut()
+            .find(|turn| turn["id"].as_str() == Some(active_turn_id.as_str()))?;
+        if turn["status"].as_str() != Some("inProgress") {
+            return None;
+        }
+        let prompt = turn["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["type"].as_str() == Some("userMessage"))
+            })
+            .and_then(|item| item["content"].as_array())
+            .and_then(|content| content.first())
+            .and_then(|item| item["text"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let reply = format!("stream reply for {prompt}");
+        if let Some(agent) = turn["items"].as_array_mut().and_then(|items| {
+            items
+                .iter_mut()
+                .find(|item| item["type"].as_str() == Some("agentMessage"))
+        }) {
+            agent["text"] = json!(reply.clone());
+        }
+        turn["status"] = json!("completed");
+        turn["completedAt"] = json!(thread.updated_at + 1);
+        thread.status = "idle".to_string();
+        thread.active_turn_id = None;
+        Some((active_turn_id, reply))
     }
 
     fn apply_live_attach_delta(&mut self, thread_id: &str) -> Option<String> {
@@ -412,16 +479,15 @@ async fn handle_websocket<S>(
                 .and_then(|item| item["text"].as_str())
                 .unwrap_or("")
                 .to_string();
-            let (turn_id, reply) = {
+            let started = {
                 let mut state = state.lock().expect("state");
-                state.complete_started_turn(&thread_id, &prompt)
+                state.start_turn(&thread_id, &prompt)
             };
-            send_stream_notifications(&mut ws, &thread_id, &turn_id, &reply).await;
             let response = json!({
                 "id": id,
                 "result": {
                     "turn": {
-                        "id": turn_id,
+                        "id": started.turn_id,
                         "status": "inProgress",
                         "items": []
                     }
@@ -434,16 +500,30 @@ async fn handle_websocket<S>(
             {
                 break;
             }
+            if let Some(previous_turn_id) = started.completed_previous_turn_id {
+                send_turn_completed(&mut ws, &thread_id, &previous_turn_id).await;
+            }
+            if started.stream_now {
+                send_stream_notifications(&mut ws, &thread_id, &started.turn_id, &started.reply)
+                    .await;
+            }
             continue;
         }
 
         if method == "thread/resume" && request["params"]["excludeTurns"].as_bool() == Some(false) {
             let thread_id = thread_id(&request).to_string();
-            let text = {
+            let generated = {
+                let mut state = state.lock().expect("state");
+                state.complete_generated_active_turn(&thread_id)
+            };
+            if let Some((turn_id, reply)) = generated {
+                send_stream_notifications(&mut ws, &thread_id, &turn_id, &reply).await;
+            } else if {
                 let mut state = state.lock().expect("state");
                 state.apply_live_attach_delta(&thread_id)
-            };
-            if text.is_some() {
+            }
+            .is_some()
+            {
                 send_delta(
                     &mut ws,
                     &thread_id,
@@ -514,6 +594,32 @@ async fn send_stream_notifications<S>(
             .into(),
         ))
         .await;
+    let _ = ws
+        .send(Message::Text(
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {
+                        "id": turn_id,
+                        "status": "completed",
+                        "items": []
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
+}
+
+async fn send_turn_completed<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    thread_id: &str,
+    turn_id: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let _ = ws
         .send(Message::Text(
             json!({

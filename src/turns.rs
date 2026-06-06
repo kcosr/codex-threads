@@ -31,6 +31,13 @@ pub struct StartedTurn {
     early_notifications: Vec<Notification>,
 }
 
+impl StartedTurn {
+    #[cfg(feature = "tui")]
+    pub fn prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
+    }
+}
+
 #[derive(Debug)]
 pub struct TurnTerminal {
     pub output: Value,
@@ -162,9 +169,10 @@ pub struct AttachTurnOptions {
 }
 
 #[cfg(feature = "tui")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnControl {
     PollNow,
+    Submit { prompt: String, yolo: bool },
     Detach,
     Interrupt,
 }
@@ -336,6 +344,25 @@ where
                         if let Some(terminal) = terminal {
                             return Ok(TurnWaitOutcome::Terminal(terminal));
                         }
+                    }
+                    Some(TurnControl::Submit { prompt, yolo }) => {
+                        let queued = start_turn(
+                            target,
+                            client,
+                            started.thread_id.clone(),
+                            prompt.clone(),
+                            TurnStartOptions {
+                                model: None,
+                                effort: None,
+                                service_tier: None,
+                                yolo,
+                            },
+                        )
+                        .await?;
+                        let mut event = queued.acceptance.clone();
+                        event["type"] = json!("queued");
+                        event["prompt"] = json!(prompt);
+                        on_event(&event)?;
                     }
                     Some(TurnControl::Detach) | None => {
                         if options.unsubscribe_on_detach {

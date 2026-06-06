@@ -45,6 +45,9 @@
   the same turn.
 - Keep TUI transcript scroll bounds in sync with suppressed headers so long
   threads opened at the bottom do not render blank.
+- Keep TUI streams attached to the selected thread across queued follow-up turns
+  and preserve optimistic queued messages until app-server history includes
+  them.
 
 ## [0.1.5] - 2026-06-05
 
