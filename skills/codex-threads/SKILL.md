@@ -101,16 +101,17 @@ Useful TUI keys:
 - `]` and `[` page through browser/detail cursors when available.
 - `p` toggles the browser preview pane, which lazily fetches the selected
   thread's recent messages.
-- `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
-  relative updated-time display toggle. In filters, `a` toggles the archived
-  thread filter.
+- `f` opens filters, `s` opens sort, and `c` opens visible columns plus
+  relative updated-time and auto-refresh interval controls. In filters, `a`
+  toggles the archived thread filter.
 - `a` edits the local annotation with `Enter` save and `Ctrl-D` clear.
 - `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
   but app-server does not expose a clear-name operation.
 - `A` opens confirmation to archive or unarchive the active thread.
 - `T` attaches to the selected active thread in the browser or the open active
   thread in detail.
-- `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
+- `r` refreshes; `R` resets pagination; `t` toggles real browser auto-refresh.
+  Use the `c` menu to set the persisted 5-300 second refresh interval.
 - `y` copies the active thread id with OSC 52.
 - `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
   `Tab` toggles stream/no-wait. Browser compose streams into the preview while

@@ -285,7 +285,7 @@ impl TuiState {
         };
         let sort = init.sort.or(init.prefs.browser.sort);
         let auto_refresh = init.prefs.refresh.auto;
-        let auto_refresh_seconds = init.prefs.refresh.interval_seconds.max(5);
+        let auto_refresh_seconds = init.prefs.refresh.interval_seconds.clamp(5, 300);
         Self {
             mode: Mode::Browser,
             browser: BrowserState {

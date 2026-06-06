@@ -58,6 +58,10 @@ const DEFAULT_LIMIT: u32 = 50;
 const DETAIL_TURN_LIMIT: u32 = 10;
 const PREVIEW_TURN_LIMIT: u32 = 3;
 const DETAIL_FOLLOW_REFRESH_SECS: u64 = 5;
+const AUTO_REFRESH_MIN_SECS: u64 = 5;
+const AUTO_REFRESH_MAX_SECS: u64 = 300;
+const AUTO_REFRESH_STEP_SECS: u64 = 5;
+const SCHEDULER_TICK_SECS: u64 = 5;
 const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
 
@@ -103,7 +107,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     schedule_browser_refresh(&mut state, &fetch_tx).await?;
 
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_TICK_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -797,6 +801,19 @@ async fn handle_terminal_event(
                     state.prefs.browser.relative_updated = !state.prefs.browser.relative_updated;
                     schedule_browser_refresh(state, fetch_tx).await?;
                 }
+                KeyCode::Char('t') => {
+                    state.browser.auto_refresh = !state.browser.auto_refresh;
+                    state.prefs.refresh.auto = state.browser.auto_refresh;
+                    if state.browser.auto_refresh {
+                        schedule_browser_refresh(state, fetch_tx).await?;
+                    }
+                }
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    adjust_auto_refresh_interval(state, -(AUTO_REFRESH_STEP_SECS as i64));
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    adjust_auto_refresh_interval(state, AUTO_REFRESH_STEP_SECS as i64);
+                }
                 _ => {}
             }
             if !matches!(key.code, KeyCode::Esc) {
@@ -1129,6 +1146,9 @@ async fn handle_terminal_event(
             state.browser.auto_refresh = !state.browser.auto_refresh;
             state.prefs.refresh.auto = state.browser.auto_refresh;
             let _ = save_prefs(&state.prefs);
+            if state.browser.auto_refresh && matches!(state.mode, Mode::Browser) {
+                schedule_browser_refresh(state, fetch_tx).await?;
+            }
         }
         KeyCode::Char('p') if matches!(state.mode, Mode::Browser) => {
             state.prefs.browser.preview_pane = !state.prefs.browser.preview_pane;
@@ -3235,6 +3255,15 @@ fn active_thread_title(state: &TuiState) -> Option<String> {
     }
 }
 
+fn adjust_auto_refresh_interval(state: &mut TuiState, delta_seconds: i64) {
+    let current = state.browser.auto_refresh_seconds as i64;
+    let next = current
+        .saturating_add(delta_seconds)
+        .clamp(AUTO_REFRESH_MIN_SECS as i64, AUTO_REFRESH_MAX_SECS as i64) as u64;
+    state.browser.auto_refresh_seconds = next;
+    state.prefs.refresh.interval_seconds = next;
+}
+
 fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4046,6 +4075,59 @@ mod tests {
             format_browser_updated_epoch_at(now + 60, now, true),
             "2023-11-14 22:14"
         );
+    }
+
+    #[test]
+    fn auto_refresh_interval_adjustment_clamps_and_updates_prefs() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        adjust_auto_refresh_interval(&mut state, -(AUTO_REFRESH_MAX_SECS as i64));
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MIN_SECS);
+        assert_eq!(state.prefs.refresh.interval_seconds, AUTO_REFRESH_MIN_SECS);
+
+        adjust_auto_refresh_interval(&mut state, AUTO_REFRESH_MAX_SECS as i64);
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MAX_SECS);
+        assert_eq!(state.prefs.refresh.interval_seconds, AUTO_REFRESH_MAX_SECS);
+    }
+
+    #[test]
+    fn tui_init_clamps_loaded_auto_refresh_interval() {
+        let mut prefs = TuiPrefs::default();
+        prefs.refresh.interval_seconds = 1;
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MIN_SECS);
+
+        let mut prefs = TuiPrefs::default();
+        prefs.refresh.interval_seconds = AUTO_REFRESH_MAX_SECS + 1;
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        assert_eq!(state.browser.auto_refresh_seconds, AUTO_REFRESH_MAX_SECS);
     }
 
     #[test]

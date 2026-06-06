@@ -215,6 +215,8 @@ Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns. Browser compose streams into the preview while the
 thread remains selected, and detaches locally when selection moves away. If the
 initial selected browser row is active, the TUI attaches to it automatically.
+Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
+refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
@@ -500,11 +502,12 @@ TUI preferences are local `codex-threads` state, separate from annotations:
 3. `~/.local/state/codex-threads/tui.json`
 
 The TUI persists disposable UI preferences such as visible columns,
-auto-refresh, preview pane, and default sort. Corrupt or unsupported preference
-files are renamed to `tui.json.corrupt.<epoch>` when possible and fall back to
-defaults instead of blocking launch. In search mode, `--cwd` is a local
-refinement over the loaded search page; sort controls are disabled until the
-app-server search API supports server-side sorting.
+auto-refresh, the 5-300 second refresh interval, preview pane, and default sort.
+Corrupt or unsupported preference files are renamed to
+`tui.json.corrupt.<epoch>` when possible and fall back to defaults instead of
+blocking launch. In search mode, `--cwd` is a local refinement over the loaded
+search page; sort controls are disabled until the app-server search API supports
+server-side sorting.
 
 Exit codes:
 

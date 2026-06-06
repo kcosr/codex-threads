@@ -571,6 +571,11 @@ fn browser_status_bar(state: &TuiState) -> String {
         } else {
             ""
         };
+    let auto_refresh = if state.browser.auto_refresh {
+        format!(" auto={}s", state.browser.auto_refresh_seconds)
+    } else {
+        String::new()
+    };
     let stream = state.stream.as_ref().map(format_stream).unwrap_or_default();
     let error = state
         .browser
@@ -580,7 +585,7 @@ fn browser_status_bar(state: &TuiState) -> String {
         .unwrap_or_default();
     let notice = notice_status(state);
     format!(
-        "{} rows={}{}{}{}{}{}",
+        "{} rows={}{}{}{}{}{}{}",
         match state.browser.source {
             BrowserSource::List => "list",
             BrowserSource::Search => "search",
@@ -588,6 +593,7 @@ fn browser_status_bar(state: &TuiState) -> String {
         state.browser.rows.len(),
         query,
         local_cwd,
+        auto_refresh,
         loading,
         stream,
         error,
@@ -770,6 +776,11 @@ fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 "5 relative updated: {}",
                 on_off(state.prefs.browser.relative_updated)
             ),
+            format!("t auto-refresh: {}", on_off(state.browser.auto_refresh)),
+            format!(
+                "-/+ refresh interval: {}s",
+                state.browser.auto_refresh_seconds
+            ),
             "Esc close".to_string(),
         ],
     );
@@ -847,7 +858,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "Browser",
         "  Enter open detail  m compose message  / search threads",
         "  T attach/watch active turn  a annotate  e rename  A confirm archive/unarchive",
-        "  f filters  s sort  c columns/time format  p preview  t auto-refresh",
+        "  f filters  s sort  c columns/time/refresh  p preview  t auto-refresh",
         "",
         "Detail",
         "  Esc browser/detach detail session  Enter or m compose/message action",
@@ -863,6 +874,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "Menus and Prompts",
         "  Filters: a toggle archived filter  Sort: u updated, c created, d direction",
         "  Columns: 1 status, 2 updated, 3 cwd, 4 annotation, 5 relative time",
+        "  Columns: t auto-refresh, -/+ refresh interval",
         "  Active turn: Enter/T attach, s steer, i interrupt, Esc cancel",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
