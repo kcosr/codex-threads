@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::cli::SortKey;
 use crate::tui::state::StreamStatus;
-use crate::tui::state::{BrowserSource, DetailState, ThreadRow};
+use crate::tui::state::{BrowserSource, DetailState, MessageBlock, ThreadRow};
 
 #[derive(Debug, Clone)]
 pub(crate) struct BrowserQuery {
@@ -62,7 +62,7 @@ pub(crate) enum AppEvent {
     PreviewLoaded {
         epoch: u64,
         thread_id: String,
-        text: Option<String>,
+        messages: Vec<MessageBlock>,
     },
     PreviewLoadFailed {
         epoch: u64,

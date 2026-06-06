@@ -136,7 +136,7 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let (table_area, preview_area) = if state.prefs.browser.preview_pane && area.height >= 16 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(9)])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
         (chunks[0], Some(chunks[1]))
     } else {
@@ -284,23 +284,30 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     };
     let preview = &state.browser.preview;
-    let text = if preview.thread_id.as_deref() != Some(row.id.as_str()) || preview.loading {
-        vec![Line::from("Loading last message...")]
+    let (text, scroll) = if preview.thread_id.as_deref() != Some(row.id.as_str()) || preview.loading
+    {
+        (vec![Line::from("Loading recent messages...")], 0)
     } else if let Some(error) = &preview.error {
-        vec![Line::from(format!("Preview failed: {error}"))]
-    } else if let Some(text) = &preview.text {
-        vec![Line::from(text.clone())]
+        (vec![Line::from(format!("Preview failed: {error}"))], 0)
+    } else if !preview.messages.is_empty() {
+        let lines = transcript_lines(&preview.messages);
+        let viewport = area.height.saturating_sub(2) as usize;
+        let scroll = lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16;
+        (lines, scroll)
     } else if let Some(snippet) = &row.snippet {
-        vec![Line::from(snippet.clone())]
+        (vec![Line::from(snippet.clone())], 0)
     } else {
-        vec![Line::from("No message preview available")]
+        (vec![Line::from("No message preview available")], 0)
     };
     frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" Last Message ")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(
+                Block::default()
+                    .title(" Recent Messages ")
+                    .borders(Borders::ALL),
+            ),
         area,
     );
 }
@@ -339,8 +346,21 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         chunks[0],
     );
 
+    let lines = transcript_lines(&detail.messages);
+    let scroll = detail.scroll.min(detail.max_scroll());
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title(" Transcript ").borders(Borders::ALL))
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false })
+            .style(Style::default()),
+        chunks[1],
+    );
+}
+
+fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for message in &detail.messages {
+    for message in messages {
         let role_style = match message.role.as_str() {
             "user" => Style::default()
                 .fg(Color::Yellow)
@@ -375,15 +395,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
         lines.push(Line::from(""));
     }
-    let scroll = detail.scroll.min(detail.max_scroll());
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().title(" Transcript ").borders(Borders::ALL))
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false })
-            .style(Style::default()),
-        chunks[1],
-    );
+    lines
 }
 
 fn detail_header_status(state: &TuiState) -> String {
@@ -903,7 +915,32 @@ mod tests {
             .preview
             .thread_id
             .replace("thread-1".to_string());
-        state.browser.preview.text = Some("assistant: recent assistant message".to_string());
+        state.browser.preview.messages = vec![
+            MessageBlock {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("user-1".to_string()),
+                role: "user".to_string(),
+                timestamp: Some("2026-06-05 09:29".to_string()),
+                lines: vec![MessageLine {
+                    kind: MessageLineKind::Text,
+                    text: "recent user message".to_string(),
+                    spans: Vec::new(),
+                }],
+                is_match: false,
+            },
+            MessageBlock {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("assistant-1".to_string()),
+                role: "assistant".to_string(),
+                timestamp: Some("2026-06-05 09:30".to_string()),
+                lines: vec![MessageLine {
+                    kind: MessageLineKind::Text,
+                    text: "recent assistant message".to_string(),
+                    spans: Vec::new(),
+                }],
+                is_match: false,
+            },
+        ];
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state)).unwrap();
@@ -913,7 +950,10 @@ mod tests {
         assert!(text.contains("2026-06-05 09:30"));
         assert!(text.contains("~/repo"));
         assert!(text.contains("needs review"));
-        assert!(text.contains("assistant: recent assistant message"));
+        assert!(text.contains("USER"));
+        assert!(text.contains("recent user message"));
+        assert!(text.contains("ASSISTANT"));
+        assert!(text.contains("recent assistant message"));
     }
 
     #[test]

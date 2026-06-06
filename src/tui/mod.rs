@@ -353,7 +353,7 @@ async fn preview_worker(
                 let _ = app_tx.send(AppEvent::PreviewLoaded {
                     epoch: request.epoch,
                     thread_id: request.thread_id,
-                    text,
+                    messages: text,
                 });
             }
             Err(err) => {
@@ -462,12 +462,12 @@ async fn fetch_preview(
     target: &Target,
     client: &mut RpcClient,
     thread_id: String,
-) -> Result<Option<String>> {
+) -> Result<Vec<MessageBlock>> {
     let mut output = read_thread_detail(
         target,
         client,
         ShowThreadRequest {
-            thread_id,
+            thread_id: thread_id.clone(),
             last: PREVIEW_TURN_LIMIT,
             cursor: None,
             asc: false,
@@ -477,7 +477,7 @@ async fn fetch_preview(
     )
     .await?;
     normalize_detail_turns_for_display(&mut output);
-    Ok(last_message_preview(&output))
+    Ok(detail_state(output, None, thread_id, 0, None).messages)
 }
 
 async fn schedule_browser_refresh(
@@ -624,7 +624,7 @@ async fn schedule_selected_preview_if_needed(
     };
     if state.browser.preview.thread_id.as_deref() == Some(thread_id.as_str())
         && (state.browser.preview.loading
-            || state.browser.preview.text.is_some()
+            || !state.browser.preview.messages.is_empty()
             || state.browser.preview.error.is_some())
     {
         return Ok(());
@@ -1780,8 +1780,8 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         AppEvent::PreviewLoaded {
             epoch,
             thread_id,
-            text,
-        } => state.set_preview_loaded(epoch, thread_id, text),
+            messages,
+        } => state.set_preview_loaded(epoch, thread_id, messages),
         AppEvent::PreviewLoadFailed {
             epoch,
             thread_id,
@@ -2468,63 +2468,6 @@ fn normalize_detail_turns_for_display(output: &mut Value) {
     if let Some(turns) = output["turns"]["data"].as_array_mut() {
         turns.reverse();
     }
-}
-
-fn last_message_preview(output: &Value) -> Option<String> {
-    let mut last = None;
-    for turn in output["turns"]["data"].as_array()? {
-        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
-            let role = match item["type"].as_str() {
-                Some("userMessage") => "user",
-                Some("agentMessage") => "assistant",
-                _ => continue,
-            };
-            let Some(text) = message_text_from_item(item) else {
-                continue;
-            };
-            let text = compact_preview_text(&text);
-            if !text.is_empty() {
-                last = Some(format!("{role}: {text}"));
-            }
-        }
-    }
-    last
-}
-
-fn message_text_from_item(item: &Value) -> Option<String> {
-    match item["type"].as_str() {
-        Some("userMessage") => {
-            let parts = item["content"]
-                .as_array()
-                .map(|content| {
-                    content
-                        .iter()
-                        .filter_map(|input| input["text"].as_str())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        Some("agentMessage") => item["text"].as_str().map(str::to_string),
-        _ => None,
-    }
-}
-
-fn compact_preview_text(text: &str) -> String {
-    let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    const MAX_PREVIEW_CHARS: usize = 700;
-    if compact.chars().count() > MAX_PREVIEW_CHARS {
-        compact = compact
-            .chars()
-            .take(MAX_PREVIEW_CHARS.saturating_sub(1))
-            .collect::<String>();
-        compact.push_str("...");
-    }
-    compact
 }
 
 fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> ThreadRow {
@@ -3277,8 +3220,9 @@ mod tests {
     }
 
     #[test]
-    fn last_message_preview_uses_recent_message_text() {
-        let output = serde_json::json!({
+    fn preview_detail_state_keeps_recent_user_and_assistant_messages() {
+        let detail = detail_state(
+            serde_json::json!({
             "thread": {"id": "t1"},
             "turns": {"data": [
                 {"id": "old", "items": [
@@ -3290,12 +3234,22 @@ mod tests {
                     {"id": "a2", "type": "agentMessage", "text": "latest\nassistant"}
                 ]}
             ]}
-        });
-
-        assert_eq!(
-            last_message_preview(&output).as_deref(),
-            Some("assistant: latest assistant")
+            }),
+            None,
+            "t1".to_string(),
+            0,
+            None,
         );
+
+        let roles = detail
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert_eq!(detail.messages[2].lines[0].text, "latest user");
+        assert_eq!(detail.messages[3].lines[0].text, "latest");
+        assert_eq!(detail.messages[3].lines[1].text, "assistant");
     }
 
     #[tokio::test]
@@ -3328,24 +3282,22 @@ mod tests {
             AppEvent::PreviewLoaded {
                 epoch: 0,
                 thread_id: "t1".to_string(),
-                text: Some("assistant: stale".to_string()),
+                messages: vec![message_block(None, None, "assistant", None, "stale", 100)],
             },
             &mut state,
         );
-        assert!(state.browser.preview.text.is_none());
+        assert!(state.browser.preview.messages.is_empty());
 
         handle_app_event(
             AppEvent::PreviewLoaded {
                 epoch: 1,
                 thread_id: "t1".to_string(),
-                text: Some("assistant: fresh".to_string()),
+                messages: vec![message_block(None, None, "assistant", None, "fresh", 100)],
             },
             &mut state,
         );
-        assert_eq!(
-            state.browser.preview.text.as_deref(),
-            Some("assistant: fresh")
-        );
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(state.browser.preview.messages[0].lines[0].text, "fresh");
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub struct BrowserPreviewState {
     pub epoch: u64,
     pub thread_id: Option<String>,
     pub loading: bool,
-    pub text: Option<String>,
+    pub messages: Vec<MessageBlock>,
     pub error: Option<String>,
 }
 
@@ -351,19 +351,24 @@ impl TuiState {
         self.browser.preview.epoch += 1;
         self.browser.preview.thread_id = Some(thread_id);
         self.browser.preview.loading = true;
-        self.browser.preview.text = None;
+        self.browser.preview.messages.clear();
         self.browser.preview.error = None;
         self.browser.preview.epoch
     }
 
-    pub fn set_preview_loaded(&mut self, epoch: u64, thread_id: String, text: Option<String>) {
+    pub fn set_preview_loaded(
+        &mut self,
+        epoch: u64,
+        thread_id: String,
+        messages: Vec<MessageBlock>,
+    ) {
         if self.browser.preview.epoch != epoch
             || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
         {
             return;
         }
         self.browser.preview.loading = false;
-        self.browser.preview.text = text;
+        self.browser.preview.messages = messages;
         self.browser.preview.error = None;
     }
 

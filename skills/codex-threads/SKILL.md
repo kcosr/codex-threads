@@ -100,7 +100,7 @@ Useful TUI keys:
 - Search prompts use `Enter` to apply and `Ctrl-D` to clear.
 - `]` and `[` page through browser/detail cursors when available.
 - `p` toggles the browser preview pane, which lazily fetches the selected
-  thread's last message.
+  thread's recent messages.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
   relative updated-time display toggle. In filters, `a` toggles the archived
   thread filter.

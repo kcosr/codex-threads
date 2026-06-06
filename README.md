@@ -206,7 +206,7 @@ Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `?` for keyboard help, `/` to search threads or loaded transcript messages,
 `Enter` to open a thread, `]` and `[` to page when cursors are available, `p`
-to toggle the lazy last-message preview pane, `f` for filters, `s` for sort,
+to toggle the lazy recent-message preview pane, `f` for filters, `s` for sort,
 `c` for visible columns and updated-time display, `a` to annotate, `e` to
 rename, `A` to archive
 or unarchive, `r` to refresh, `y` to copy the active thread id with OSC 52, and
