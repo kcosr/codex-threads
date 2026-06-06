@@ -7,8 +7,10 @@ mod prefs;
 mod state;
 mod views;
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::annotations::{clear_annotation, set_annotation};
 use crate::cli::{ItemsView, SortKey, TuiCommand};
-use crate::config::Target;
+use crate::config::{Endpoint, Target};
 use crate::errors::usage_error;
 use crate::rpc::RpcClient;
 use crate::session::{
@@ -68,6 +70,8 @@ const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
 const FOLLOW_NEXT_TURN_POLL_ATTEMPTS: usize = 8;
 const FOLLOW_NEXT_TURN_POLL_INTERVAL_MS: u64 = 500;
+const CODEX_BIN_ENV: &str = "CODEX_THREADS_CODEX_BIN";
+const CODEX_REMOTE_AUTH_ENV: &str = "CODEX_THREADS_CODEX_REMOTE_AUTH_TOKEN";
 
 pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<i32> {
     if !io::stdout().is_terminal() {
@@ -236,8 +240,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        enter_terminal()?;
         let previous_hook = panic::take_hook();
         let previous_hook = Arc::new(Mutex::new(Some(previous_hook)));
         let hook_for_panic = Arc::clone(&previous_hook);
@@ -269,6 +272,12 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn enter_terminal() -> Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    Ok(())
+}
+
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -277,6 +286,62 @@ fn restore_terminal() {
         Show,
         LeaveAlternateScreen
     );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexResumeLaunch {
+    program: OsString,
+    args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+}
+
+fn build_codex_resume_launch(
+    target: &Target,
+    thread_id: &str,
+    cwd: &str,
+    yolo: bool,
+) -> CodexResumeLaunch {
+    let mut args = vec![
+        OsString::from("resume"),
+        OsString::from(thread_id),
+        OsString::from("--remote"),
+        OsString::from(target.endpoint.display()),
+    ];
+    let mut env = Vec::new();
+    if let Endpoint::WebSocket {
+        auth_token: Some(token),
+        ..
+    } = &target.endpoint
+    {
+        args.push(OsString::from("--remote-auth-token-env"));
+        args.push(OsString::from(CODEX_REMOTE_AUTH_ENV));
+        env.push((OsString::from(CODEX_REMOTE_AUTH_ENV), OsString::from(token)));
+    }
+    if yolo {
+        args.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"));
+    }
+    args.push(OsString::from("--cd"));
+    args.push(OsString::from(cwd));
+    CodexResumeLaunch {
+        program: std::env::var_os(CODEX_BIN_ENV).unwrap_or_else(|| OsString::from("codex")),
+        args,
+        env,
+    }
+}
+
+fn launch_codex_resume(launch: &CodexResumeLaunch) -> Result<ExitStatus> {
+    let _ = io::stdout().flush();
+    restore_terminal();
+    let status = Command::new(&launch.program)
+        .args(&launch.args)
+        .envs(launch.env.iter().cloned())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch `{}`", launch.program.to_string_lossy()));
+    enter_terminal().context("failed to restore tui terminal after codex exited")?;
+    status
 }
 
 #[cfg(unix)]
@@ -996,6 +1061,53 @@ async fn handle_terminal_event(
             }
             return Ok(());
         }
+        Mode::ConfirmOpenCodex {
+            thread_id,
+            cwd,
+            return_to_detail,
+        } => {
+            let return_mode = if return_to_detail {
+                Mode::Detail
+            } else {
+                Mode::Browser
+            };
+            match key.code {
+                KeyCode::Esc => state.mode = return_mode,
+                KeyCode::Enter => {
+                    state.mode = return_mode;
+                    detach_stream(state);
+                    let launch = build_codex_resume_launch(target, &thread_id, &cwd, yolo);
+                    let status = launch_codex_resume(&launch);
+                    match status {
+                        Ok(status) if status.success() => {
+                            state.set_notice("codex exited");
+                        }
+                        Ok(status) => {
+                            state.set_notice(format!("codex exited with {status}"));
+                        }
+                        Err(error) => {
+                            state.set_notice(format!("failed to launch codex: {error}"));
+                        }
+                    }
+                    schedule_browser_refresh(state, fetch_tx).await?;
+                    if state
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.thread_id == thread_id)
+                    {
+                        schedule_detail_refresh(state, fetch_tx, thread_id).await?;
+                    }
+                }
+                _ => {
+                    state.mode = Mode::ConfirmOpenCodex {
+                        thread_id,
+                        cwd,
+                        return_to_detail,
+                    }
+                }
+            }
+            return Ok(());
+        }
         Mode::Help => {
             state.mode = Mode::Browser;
             return Ok(());
@@ -1112,6 +1224,20 @@ async fn handle_terminal_event(
                     draft,
                     return_to_detail,
                 };
+            }
+        }
+        KeyCode::Char('o') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                if let Some(cwd) = active_thread_cwd(state, &thread_id) {
+                    let return_to_detail = matches!(state.mode, Mode::Detail);
+                    state.mode = Mode::ConfirmOpenCodex {
+                        thread_id,
+                        cwd,
+                        return_to_detail,
+                    };
+                } else {
+                    state.set_notice("thread cwd unavailable; refresh or load first");
+                }
             }
         }
         KeyCode::Char('y') => {
@@ -1478,6 +1604,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
         | Mode::ConfirmArchive {
             return_to_detail: true,
             ..
+        }
+        | Mode::ConfirmOpenCodex {
+            return_to_detail: true,
+            ..
         } => scroll_detail(state, delta),
         Mode::Browser
         | Mode::SearchInput { .. }
@@ -1490,6 +1620,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
             ..
         }
         | Mode::ConfirmInterrupt {
+            return_to_detail: false,
+            ..
+        }
+        | Mode::ConfirmOpenCodex {
             return_to_detail: false,
             ..
         } => {
@@ -3541,6 +3675,16 @@ fn active_thread_id(state: &TuiState) -> Option<String> {
         Mode::Detail => state.detail.as_ref().map(|detail| detail.thread_id.clone()),
         _ => state.selected_thread_id().map(str::to_string),
     }
+}
+
+fn active_thread_cwd(state: &TuiState, thread_id: &str) -> Option<String> {
+    state
+        .browser
+        .rows
+        .iter()
+        .find(|row| row.id == thread_id)
+        .map(|row| row.cwd.clone())
+        .filter(|cwd| !cwd.trim().is_empty())
 }
 
 fn selected_thread_is_running(state: &TuiState, thread_id: &str) -> bool {
@@ -7165,6 +7309,135 @@ mod tests {
 
         assert!(matches!(state.mode, Mode::Browser));
         assert!(app_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn open_codex_shortcut_opens_confirmation_with_thread_cwd() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut row = test_thread_row("t1", "idle");
+        row.cwd = "/tmp/project".to_string();
+        state.browser.rows = vec![row];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmOpenCodex {
+                ref thread_id,
+                ref cwd,
+                return_to_detail: false,
+            } if thread_id == "t1" && cwd == "/tmp/project"
+        ));
+        assert!(app_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn codex_resume_launch_uses_remote_cwd_and_yolo_flag() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/codex.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+
+        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project", true);
+        let args = launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "resume",
+                "session-1",
+                "--remote",
+                "unix:///tmp/codex.sock",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--cd",
+                "/tmp/project",
+            ]
+        );
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn codex_resume_launch_passes_websocket_auth_by_env() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::WebSocket {
+                url: "ws://127.0.0.1:1234/".to_string(),
+                auth_token: Some("secret-token".to_string()),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+
+        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project", false);
+        let args = launch
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "resume",
+                "session-1",
+                "--remote",
+                "ws://127.0.0.1:1234/",
+                "--remote-auth-token-env",
+                CODEX_REMOTE_AUTH_ENV,
+                "--cd",
+                "/tmp/project",
+            ]
+        );
+        assert_eq!(
+            launch
+                .env
+                .iter()
+                .map(|(name, value)| (
+                    name.to_string_lossy().to_string(),
+                    value.to_string_lossy().to_string()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                CODEX_REMOTE_AUTH_ENV.to_string(),
+                "secret-token".to_string()
+            )]
+        );
     }
 
     #[tokio::test]

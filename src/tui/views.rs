@@ -39,6 +39,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 return_to_detail: true,
                 ..
             }
+            | Mode::ConfirmOpenCodex {
+                return_to_detail: true,
+                ..
+            }
     ) || (matches!(
         state.mode,
         Mode::AnnotationInput { .. } | Mode::RenameInput { .. }
@@ -100,6 +104,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             ..
         } => {
             draw_confirm_archive(frame, area, thread_id, *archived);
+        }
+        Mode::ConfirmOpenCodex { thread_id, cwd, .. } => {
+            draw_confirm_open_codex(frame, area, thread_id, cwd);
         }
         Mode::Compose(compose) => {
             let label = match compose.target {
@@ -571,6 +578,10 @@ fn draws_detail_background(state: &TuiState) -> bool {
                 return_to_detail: true,
                 ..
             }
+            | Mode::ConfirmOpenCodex {
+                return_to_detail: true,
+                ..
+            }
     ) || (matches!(
         state.mode,
         Mode::AnnotationInput { .. } | Mode::RenameInput { .. }
@@ -855,6 +866,19 @@ fn draw_confirm_archive(frame: &mut Frame<'_>, area: Rect, thread_id: &str, arch
     );
 }
 
+fn draw_confirm_open_codex(frame: &mut Frame<'_>, area: Rect, thread_id: &str, cwd: &str) {
+    draw_static_modal(
+        frame,
+        area,
+        "Open In Codex",
+        &[
+            format!("Launch Codex TUI for {thread_id}?"),
+            format!("cwd: {cwd}"),
+            "Enter launch, Esc cancel".to_string(),
+        ],
+    );
+}
+
 fn draw_static_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String]) {
     let height = (lines.len() as u16 + 2).max(5);
     let area = centered_rect(area, 70, height);
@@ -883,7 +907,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Browser: [ previous page  ] next page",
         "",
         "Browser",
-        "  Enter open detail  m compose message  / search threads",
+        "  Enter open detail  m compose message  o open in Codex TUI  / search threads",
         "  l load selected thread  T attach/watch active turn",
         "  S steer selected active turn  i interrupt selected active turn",
         "  a annotate  e rename  A confirm archive/unarchive",
@@ -893,7 +917,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Esc browser/detach detail session  Enter or m compose/message action",
         "  gg/Home real transcript start  G/End real transcript end",
         "  / search loaded transcript  n/N next/previous match",
-        "  l load thread  a annotate  e rename  A confirm archive/unarchive",
+        "  l load thread  o open in Codex TUI  a annotate  e rename  A confirm archive/unarchive",
         "  T attach  S steer  i interrupt",
         "",
         "Compose and Text Inputs",
@@ -908,6 +932,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Columns: t auto-refresh, -/+ refresh interval",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
+        "  Open in Codex confirmation: Enter launch, Esc cancel",
     ];
     frame.render_widget(
         Paragraph::new(items.join("\n"))

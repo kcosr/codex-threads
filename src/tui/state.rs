@@ -30,6 +30,11 @@ pub enum Mode {
         archived: bool,
         return_to_detail: bool,
     },
+    ConfirmOpenCodex {
+        thread_id: String,
+        cwd: String,
+        return_to_detail: bool,
+    },
     AnnotationInput {
         thread_id: String,
         draft: String,
@@ -652,6 +657,10 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
         })
         | Mode::ConfirmInterrupt { .. }
         | Mode::ConfirmArchive {
+            return_to_detail: true,
+            ..
+        }
+        | Mode::ConfirmOpenCodex {
             return_to_detail: true,
             ..
         } => previous_mode,

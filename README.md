@@ -210,7 +210,8 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
 to confirm archive or unarchive, `T` to attach to the selected active thread,
 `S` to steer the selected active thread, `i` to confirm interrupting it, `r` to
-refresh, `y` to copy the active thread id with OSC 52, and `m` to compose. Use
+refresh, `y` to copy the active thread id with OSC 52, `o` to confirm opening
+the active thread in Codex's own TUI, and `m` to compose. Use
 `l` to explicitly load the selected or open thread, matching
 `status THREAD_ID --load`, then refresh visible metadata and history.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
@@ -236,6 +237,11 @@ there; `G` and `End` load through to the real transcript end before jumping
 there. Detail views refresh in place while open, and `Esc` returns to the
 browser after unlinking the local detail view and detaching any local stream.
 Local detach leaves remote turns running.
+Opening in Codex temporarily returns terminal control to `codex resume
+<thread-id> --remote <server-endpoint> --cd <thread-cwd>`, adding
+`--dangerously-bypass-approvals-and-sandbox` when the codex-threads TUI was
+launched with yolo enabled, then redraws and refreshes the codex-threads TUI
+after Codex exits.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
