@@ -851,19 +851,21 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let items = [
         "Global",
         "  ? help  q quit  Ctrl-C quit or interrupt active stream",
-        "  r refresh or poll active stream  R reload/reset  y copy thread id",
+        "  r refresh or poll active stream  R reload/reset  l load thread  y copy thread id",
         "  j/k, arrows, or mouse wheel move/scroll  gg/Home top  G/End bottom",
         "  [ newer page  ] older page",
         "",
         "Browser",
         "  Enter open detail  m compose message  / search threads",
-        "  T attach/watch active turn  a annotate  e rename  A confirm archive/unarchive",
+        "  l load selected thread  T attach/watch active turn",
+        "  a annotate  e rename  A confirm archive/unarchive",
         "  f filters  s sort  c columns/time/refresh  p preview  t auto-refresh",
         "",
         "Detail",
         "  Esc browser/detach detail session  Enter or m compose/message action",
         "  / search loaded transcript  n/N next/previous match",
-        "  a annotate  e rename  A confirm archive/unarchive  T attach  S steer  i interrupt",
+        "  l load thread  a annotate  e rename  A confirm archive/unarchive",
+        "  T attach  S steer  i interrupt",
         "",
         "Compose and Text Inputs",
         "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
@@ -1086,6 +1088,7 @@ mod tests {
 
         assert!(text.contains("? help"));
         assert!(text.contains("r/R refresh/reload"));
+        assert!(text.contains("l load"));
         assert!(text.contains("[] page"));
     }
 
@@ -1116,6 +1119,7 @@ mod tests {
 
         assert!(text.contains("Global"));
         assert!(text.contains("r refresh or poll active stream"));
+        assert!(text.contains("l load thread"));
         assert!(text.contains("[ newer page"));
         assert!(text.contains("Browser"));
         assert!(text.contains("a annotate"));

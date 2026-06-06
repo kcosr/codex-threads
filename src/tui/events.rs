@@ -30,6 +30,9 @@ pub(crate) enum FetchRequest {
         cursor: Option<String>,
         page_direction: DetailPageDirection,
     },
+    LoadThread {
+        thread_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -66,6 +69,14 @@ pub(crate) enum AppEvent {
     },
     PreviewLoadFailed {
         epoch: u64,
+        thread_id: String,
+        error: String,
+    },
+    ThreadLoaded {
+        thread_id: String,
+        status: Value,
+    },
+    ThreadLoadFailed {
         thread_id: String,
         error: String,
     },

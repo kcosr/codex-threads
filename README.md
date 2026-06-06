@@ -210,7 +210,8 @@ to toggle the lazy recent-message preview pane, `f` for filters, `s` for sort,
 `c` for visible columns and updated-time display, `a` to annotate, `e` to
 rename, `A` to confirm archive or unarchive, `T` to attach to the selected
 active thread, `r` to refresh, `y` to copy the active thread id with OSC 52, and
-`m` to compose.
+`m` to compose. Use `l` to explicitly load the selected or open thread, matching
+`status THREAD_ID --load`, then refresh visible metadata and history.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns. Browser compose streams into the preview while the
 thread remains selected, and detaches locally when selection moves away. If the

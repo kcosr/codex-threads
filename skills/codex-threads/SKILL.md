@@ -112,6 +112,8 @@ Useful TUI keys:
   thread in detail.
 - `r` refreshes; `R` resets pagination; `t` toggles real browser auto-refresh.
   Use the `c` menu to set the persisted 5-300 second refresh interval.
+- `l` explicitly loads the selected/open thread, matching
+  `status THREAD_ID --load`, then refreshes visible metadata and history.
 - `y` copies the active thread id with OSC 52.
 - `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
   `Tab` toggles stream/no-wait. Browser compose streams into the preview while

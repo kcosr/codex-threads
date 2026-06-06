@@ -136,6 +136,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 let refresh_after_archive = archive_changed_thread(&event);
                 let refresh_after_rename = rename_changed_thread(&event);
                 let refresh_after_submit = turn_submitted_thread(&event);
+                let refresh_after_load = loaded_thread(&event);
                 handle_app_event(event, &mut state);
                 if auto_attach_initial_active && !state.should_quit {
                     auto_attach_selected_browser_thread_if_active(
@@ -162,6 +163,18 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 }
                 if refresh_after_submit.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if let Some(thread_id) = refresh_after_load
+                    && !state.should_quit
+                {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                    if state
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.thread_id == thread_id)
+                    {
+                        schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                    }
                 }
                 schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
             }
@@ -290,6 +303,12 @@ async fn fetch_worker(
                             error: err.to_string(),
                         });
                     }
+                    FetchRequest::LoadThread { thread_id } => {
+                        let _ = app_tx.send(AppEvent::ThreadLoadFailed {
+                            thread_id,
+                            error: err.to_string(),
+                        });
+                    }
                 }
             }
             return;
@@ -335,6 +354,29 @@ async fn fetch_worker(
                     Err(err) => {
                         let _ = app_tx.send(AppEvent::DetailLoadFailed {
                             epoch,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+            FetchRequest::LoadThread { thread_id } => {
+                let result = thread_status(
+                    &target,
+                    &mut client,
+                    ThreadStatusRequest {
+                        thread_id: thread_id.clone(),
+                        load: true,
+                        turn_scan_limit: TURN_SCAN_LIMIT,
+                    },
+                )
+                .await;
+                match result {
+                    Ok(status) => {
+                        let _ = app_tx.send(AppEvent::ThreadLoaded { thread_id, status });
+                    }
+                    Err(err) => {
+                        let _ = app_tx.send(AppEvent::ThreadLoadFailed {
+                            thread_id,
                             error: err.to_string(),
                         });
                     }
@@ -505,6 +547,18 @@ async fn schedule_browser_refresh(
     fetch_tx: &mpsc::Sender<FetchRequest>,
 ) -> Result<()> {
     schedule_browser_page(state, fetch_tx, state.browser.current_cursor.clone()).await
+}
+
+async fn schedule_thread_load(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+) -> Result<()> {
+    state.set_notice(format!("loading {thread_id}..."));
+    fetch_tx
+        .send(FetchRequest::LoadThread { thread_id })
+        .await
+        .context("failed to schedule thread load")
 }
 
 async fn schedule_browser_reset(
@@ -1062,6 +1116,11 @@ async fn handle_terminal_event(
         KeyCode::Char('m') => {
             if let Some(thread_id) = active_thread_id(state) {
                 open_message_action(state, thread_id);
+            }
+        }
+        KeyCode::Char('l') => {
+            if let Some(thread_id) = active_thread_id(state) {
+                schedule_thread_load(state, fetch_tx, thread_id).await?;
             }
         }
         KeyCode::Char('S') => {
@@ -2379,6 +2438,14 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             thread_id,
             error,
         } => state.set_preview_error(epoch, thread_id, error),
+        AppEvent::ThreadLoaded { thread_id, status } => {
+            apply_thread_load_status(state, &thread_id, &status);
+            reset_preview_for_thread(state, &thread_id);
+            state.set_notice(format!("loaded {thread_id}"));
+        }
+        AppEvent::ThreadLoadFailed { thread_id, error } => {
+            state.set_notice(format!("failed to load {thread_id}: {error}"));
+        }
         AppEvent::StreamEvent { stream_id, event } => {
             log_stream_event(&event);
             let event_thread_id = event["threadId"].as_str();
@@ -2625,6 +2692,13 @@ fn rename_changed_thread(event: &AppEvent) -> Option<String> {
 fn turn_submitted_thread(event: &AppEvent) -> Option<String> {
     match event {
         AppEvent::TurnSubmitted { thread_id } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn loaded_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::ThreadLoaded { thread_id, .. } => Some(thread_id.clone()),
         _ => None,
     }
 }
@@ -3303,6 +3377,56 @@ fn set_browser_thread_status(state: &mut TuiState, thread_id: &str, status: &str
         && detail.thread_id == thread_id
     {
         detail.status = status.to_string();
+    }
+}
+
+fn apply_thread_load_status(state: &mut TuiState, thread_id: &str, status: &Value) {
+    let thread = &status["thread"];
+    let lifecycle = thread_status_label(thread);
+    let title = thread["name"]
+        .as_str()
+        .or_else(|| thread["preview"].as_str())
+        .map(str::to_string);
+    let cwd = thread["cwd"].as_str().map(str::to_string);
+    let updated = thread["updatedAt"].as_i64().map(|updated_at| {
+        format_browser_updated_epoch(updated_at, state.prefs.browser.relative_updated)
+    });
+    for row in &mut state.browser.rows {
+        if row.id != thread_id {
+            continue;
+        }
+        if let Some(title) = &title {
+            row.title = title.clone();
+        }
+        if let Some(cwd) = &cwd {
+            row.cwd = cwd.clone();
+        }
+        if let Some(updated) = &updated {
+            row.updated = updated.clone();
+        }
+        if !thread.is_null() {
+            if row.raw.get("thread").is_some() {
+                row.raw["thread"] = thread.clone();
+            } else {
+                row.raw = thread.clone();
+            }
+        }
+        row.set_status(lifecycle.clone());
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        if let Some(title) = title {
+            detail.title = title;
+        }
+        detail.status = lifecycle;
+        detail.active_turn_id = status["activeTurnId"].as_str().map(str::to_string);
+    }
+}
+
+fn reset_preview_for_thread(state: &mut TuiState, thread_id: &str) {
+    if state.browser.preview.thread_id.as_deref() == Some(thread_id) {
+        state.browser.preview = Default::default();
     }
 }
 
@@ -5711,6 +5835,172 @@ mod tests {
         assert!(detail.search_query.is_empty());
         assert!(detail.matches.is_empty());
         assert!(fetch_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn load_shortcut_schedules_selected_browser_thread_load() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::LoadThread { thread_id } = fetch_rx.recv().await.unwrap() else {
+            panic!("expected load thread request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert!(
+            state
+                .notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("loading t1")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_shortcut_schedules_open_detail_thread_load() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "notLoaded"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::LoadThread { thread_id } = fetch_rx.recv().await.unwrap() else {
+            panic!("expected load thread request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert!(matches!(state.mode, Mode::Detail));
+    }
+
+    #[test]
+    fn thread_loaded_event_updates_visible_state_and_invalidates_preview() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+        state.browser.preview.thread_id = Some("t1".to_string());
+        state.browser.preview.messages = vec![message_block(
+            Some("turn-old".to_string()),
+            None,
+            "assistant",
+            None,
+            "old",
+            100,
+        )];
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Old", "status": {"type": "notLoaded"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            AppEvent::ThreadLoaded {
+                thread_id: "t1".to_string(),
+                status: serde_json::json!({
+                    "threadId": "t1",
+                    "thread": {
+                        "id": "t1",
+                        "name": "Loaded title",
+                        "cwd": "/tmp/repo",
+                        "updatedAt": 1_700_000_000,
+                        "status": {"type": "idle"}
+                    },
+                    "activeTurnId": null,
+                    "truncated": false
+                }),
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.browser.rows[0].title, "Loaded title");
+        assert_eq!(state.browser.rows[0].cwd, "/tmp/repo");
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
+        );
+        assert_eq!(state.detail.as_ref().unwrap().title, "Loaded title");
+        assert_eq!(state.detail.as_ref().unwrap().status, "idle");
+        assert!(state.browser.preview.thread_id.is_none());
+        assert!(state.browser.preview.messages.is_empty());
     }
 
     #[test]
