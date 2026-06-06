@@ -1934,14 +1934,25 @@ fn stream_assistant_item_mut(
     turn_id: Option<String>,
     item_id: Option<String>,
 ) -> &mut StreamAssistantItem {
-    if let Some(index) = stream.assistant_items.iter().position(|item| {
-        if item_id.is_some() || item.item_id.is_some() {
-            item.item_id == item_id
-        } else {
-            item.turn_id == turn_id
-        }
-    }) {
+    if let Some(index) = stream
+        .assistant_items
+        .iter()
+        .position(|item| assistant_item_exact_match(item, turn_id.as_deref(), item_id.as_deref()))
+    {
         return &mut stream.assistant_items[index];
+    }
+    if item_id.is_some()
+        && let Some(index) = stream
+            .assistant_items
+            .iter()
+            .position(|item| assistant_item_provisional_match(item, turn_id.as_deref()))
+    {
+        let item = &mut stream.assistant_items[index];
+        item.item_id = item_id;
+        if item.turn_id.is_none() {
+            item.turn_id = turn_id;
+        }
+        return item;
     }
     stream.assistant_items.push(StreamAssistantItem {
         turn_id,
@@ -1952,6 +1963,32 @@ fn stream_assistant_item_mut(
         .assistant_items
         .last_mut()
         .expect("stream assistant item just pushed")
+}
+
+fn assistant_item_exact_match(
+    item: &StreamAssistantItem,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> bool {
+    if let Some(item_id) = item_id {
+        item.item_id.as_deref() == Some(item_id)
+            && turns_compatible(item.turn_id.as_deref(), turn_id)
+    } else {
+        item.item_id.is_none() && item.turn_id.as_deref() == turn_id
+    }
+}
+
+fn assistant_item_provisional_match(item: &StreamAssistantItem, turn_id: Option<&str>) -> bool {
+    item.item_id.is_none()
+        && turn_id.is_some()
+        && turns_compatible(item.turn_id.as_deref(), turn_id)
+}
+
+fn turns_compatible(existing: Option<&str>, incoming: Option<&str>) -> bool {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
+    }
 }
 
 fn upsert_streaming_assistant_message(
@@ -1970,16 +2007,27 @@ fn upsert_streaming_assistant_message(
         return;
     }
     let was_at_bottom = detail.is_at_bottom();
-    if let Some(message) = detail.messages.iter_mut().rev().find(|message| {
-        if item_id.is_some() || message.item_id.is_some() {
-            message.role == "assistant" && message.item_id == item_id
-        } else {
-            message.role == "assistant" && message.turn_id == turn_id
-        }
-    }) {
+    let match_index = detail.messages.iter().rposition(|message| {
+        streaming_message_exact_match(message, turn_id.as_deref(), item_id.as_deref())
+    });
+    let provisional_index = if item_id.is_some() && match_index.is_none() {
+        detail
+            .messages
+            .iter()
+            .rposition(|message| streaming_message_provisional_match(message, turn_id.as_deref()))
+    } else {
+        None
+    };
+    if let Some(message) = match_index
+        .or(provisional_index)
+        .and_then(|index| detail.messages.get_mut(index))
+    {
         message.lines = markdown_lines(text, 100);
         if message.turn_id.is_none() {
             message.turn_id = turn_id.clone();
+        }
+        if message.item_id.is_none() {
+            message.item_id = item_id.clone();
         }
     } else {
         detail.messages.push(message_block(
@@ -1998,6 +2046,29 @@ fn upsert_streaming_assistant_message(
         let query = detail.search_query.clone();
         state.update_message_search(query);
     }
+}
+
+fn streaming_message_exact_match(
+    message: &MessageBlock,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> bool {
+    if message.role != "assistant" {
+        return false;
+    }
+    if let Some(item_id) = item_id {
+        message.item_id.as_deref() == Some(item_id)
+            && turns_compatible(message.turn_id.as_deref(), turn_id)
+    } else {
+        message.item_id.is_none() && message.turn_id.as_deref() == turn_id
+    }
+}
+
+fn streaming_message_provisional_match(message: &MessageBlock, turn_id: Option<&str>) -> bool {
+    message.role == "assistant"
+        && message.item_id.is_none()
+        && turn_id.is_some()
+        && turns_compatible(message.turn_id.as_deref(), turn_id)
 }
 
 fn active_thread_id(state: &TuiState) -> Option<String> {
@@ -3137,6 +3208,116 @@ mod tests {
         assert_eq!(detail.messages[0].lines[0].text, "first message");
         assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-2"));
         assert_eq!(detail.messages[1].lines[0].text, "second corrected");
+    }
+
+    #[test]
+    fn terminal_response_adopts_provisional_stream_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": "Verification passed. I'm"
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "server": "work",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "completed",
+                "assistantResponses": [
+                    {
+                        "itemId": "assistant-1",
+                        "text": "Verification passed. I'm installing the rebuilt binary."
+                    }
+                ],
+                "finalAssistantText": "Verification passed. I'm installing the rebuilt binary."
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(
+            detail.messages[0].lines[0].text,
+            "Verification passed. I'm installing the rebuilt binary."
+        );
+    }
+
+    #[test]
+    fn terminal_response_does_not_leave_punctuation_fragment() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "type": "progress",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "delta": "."
+            })),
+            &mut state,
+        );
+        handle_app_event(
+            AppEvent::StreamEvent(serde_json::json!({
+                "server": "work",
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "status": "completed",
+                "assistantResponses": [
+                    {"itemId": "assistant-1", "text": "Done."}
+                ],
+                "finalAssistantText": "Done."
+            })),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(detail.messages[0].lines[0].text, "Done.");
     }
 
     #[test]
