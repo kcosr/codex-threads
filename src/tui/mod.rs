@@ -2395,6 +2395,12 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
             if let Some(thread_id) = event_thread_id {
                 touch_browser_thread_updated(state, thread_id);
+                match event["status"].as_str() {
+                    Some("completed" | "failed" | "interrupted") => {
+                        set_browser_thread_status(state, thread_id, "idle");
+                    }
+                    _ => set_browser_thread_status(state, thread_id, "active"),
+                }
             }
             if state.stream.is_none()
                 && let Some(thread_id) = event_thread_id
@@ -2540,6 +2546,9 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 return;
             }
             touch_browser_thread_updated(state, &thread_id);
+            if status != StreamStatus::Detached {
+                set_browser_thread_status(state, &thread_id, "idle");
+            }
             if let Some(stream) = &mut state.stream {
                 stream.status = status;
                 if status == StreamStatus::Detached {
@@ -2549,6 +2558,8 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             state.stream_control = None;
         }
         AppEvent::TurnSubmitted { thread_id } => {
+            set_browser_thread_status(state, &thread_id, "active");
+            touch_browser_thread_updated(state, &thread_id);
             state.set_notice(format!("sent {thread_id}"));
         }
         AppEvent::TurnSubmitFailed { thread_id, error } => {
@@ -3279,6 +3290,19 @@ fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
                 row.raw["updatedAt"] = json!(now);
             }
         }
+    }
+}
+
+fn set_browser_thread_status(state: &mut TuiState, thread_id: &str, status: &str) {
+    for row in &mut state.browser.rows {
+        if row.id == thread_id {
+            row.set_status(status);
+        }
+    }
+    if let Some(detail) = &mut state.detail
+        && detail.thread_id == thread_id
+    {
+        detail.status = status.to_string();
     }
 }
 
@@ -4044,6 +4068,37 @@ mod tests {
     }
 
     #[test]
+    fn browser_refresh_preserves_locally_known_status_over_not_loaded() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+        set_browser_thread_status(&mut state, "t1", "idle");
+        state.browser.epoch = 1;
+
+        state.set_browser_rows(
+            1,
+            vec![test_thread_row("t1", "notLoaded")],
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
+        );
+    }
+
+    #[test]
     fn browser_updated_time_is_toggleable_and_relative_for_all_past_times() {
         let now = 1_700_000_000;
 
@@ -4765,9 +4820,11 @@ mod tests {
             descending: true,
             prefs: TuiPrefs::default(),
         });
+        state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         state.stream_control = Some(control_tx);
-        state.stream = Some(StreamState::new(
+        state.stream = Some(StreamState::new_with_id(
+            0,
             "t1".to_string(),
             Some("turn-1".to_string()),
             StreamStatus::Running,
@@ -4788,6 +4845,11 @@ mod tests {
         assert_eq!(
             state.stream.as_ref().expect("stream").status,
             StreamStatus::Completed
+        );
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
         );
     }
 

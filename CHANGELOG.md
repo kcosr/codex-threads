@@ -7,6 +7,11 @@
 - Add `codex-threads tui`, an interactive terminal UI for browsing, viewing,
   searching, and controlling threads.
 
+### Fixed
+
+- Keep TUI browser row status from falling back to stale `notLoaded` after a
+  locally observed send or stream completion.
+
 ## [0.1.5] - 2026-06-05
 
 ### Added

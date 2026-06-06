@@ -419,6 +419,11 @@ impl TuiState {
             return;
         }
         let previous_id = self.selected_thread_id().map(str::to_string);
+        let previous_rows = self.browser.rows.clone();
+        let rows = rows
+            .into_iter()
+            .map(|row| preserve_known_status(row, &previous_rows))
+            .collect();
         self.browser.rows = group_running_rows_first(rows);
         self.browser.next_cursor = next_cursor;
         self.browser.backwards_cursor = backwards_cursor;
@@ -636,6 +641,28 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
     }
 }
 
+fn preserve_known_status(mut row: ThreadRow, previous_rows: &[ThreadRow]) -> ThreadRow {
+    if !row.status.eq_ignore_ascii_case("notLoaded") {
+        return row;
+    }
+    let Some(previous) = previous_rows.iter().find(|previous| previous.id == row.id) else {
+        return row;
+    };
+    if previous.status.is_empty() || previous.status.eq_ignore_ascii_case("notLoaded") {
+        return row;
+    }
+    row.set_status(previous.status.clone());
+    row
+}
+
+fn set_thread_row_raw_status(row: &mut ThreadRow, status: &str) {
+    if let Some(raw_thread) = row.raw.get_mut("thread") {
+        raw_thread["status"]["type"] = serde_json::json!(status);
+    } else {
+        row.raw["status"]["type"] = serde_json::json!(status);
+    }
+}
+
 fn group_running_rows_first(rows: Vec<ThreadRow>) -> Vec<ThreadRow> {
     let (mut running, idle): (Vec<_>, Vec<_>) = rows.into_iter().partition(ThreadRow::is_running);
     running.extend(idle);
@@ -648,6 +675,12 @@ impl ThreadRow {
             self.status.to_ascii_lowercase().as_str(),
             "active" | "running" | "inprogress" | "starting"
         )
+    }
+
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        let status = status.into();
+        self.status = status.clone();
+        set_thread_row_raw_status(self, &status);
     }
 }
 
