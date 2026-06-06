@@ -20,13 +20,10 @@ pub enum Mode {
     FilterMenu,
     SortMenu,
     ColumnsMenu,
-    ActiveTurnPrompt {
-        thread_id: String,
-        turn_id: String,
-    },
     ConfirmInterrupt {
         thread_id: String,
-        turn_id: String,
+        turn_id: Option<String>,
+        return_to_detail: bool,
     },
     ConfirmArchive {
         thread_id: String,
@@ -172,6 +169,7 @@ pub struct ComposeState {
 pub enum ComposeTarget {
     NewTurn { thread_id: String },
     Steer { thread_id: String, turn_id: String },
+    SteerSelected { thread_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,7 +633,6 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
             return_to_detail: true,
             ..
         })
-        | Mode::ActiveTurnPrompt { .. }
         | Mode::ConfirmInterrupt { .. }
         | Mode::ConfirmArchive {
             return_to_detail: true,

@@ -741,7 +741,8 @@ async fn handle_terminal_event(
         {
             state.mode = Mode::ConfirmInterrupt {
                 thread_id: stream.thread_id.clone(),
-                turn_id,
+                turn_id: Some(turn_id),
+                return_to_detail: matches!(state.mode, Mode::Detail),
             };
         } else {
             state.should_quit = true;
@@ -888,58 +889,33 @@ async fn handle_terminal_event(
             }
             return Ok(());
         }
-        Mode::ActiveTurnPrompt { thread_id, turn_id } => {
+        Mode::ConfirmInterrupt {
+            thread_id,
+            turn_id,
+            return_to_detail,
+        } => {
+            let return_mode = if return_to_detail {
+                Mode::Detail
+            } else {
+                Mode::Browser
+            };
             match key.code {
-                KeyCode::Esc => state.mode = Mode::Detail,
-                KeyCode::Enter | KeyCode::Char('T') | KeyCode::Char('t') => {
-                    let (control_tx, control_rx) = mpsc::unbounded_channel();
-                    let stream_id = state.allocate_stream_id();
-                    state.stream = Some(StreamState::new_with_id(
-                        stream_id,
-                        thread_id.clone(),
-                        Some(turn_id.clone()),
-                        StreamStatus::Running,
-                        true,
-                    ));
-                    state.stream_control = Some(control_tx);
-                    state.mode = Mode::Detail;
-                    spawn_attach_task(
-                        target.clone(),
-                        thread_id.clone(),
-                        turn_id,
-                        yolo,
-                        control_rx,
-                        stream_id,
-                        app_tx.clone(),
-                    );
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    state.mode = Mode::Compose(ComposeState {
-                        target: ComposeTarget::Steer { thread_id, turn_id },
-                        text: String::new(),
-                        send_mode: SendMode::NoWait,
-                        return_to_detail: true,
-                    });
-                }
-                KeyCode::Char('i') => {
-                    state.mode = Mode::ConfirmInterrupt { thread_id, turn_id };
-                }
-                _ => state.mode = Mode::ActiveTurnPrompt { thread_id, turn_id },
-            }
-            return Ok(());
-        }
-        Mode::ConfirmInterrupt { thread_id, turn_id } => {
-            match key.code {
-                KeyCode::Esc => state.mode = Mode::Detail,
+                KeyCode::Esc => state.mode = return_mode,
                 KeyCode::Enter => {
-                    state.mode = Mode::Detail;
-                    if let Some(control) = &state.stream_control {
+                    state.mode = return_mode;
+                    if let (Some(_turn_id), Some(control)) = (&turn_id, &state.stream_control) {
                         let _ = control.send(TurnControl::Interrupt);
                     } else {
                         spawn_interrupt_task(target.clone(), thread_id, turn_id, app_tx.clone());
                     }
                 }
-                _ => state.mode = Mode::ConfirmInterrupt { thread_id, turn_id },
+                _ => {
+                    state.mode = Mode::ConfirmInterrupt {
+                        thread_id,
+                        turn_id,
+                        return_to_detail,
+                    }
+                }
             }
             return Ok(());
         }
@@ -1135,22 +1111,36 @@ async fn handle_terminal_event(
                 schedule_thread_load(state, fetch_tx, thread_id).await?;
             }
         }
-        KeyCode::Char('S') => {
-            if matches!(state.mode, Mode::Detail)
-                && let Some(detail) = &state.detail
-                && let Some(turn_id) = detail.active_turn_id.clone()
-            {
-                state.mode = Mode::Compose(ComposeState {
-                    target: ComposeTarget::Steer {
-                        thread_id: detail.thread_id.clone(),
-                        turn_id,
-                    },
-                    text: String::new(),
-                    send_mode: SendMode::NoWait,
-                    return_to_detail: true,
-                });
+        KeyCode::Char('S') => match state.mode {
+            Mode::Detail => {
+                if let Some(detail) = &state.detail
+                    && let Some(turn_id) = detail.active_turn_id.clone()
+                {
+                    state.mode = Mode::Compose(ComposeState {
+                        target: ComposeTarget::Steer {
+                            thread_id: detail.thread_id.clone(),
+                            turn_id,
+                        },
+                        text: String::new(),
+                        send_mode: SendMode::NoWait,
+                        return_to_detail: true,
+                    });
+                }
             }
-        }
+            Mode::Browser => {
+                if let Some(thread_id) = state.selected_thread_id().map(str::to_string)
+                    && selected_thread_is_running(state, &thread_id)
+                {
+                    state.mode = Mode::Compose(ComposeState {
+                        target: ComposeTarget::SteerSelected { thread_id },
+                        text: String::new(),
+                        send_mode: SendMode::NoWait,
+                        return_to_detail: false,
+                    });
+                }
+            }
+            _ => {}
+        },
         KeyCode::Char('T') => {
             if matches!(state.mode, Mode::Detail)
                 && let Some(detail) = &state.detail
@@ -1201,17 +1191,32 @@ async fn handle_terminal_event(
                 );
             }
         }
-        KeyCode::Char('i') => {
-            if matches!(state.mode, Mode::Detail)
-                && let Some(detail) = &state.detail
-                && let Some(turn_id) = detail.active_turn_id.clone()
-            {
-                state.mode = Mode::ConfirmInterrupt {
-                    thread_id: detail.thread_id.clone(),
-                    turn_id,
-                };
+        KeyCode::Char('i') => match state.mode {
+            Mode::Detail => {
+                if let Some(detail) = &state.detail
+                    && let Some(turn_id) = detail.active_turn_id.clone()
+                {
+                    state.mode = Mode::ConfirmInterrupt {
+                        thread_id: detail.thread_id.clone(),
+                        turn_id: Some(turn_id),
+                        return_to_detail: true,
+                    };
+                }
             }
-        }
+            Mode::Browser => {
+                if let Some(thread_id) = state.selected_thread_id().map(str::to_string)
+                    && selected_thread_is_running(state, &thread_id)
+                {
+                    let turn_id = active_turn_hint_for_compose(state, &thread_id);
+                    state.mode = Mode::ConfirmInterrupt {
+                        thread_id,
+                        turn_id,
+                        return_to_detail: false,
+                    };
+                }
+            }
+            _ => {}
+        },
         KeyCode::Char('f') if matches!(state.mode, Mode::Browser) => state.mode = Mode::FilterMenu,
         KeyCode::Char('c') if matches!(state.mode, Mode::Browser) => state.mode = Mode::ColumnsMenu,
         KeyCode::Char('t') => {
@@ -1316,20 +1321,12 @@ fn jump_to_bottom(state: &mut TuiState) {
 
 fn open_message_action(state: &mut TuiState, thread_id: String) {
     let return_to_detail = matches!(state.mode, Mode::Detail);
-    if return_to_detail
-        && let Some(detail) = &state.detail
-        && detail.thread_id == thread_id
-        && let Some(turn_id) = detail.active_turn_id.clone()
-    {
-        state.mode = Mode::ActiveTurnPrompt { thread_id, turn_id };
-    } else {
-        state.mode = Mode::Compose(ComposeState {
-            target: ComposeTarget::NewTurn { thread_id },
-            text: String::new(),
-            send_mode: SendMode::Stream,
-            return_to_detail,
-        });
-    }
+    state.mode = Mode::Compose(ComposeState {
+        target: ComposeTarget::NewTurn { thread_id },
+        text: String::new(),
+        send_mode: SendMode::Stream,
+        return_to_detail,
+    });
 }
 
 fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
@@ -1343,8 +1340,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         Mode::Detail
         | Mode::MessageSearchInput { .. }
         | Mode::Compose(_)
-        | Mode::ActiveTurnPrompt { .. }
-        | Mode::ConfirmInterrupt { .. }
+        | Mode::ConfirmInterrupt {
+            return_to_detail: true,
+            ..
+        }
         | Mode::ConfirmArchive {
             return_to_detail: true,
             ..
@@ -1356,6 +1355,10 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         | Mode::ColumnsMenu
         | Mode::Help
         | Mode::ConfirmArchive {
+            return_to_detail: false,
+            ..
+        }
+        | Mode::ConfirmInterrupt {
             return_to_detail: false,
             ..
         } => state.move_selection(delta),
@@ -1713,7 +1716,11 @@ fn submit_compose(
                             prompt,
                             yolo,
                             control_rx,
-                            stream_id,
+                            BrowserWatchSendOptions {
+                                stream_id,
+                                active_turn_hint,
+                                probe_active_turn,
+                            },
                             app_tx.clone(),
                         );
                     } else {
@@ -1722,12 +1729,12 @@ fn submit_compose(
                             thread_id,
                             control_rx,
                             BrowserWatchSendOptions {
-                                prompt,
-                                yolo,
                                 stream_id,
                                 active_turn_hint,
                                 probe_active_turn,
                             },
+                            prompt,
+                            yolo,
                             app_tx.clone(),
                         );
                     }
@@ -1738,8 +1745,6 @@ fn submit_compose(
                         thread_id,
                         prompt,
                         yolo,
-                        active_turn_hint,
-                        probe_active_turn,
                         app_tx.clone(),
                     );
                 }
@@ -1750,7 +1755,18 @@ fn submit_compose(
             spawn_steer_task(
                 target.clone(),
                 thread_id,
-                turn_id,
+                Some(turn_id),
+                prompt,
+                yolo,
+                app_tx.clone(),
+            );
+        }
+        ComposeTarget::SteerSelected { thread_id } => {
+            state.mode = return_mode;
+            spawn_steer_task(
+                target.clone(),
+                thread_id,
+                None,
                 prompt,
                 yolo,
                 app_tx.clone(),
@@ -1977,16 +1993,25 @@ fn spawn_browser_attach_task(
 fn spawn_steer_task(
     target: Target,
     thread_id: String,
-    turn_id: String,
+    turn_id: Option<String>,
     prompt: String,
     yolo: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
         let stream_thread_id = thread_id.clone();
-        let stream_turn_id = Some(turn_id.clone());
+        let mut stream_turn_id = turn_id.clone();
         let result: Result<Value> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
+            let turn_id = match turn_id {
+                Some(turn_id) => turn_id,
+                None => active_turn_id_for_thread(&target, &mut client, &thread_id, true)
+                    .await?
+                    .ok_or_else(|| {
+                        usage_error(format!("thread `{thread_id}` has no active turn"))
+                    })?,
+            };
+            stream_turn_id = Some(turn_id.clone());
             steer_turn(&target, &mut client, thread_id, turn_id, prompt, yolo).await
         }
         .await;
@@ -2012,14 +2037,23 @@ fn spawn_steer_task(
 fn spawn_interrupt_task(
     target: Target,
     thread_id: String,
-    turn_id: String,
+    turn_id: Option<String>,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
         let stream_thread_id = thread_id.clone();
-        let stream_turn_id = Some(turn_id.clone());
+        let mut stream_turn_id = turn_id.clone();
         let result: Result<Value> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
+            let turn_id = match turn_id {
+                Some(turn_id) => turn_id,
+                None => active_turn_id_for_thread(&target, &mut client, &thread_id, true)
+                    .await?
+                    .ok_or_else(|| {
+                        usage_error(format!("thread `{thread_id}` has no active turn"))
+                    })?,
+            };
+            stream_turn_id = Some(turn_id.clone());
             interrupt_turn(&target, &mut client, thread_id, turn_id).await
         }
         .await;
@@ -2109,45 +2143,24 @@ fn spawn_no_wait_send_task(
     thread_id: String,
     prompt: String,
     yolo: bool,
-    active_turn_hint: Option<String>,
-    probe_active_turn: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            let active_turn_id = if active_turn_hint.is_some() {
-                active_turn_hint
-            } else if probe_active_turn {
-                active_turn_id_for_thread(&target, &mut client, &thread_id, true).await?
-            } else {
-                None
-            };
-            if let Some(turn_id) = active_turn_id {
-                steer_turn(
-                    &target,
-                    &mut client,
-                    thread_id.clone(),
-                    turn_id,
-                    prompt,
+            start_turn_request(
+                &target,
+                &mut client,
+                thread_id.clone(),
+                prompt,
+                TurnStartOptions {
+                    model: None,
+                    effort: None,
+                    service_tier: None,
                     yolo,
-                )
-                .await?;
-            } else {
-                start_turn_request(
-                    &target,
-                    &mut client,
-                    thread_id.clone(),
-                    prompt,
-                    TurnStartOptions {
-                        model: None,
-                        effort: None,
-                        service_tier: None,
-                        yolo,
-                    },
-                )
-                .await?;
-            }
+                },
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -2182,9 +2195,30 @@ async fn active_turn_id_for_thread(
     Ok(status["activeTurnId"].as_str().map(str::to_string))
 }
 
+async fn active_turn_id_for_stream_send(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: &str,
+    active_turn_hint: Option<String>,
+    probe_active_turn: bool,
+) -> Result<Option<String>> {
+    if active_turn_hint.is_some() {
+        return Ok(active_turn_hint);
+    }
+    if probe_active_turn {
+        return active_turn_id_for_thread(target, client, thread_id, true).await;
+    }
+    Ok(None)
+}
+
+fn accepted_event_for_turn(mut event: Value, turn_id: &str) -> Value {
+    if let Some(object) = event.as_object_mut() {
+        object.insert("turnId".to_string(), json!(turn_id));
+    }
+    event
+}
+
 struct BrowserWatchSendOptions {
-    prompt: String,
-    yolo: bool,
     stream_id: u64,
     active_turn_hint: Option<String>,
     probe_active_turn: bool,
@@ -2195,12 +2229,12 @@ fn spawn_browser_watch_send_task(
     thread_id: String,
     control_rx: mpsc::UnboundedReceiver<TurnControl>,
     options: BrowserWatchSendOptions,
+    prompt: String,
+    yolo: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
         let BrowserWatchSendOptions {
-            prompt,
-            yolo,
             stream_id,
             active_turn_hint,
             probe_active_turn,
@@ -2209,31 +2243,40 @@ fn spawn_browser_watch_send_task(
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            let active_turn_id = if active_turn_hint.is_some() {
-                active_turn_hint
-            } else if probe_active_turn {
-                active_turn_id_for_thread(&target, &mut client, &thread_id, true).await?
-            } else {
-                None
-            };
-            if let Some(turn_id) = active_turn_id {
-                stream_turn_id = Some(turn_id.clone());
-                let accepted = steer_turn(
-                    &target,
-                    &mut client,
-                    thread_id.clone(),
-                    turn_id.clone(),
-                    prompt,
+            let active_turn_id = active_turn_id_for_stream_send(
+                &target,
+                &mut client,
+                &thread_id,
+                active_turn_hint,
+                probe_active_turn,
+            )
+            .await?;
+            let started = start_turn_request(
+                &target,
+                &mut client,
+                thread_id.clone(),
+                prompt,
+                TurnStartOptions {
+                    model: None,
+                    effort: None,
+                    service_tier: None,
                     yolo,
-                )
-                .await?;
-                send_stream_event(&app_tx, stream_id, accepted);
+                },
+            )
+            .await?;
+            if let Some(active_turn_id) = active_turn_id {
+                stream_turn_id = Some(active_turn_id.clone());
+                send_stream_event(
+                    &app_tx,
+                    stream_id,
+                    accepted_event_for_turn(started.acceptance, &active_turn_id),
+                );
                 attach_existing_turn_stream(
                     &target,
                     &mut client,
                     AttachTurnOptions {
                         thread_id,
-                        turn_id,
+                        turn_id: active_turn_id,
                         yolo,
                         poll_limit: TURN_SCAN_LIMIT,
                         timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
@@ -2244,19 +2287,6 @@ fn spawn_browser_watch_send_task(
                 )
                 .await
             } else {
-                let started = start_turn_request(
-                    &target,
-                    &mut client,
-                    thread_id,
-                    prompt,
-                    TurnStartOptions {
-                        model: None,
-                        effort: None,
-                        service_tier: None,
-                        yolo,
-                    },
-                )
-                .await?;
                 stream_turn_id = Some(started.turn_id.clone());
                 send_stream_event(&app_tx, stream_id, started.acceptance.clone());
                 wait_started_turn_stream(
@@ -2281,18 +2311,32 @@ fn spawn_stream_send_task(
     prompt: String,
     yolo: bool,
     control_rx: mpsc::UnboundedReceiver<TurnControl>,
-    stream_id: u64,
+    options: BrowserWatchSendOptions,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let stream_id = options.stream_id;
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
+            let BrowserWatchSendOptions {
+                active_turn_hint,
+                probe_active_turn,
+                ..
+            } = options;
+            let active_turn_id = active_turn_id_for_stream_send(
+                &target,
+                &mut client,
+                &thread_id,
+                active_turn_hint,
+                probe_active_turn,
+            )
+            .await?;
             let started = start_turn_request(
                 &target,
                 &mut client,
-                thread_id,
+                thread_id.clone(),
                 prompt,
                 TurnStartOptions {
                     model: None,
@@ -2302,17 +2346,41 @@ fn spawn_stream_send_task(
                 },
             )
             .await?;
-            stream_turn_id = Some(started.turn_id.clone());
-            send_stream_event(&app_tx, stream_id, started.acceptance.clone());
-            wait_started_turn_stream(
-                &target,
-                &mut client,
-                started,
-                control_rx,
-                stream_id,
-                &app_tx,
-            )
-            .await
+            if let Some(active_turn_id) = active_turn_id {
+                stream_turn_id = Some(active_turn_id.clone());
+                send_stream_event(
+                    &app_tx,
+                    stream_id,
+                    accepted_event_for_turn(started.acceptance, &active_turn_id),
+                );
+                attach_existing_turn_stream(
+                    &target,
+                    &mut client,
+                    AttachTurnOptions {
+                        thread_id,
+                        turn_id: active_turn_id,
+                        yolo,
+                        poll_limit: TURN_SCAN_LIMIT,
+                        timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                    },
+                    control_rx,
+                    stream_id,
+                    &app_tx,
+                )
+                .await
+            } else {
+                stream_turn_id = Some(started.turn_id.clone());
+                send_stream_event(&app_tx, stream_id, started.acceptance.clone());
+                wait_started_turn_stream(
+                    &target,
+                    &mut client,
+                    started,
+                    control_rx,
+                    stream_id,
+                    &app_tx,
+                )
+                .await
+            }
         }
         .await;
         report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
@@ -2737,12 +2805,14 @@ fn stream_terminal_event_applies(
 }
 
 fn stream_is_running(state: &TuiState) -> bool {
-    state.stream.as_ref().is_some_and(|stream| {
-        matches!(
-            stream.status,
-            StreamStatus::Starting | StreamStatus::Running
-        )
-    })
+    state.stream.as_ref().is_some_and(stream_is_running_status)
+}
+
+fn stream_is_running_status(stream: &StreamState) -> bool {
+    matches!(
+        stream.status,
+        StreamStatus::Starting | StreamStatus::Running
+    )
 }
 
 fn stream_is_visible_in_browser(state: &TuiState, thread_id: &str) -> bool {
@@ -3235,6 +3305,18 @@ fn active_thread_id(state: &TuiState) -> Option<String> {
         Mode::Detail => state.detail.as_ref().map(|detail| detail.thread_id.clone()),
         _ => state.selected_thread_id().map(str::to_string),
     }
+}
+
+fn selected_thread_is_running(state: &TuiState, thread_id: &str) -> bool {
+    state
+        .stream
+        .as_ref()
+        .is_some_and(|stream| stream.thread_id == thread_id && stream_is_running_status(stream))
+        || state
+            .browser
+            .rows
+            .get(state.browser.selected)
+            .is_some_and(|row| row.id == thread_id && row.is_running())
 }
 
 fn active_thread_is_archived(state: &TuiState) -> bool {
@@ -5309,7 +5391,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_enter_opens_same_message_action_as_m() {
+    fn detail_message_action_opens_normal_compose_even_when_active() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -5336,10 +5418,12 @@ mod tests {
 
         assert!(matches!(
             state.mode,
-            Mode::ActiveTurnPrompt {
-                ref thread_id,
-                ref turn_id
-            } if thread_id == "t1" && turn_id == "turn-1"
+            Mode::Compose(ComposeState {
+                target: ComposeTarget::NewTurn { ref thread_id },
+                send_mode: SendMode::Stream,
+                return_to_detail: true,
+                ..
+            }) if thread_id == "t1"
         ));
 
         state.mode = Mode::Detail;
@@ -6173,6 +6257,178 @@ mod tests {
                 return_to_detail: true,
             } if thread_id == "t1"
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_steer_shortcut_targets_selected_active_thread() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::Compose(ComposeState {
+                target: ComposeTarget::SteerSelected { ref thread_id },
+                send_mode: SendMode::NoWait,
+                return_to_detail: false,
+                ..
+            }) if thread_id == "t1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_interrupt_shortcut_returns_to_browser() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmInterrupt {
+                ref thread_id,
+                turn_id: None,
+                return_to_detail: false,
+            } if thread_id == "t1"
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+    }
+
+    #[tokio::test]
+    async fn detail_interrupt_shortcut_returns_to_detail() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.mode,
+            Mode::ConfirmInterrupt {
+                ref thread_id,
+                turn_id: Some(ref turn_id),
+                return_to_detail: true,
+            } if thread_id == "t1" && turn_id == "turn-1"
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Detail));
     }
 
     #[test]

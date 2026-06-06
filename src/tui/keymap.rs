@@ -1,4 +1,4 @@
-pub(crate) const BROWSER_HELP: &str = "? help  q quit  r/R refresh/reload  l load  j/k/wheel gg/G  Enter open  m msg  T attach  a/e/A note/name/arch  y copy  / search  [] page  f/s/c/p/t";
+pub(crate) const BROWSER_HELP: &str = "? help  q quit  r/R refresh  l load  j/k/wheel gg/G  Enter open  m msg  T attach  S steer  i int  / search  [] page  a/e/A note/name/arch  y copy  f/s/c/p/t";
 
 pub(crate) const DETAIL_HELP: &str = "? help  Esc browser  q quit  r refresh  l load  j/k/wheel gg/G  / search n/N  m/Enter msg  a/e/A note/name/arch  y copy  T/S/i";
 

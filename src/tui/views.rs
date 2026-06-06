@@ -31,8 +31,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         Mode::Detail
             | Mode::MessageSearchInput { .. }
             | Mode::Compose(_)
-            | Mode::ActiveTurnPrompt { .. }
-            | Mode::ConfirmInterrupt { .. }
+            | Mode::ConfirmInterrupt {
+                return_to_detail: true,
+                ..
+            }
             | Mode::ConfirmArchive {
                 return_to_detail: true,
                 ..
@@ -87,11 +89,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         Mode::FilterMenu => draw_filter_menu(frame, area, state),
         Mode::SortMenu => draw_sort_menu(frame, area, state),
         Mode::ColumnsMenu => draw_columns_menu(frame, area, state),
-        Mode::ActiveTurnPrompt { thread_id, turn_id } => {
-            draw_active_turn_prompt(frame, area, thread_id, turn_id);
-        }
-        Mode::ConfirmInterrupt { thread_id, turn_id } => {
-            draw_confirm_interrupt(frame, area, thread_id, turn_id);
+        Mode::ConfirmInterrupt {
+            thread_id, turn_id, ..
+        } => {
+            draw_confirm_interrupt(frame, area, thread_id, turn_id.as_deref());
         }
         Mode::ConfirmArchive {
             thread_id,
@@ -102,14 +103,18 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         }
         Mode::Compose(compose) => {
             let label = match compose.target {
-                ComposeTarget::Steer { .. } => "Steer active turn",
+                ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
+                    "Steer active turn"
+                }
                 ComposeTarget::NewTurn { .. } => match compose.send_mode {
                     SendMode::Stream => "Compose stream",
                     SendMode::NoWait => "Compose no-wait",
                 },
             };
             let footer = match compose.target {
-                ComposeTarget::Steer { .. } => "Enter steer, Ctrl-J newline, Esc cancel",
+                ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
+                    "Enter steer, Ctrl-J newline, Esc cancel"
+                }
                 ComposeTarget::NewTurn { .. } => "Enter send, Ctrl-J newline, Tab mode, Esc cancel",
             };
             draw_compose(frame, area, label, &compose.text, footer);
@@ -558,7 +563,6 @@ fn draws_detail_background(state: &TuiState) -> bool {
         Mode::Detail
             | Mode::MessageSearchInput { .. }
             | Mode::Compose(_)
-            | Mode::ActiveTurnPrompt { .. }
             | Mode::ConfirmInterrupt { .. }
             | Mode::ConfirmArchive {
                 return_to_detail: true,
@@ -813,28 +817,21 @@ fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
-fn draw_active_turn_prompt(frame: &mut Frame<'_>, area: Rect, thread_id: &str, turn_id: &str) {
-    draw_static_modal(
-        frame,
-        area,
-        "Active Turn",
-        &[
-            format!("Thread {thread_id} already has active turn {turn_id}."),
-            "Enter/T attach".to_string(),
-            "s steer".to_string(),
-            "i interrupt".to_string(),
-            "Esc cancel".to_string(),
-        ],
-    );
-}
-
-fn draw_confirm_interrupt(frame: &mut Frame<'_>, area: Rect, thread_id: &str, turn_id: &str) {
+fn draw_confirm_interrupt(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) {
+    let target = turn_id
+        .map(|turn_id| format!("{turn_id} on {thread_id}"))
+        .unwrap_or_else(|| format!("the active turn on {thread_id}"));
     draw_static_modal(
         frame,
         area,
         "Interrupt Turn",
         &[
-            format!("Interrupt {turn_id} on {thread_id}?"),
+            format!("Interrupt {target}?"),
             "Enter interrupt".to_string(),
             "Esc cancel".to_string(),
         ],
@@ -885,6 +882,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "Browser",
         "  Enter open detail  m compose message  / search threads",
         "  l load selected thread  T attach/watch active turn",
+        "  S steer selected active turn  i interrupt selected active turn",
         "  a annotate  e rename  A confirm archive/unarchive",
         "  f filters  s sort  c columns/time/refresh  p preview  t auto-refresh",
         "",
@@ -904,7 +902,6 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Filters: a toggle archived filter  Sort: u updated, c created, d direction",
         "  Columns: 1 status, 2 updated, 3 cwd, 4 annotation, 5 relative time",
         "  Columns: t auto-refresh, -/+ refresh interval",
-        "  Active turn: Enter/T attach, s steer, i interrupt, Esc cancel",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
     ];
@@ -1114,8 +1111,10 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("? help"));
-        assert!(text.contains("r/R refresh/reload"));
+        assert!(text.contains("r/R refresh"));
         assert!(text.contains("l load"));
+        assert!(text.contains("S steer"));
+        assert!(text.contains("i int"));
         assert!(text.contains("[] page"));
     }
 
@@ -1553,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_prompt_keeps_detail_background() {
+    fn detail_interrupt_confirm_keeps_detail_background() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -1564,9 +1563,10 @@ mod tests {
             descending: true,
             prefs: TuiPrefs::default(),
         });
-        state.mode = Mode::ActiveTurnPrompt {
+        state.mode = Mode::ConfirmInterrupt {
             thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            return_to_detail: true,
         };
         state.detail = Some(DetailState {
             thread_id: "thread-1".to_string(),
@@ -1606,7 +1606,7 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("detail stays visible"));
-        assert!(text.contains("Active Turn"));
+        assert!(text.contains("Interrupt Turn"));
     }
 
     #[test]

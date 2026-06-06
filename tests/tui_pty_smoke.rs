@@ -251,11 +251,41 @@ impl ServerState {
     }
 
     fn complete_started_turn(&mut self, thread_id: &str, prompt: &str) -> (String, String) {
+        let reply = format!("stream reply for {prompt}");
+        let thread = self.threads.get_mut(thread_id).expect("thread exists");
+        if let Some(active_turn_id) = thread.active_turn_id.clone() {
+            let item_id = format!("item_agent_{}", self.next_turn);
+            self.next_turn += 1;
+            if let Some(turn) = thread
+                .turns
+                .iter_mut()
+                .find(|turn| turn["id"].as_str() == Some(active_turn_id.as_str()))
+            {
+                if let Some(items) = turn["items"].as_array_mut() {
+                    items.push(json!({
+                        "id": format!("item_user_{}", self.next_turn),
+                        "type": "userMessage",
+                        "content": [{ "type": "text", "text": prompt }]
+                    }));
+                    items.push(json!({
+                        "id": item_id,
+                        "type": "agentMessage",
+                        "text": reply
+                    }));
+                }
+                turn["status"] = json!("completed");
+                turn["completedAt"] = json!(thread.updated_at + 1);
+            }
+            thread.status = "idle".to_string();
+            thread.active_turn_id = None;
+            thread.preview = prompt.to_string();
+            thread.updated_at += 1;
+            return (active_turn_id, reply);
+        }
+
         let turn_id = format!("turn_{}", self.next_turn);
         self.next_turn += 1;
         let item_id = format!("item_agent_{}", self.next_turn);
-        let reply = format!("stream reply for {prompt}");
-        let thread = self.threads.get_mut(thread_id).expect("thread exists");
         thread.status = "idle".to_string();
         thread.active_turn_id = None;
         thread.preview = prompt.to_string();
@@ -688,5 +718,61 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
         fs::read_to_string(stream_log)
             .expect("stream log")
             .contains("attached live update")
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"m");
+    tui.wait_for("Compose stream");
+    tui.type_text("browser active followup");
+    tui.write(b"\r");
+    tui.wait_for("stream reply for browser active followup");
+    tui.quit();
+
+    assert!(server.method_count("turn/start") >= 1);
+    assert_eq!(
+        server.method_count("turn/steer"),
+        0,
+        "normal browser send should not use explicit steer"
+    );
+    assert!(
+        fs::read_to_string(stream_log)
+            .expect("stream log")
+            .contains("stream reply for browser active followup")
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_explicit_steer_and_interrupt_use_active_control_rpcs() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"S");
+    tui.wait_for("Steer active turn");
+    tui.type_text("browser explicit steer");
+    tui.write(b"\r");
+    server.wait_for_method_count("turn/steer", 1);
+    tui.write(b"i");
+    tui.wait_for("Interrupt Turn");
+    tui.write(b"\r");
+    server.wait_for_method_count("turn/interrupt", 1);
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("turn/start"),
+        0,
+        "explicit browser steer should not start a normal turn"
     );
 }
