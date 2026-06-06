@@ -228,13 +228,13 @@ Normal compose uses Codex app-server's `turn/start` path, including for active
 threads; explicit steer remains on `S`. Attaching resumes the thread with turns
 included so the active-turn snapshot appears before new stream notifications.
 Opening a thread loads a small recent turn window, orders it chronologically,
-and starts at the bottom of the transcript. When older history is available, the
-detail header marks it as older above; scrolling up at the top loads the next
-older chunk above the current transcript and preserves the current view. In
-detail, `[` manually loads older messages above and `]` loads newer messages
-below when cursors are available. Detail views refresh in place while open, and
-`Esc` returns to the browser after unlinking the local detail view and detaching
-any local stream. Local detach leaves remote turns running.
+and starts at the bottom of the transcript. Scrolling up at the top loads the
+next older chunk above the current transcript and preserves the current view. In
+detail, `gg` and `Home` load through to the real transcript start before jumping
+there; `G` and `End` load through to the real transcript end before jumping
+there. Detail views refresh in place while open, and `Esc` returns to the
+browser after unlinking the local detail view and detaching any local stream.
+Local detach leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted

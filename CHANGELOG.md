@@ -24,8 +24,8 @@
   preview and detail transcripts stay current while attached.
 - Keep normal TUI compose sends on Codex app-server's `turn/start` path while
   exposing explicit browser steer and interrupt controls for active threads.
-- Let TUI detail scrolling load older history continuously above the transcript,
-  with detail `[`/`]` shortcuts aligned to older-above/newer-below direction.
+- Let TUI detail scrolling and `gg`/`G` load history through to real transcript
+  start/end boundaries instead of stopping at the prefetched window.
 
 ## [0.1.5] - 2026-06-05
 

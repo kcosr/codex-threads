@@ -376,12 +376,6 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(connection));
     }
-    if detail.next_cursor.is_some() {
-        metadata_spans.push(Span::raw("  older above"));
-    }
-    if detail.backwards_cursor.is_some() {
-        metadata_spans.push(Span::raw("  newer below"));
-    }
     if !annotation.is_empty() {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(annotation));
@@ -398,18 +392,9 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let lines = transcript_lines(&detail.messages);
     let scroll = detail.scroll.min(detail.max_scroll());
-    let transcript_title = if detail.next_cursor.is_some() {
-        " Transcript - older above "
-    } else {
-        " Transcript "
-    };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(transcript_title)
-                    .borders(Borders::ALL),
-            )
+            .block(Block::default().title(" Transcript ").borders(Borders::ALL))
             .scroll((scroll, 0))
             .wrap(Wrap { trim: false })
             .style(Style::default()),
@@ -897,8 +882,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "",
         "Detail",
         "  Esc browser/detach detail session  Enter or m compose/message action",
-        "  [ load older above  ] load newer below  / search loaded transcript",
-        "  n/N next/previous match",
+        "  gg/Home real transcript start  G/End real transcript end",
+        "  / search loaded transcript  n/N next/previous match",
         "  l load thread  a annotate  e rename  A confirm archive/unarchive",
         "  T attach  S steer  i interrupt",
         "",
@@ -1290,7 +1275,7 @@ mod tests {
         assert!(text.contains("r refresh or poll active stream"));
         assert!(text.contains("l load thread"));
         assert!(text.contains("Browser: [ previous page"));
-        assert!(text.contains("[ load older above"));
+        assert!(text.contains("real transcript start"));
         assert!(text.contains("Browser"));
         assert!(text.contains("a annotate"));
         assert!(text.contains("Detail"));

@@ -784,15 +784,10 @@ fn tui_detail_loads_older_history_above_transcript() {
     tui.wait_for_all(&["Active stream", "Beta task", "Long history"]);
     tui.write(b"jj");
     tui.write(b"\r");
-    tui.wait_for_all(&[
-        "Transcript - older above",
-        "long prompt 12",
-        "long response 12",
-    ]);
+    tui.wait_for_all(&["Transcript", "long prompt 12", "long response 12"]);
     let before_older_load = server.method_count("thread/turns/list");
-    tui.write(b"[");
-    server.wait_for_method_count("thread/turns/list", before_older_load + 1);
     tui.write(b"gg");
+    server.wait_for_method_count("thread/turns/list", before_older_load + 1);
     tui.wait_for_all(&["long prompt 01", "long response 01"]);
     tui.quit();
 }

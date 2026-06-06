@@ -240,6 +240,12 @@ pub enum StreamStatus {
     Detached,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailJump {
+    Start,
+    End,
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiState {
     pub mode: Mode,
@@ -250,6 +256,7 @@ pub struct TuiState {
     pub stream_control: Option<mpsc::UnboundedSender<TurnControl>>,
     pub next_stream_id: u64,
     pub pending_goto_top: bool,
+    pub pending_detail_jump: Option<DetailJump>,
     pub notice: Option<Notice>,
     pub should_quit: bool,
 }
@@ -313,6 +320,7 @@ impl TuiState {
             stream_control: None,
             next_stream_id: 0,
             pending_goto_top: false,
+            pending_detail_jump: None,
             notice: None,
             should_quit: false,
         }
@@ -544,6 +552,7 @@ impl TuiState {
         {
             detail.loading = false;
             detail.last_error = Some(error);
+            self.pending_detail_jump = None;
         }
     }
 

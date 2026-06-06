@@ -45,7 +45,7 @@ use crate::tui::events::{
 use crate::tui::input::{InputAction, ModeKind};
 use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
-    BrowserSource, ComposeState, ComposeTarget, DetailState, MessageBlock, MessageLine,
+    BrowserSource, ComposeState, ComposeTarget, DetailJump, DetailState, MessageBlock, MessageLine,
     MessageLineKind, MessageSpan, Mode, SendMode, StreamAssistantItem, StreamState, StreamStatus,
     ThreadRow, TuiInit, TuiState,
 };
@@ -138,7 +138,11 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 let refresh_after_rename = rename_changed_thread(&event);
                 let refresh_after_submit = turn_submitted_thread(&event);
                 let refresh_after_load = loaded_thread(&event);
+                let detail_loaded = matches!(event, AppEvent::DetailLoaded { .. });
                 handle_app_event(event, &mut state);
+                if detail_loaded && !state.should_quit {
+                    schedule_pending_detail_jump(&mut state, &fetch_tx).await?;
+                }
                 if auto_attach_initial_active && !state.should_quit {
                     auto_attach_selected_browser_thread_if_active(
                         &mut state,
@@ -676,6 +680,9 @@ async fn schedule_detail_page(
             last_error: None,
         });
     }
+    if page_direction == DetailPageDirection::Replace {
+        state.pending_detail_jump = None;
+    }
     state.mode = Mode::Detail;
     fetch_tx
         .send(FetchRequest::Detail {
@@ -962,7 +969,7 @@ async fn handle_terminal_event(
         key.code,
         KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Home | KeyCode::End
     ) {
-        handle_goto_key(key.code, state);
+        handle_goto_key(key.code, state, fetch_tx).await?;
         return Ok(());
     }
     state.pending_goto_top = false;
@@ -1000,21 +1007,7 @@ async fn handle_terminal_event(
         },
         KeyCode::Char(']') => match state.mode {
             Mode::Detail => {
-                if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
-                    detail
-                        .backwards_cursor
-                        .clone()
-                        .map(|cursor| (detail.thread_id.clone(), cursor))
-                }) {
-                    schedule_detail_page(
-                        state,
-                        fetch_tx,
-                        thread_id,
-                        Some(cursor),
-                        DetailPageDirection::Newer,
-                    )
-                    .await?;
-                }
+                jump_to_bottom(state);
             }
             _ => {
                 if let Some(cursor) = state.browser.next_cursor.clone() {
@@ -1024,21 +1017,7 @@ async fn handle_terminal_event(
         },
         KeyCode::Char('[') => match state.mode {
             Mode::Detail => {
-                if let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
-                    detail
-                        .next_cursor
-                        .clone()
-                        .map(|cursor| (detail.thread_id.clone(), cursor))
-                }) {
-                    schedule_detail_page(
-                        state,
-                        fetch_tx,
-                        thread_id,
-                        Some(cursor),
-                        DetailPageDirection::Older,
-                    )
-                    .await?;
-                }
+                jump_to_top(state);
             }
             _ => {
                 if let Some(cursor) = state.browser.backwards_cursor.clone() {
@@ -1275,35 +1254,88 @@ async fn handle_terminal_event(
     Ok(())
 }
 
-fn handle_goto_key(code: KeyCode, state: &mut TuiState) -> bool {
+async fn handle_goto_key(
+    code: KeyCode,
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+) -> Result<bool> {
     match code {
         KeyCode::Char('g') => {
             if state.pending_goto_top {
-                jump_to_top(state);
+                begin_detail_jump_or_browser_jump(state, fetch_tx, DetailJump::Start).await?;
                 state.pending_goto_top = false;
             } else {
                 state.pending_goto_top = true;
             }
-            true
+            Ok(true)
         }
         KeyCode::Char('G') | KeyCode::End => {
-            jump_to_bottom(state);
+            begin_detail_jump_or_browser_jump(state, fetch_tx, DetailJump::End).await?;
             state.pending_goto_top = false;
-            true
+            Ok(true)
         }
         KeyCode::Home => {
-            jump_to_top(state);
+            begin_detail_jump_or_browser_jump(state, fetch_tx, DetailJump::Start).await?;
             state.pending_goto_top = false;
-            true
+            Ok(true)
         }
         _ => {
             state.pending_goto_top = false;
-            false
+            Ok(false)
         }
     }
 }
 
+async fn begin_detail_jump_or_browser_jump(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    jump: DetailJump,
+) -> Result<()> {
+    if matches!(state.mode, Mode::Detail) {
+        state.pending_detail_jump = Some(jump);
+        schedule_pending_detail_jump(state, fetch_tx).await
+    } else {
+        match jump {
+            DetailJump::Start => jump_to_top(state),
+            DetailJump::End => jump_to_bottom(state),
+        }
+        Ok(())
+    }
+}
+
+async fn schedule_pending_detail_jump(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+) -> Result<()> {
+    let Some(jump) = state.pending_detail_jump else {
+        return Ok(());
+    };
+    let Some(detail) = state.detail.as_ref() else {
+        state.pending_detail_jump = None;
+        return Ok(());
+    };
+    if detail.loading {
+        return Ok(());
+    }
+    let thread_id = detail.thread_id.clone();
+    let (cursor, direction) = match jump {
+        DetailJump::Start => (detail.next_cursor.clone(), DetailPageDirection::Older),
+        DetailJump::End => (detail.backwards_cursor.clone(), DetailPageDirection::Newer),
+    };
+    if let Some(cursor) = cursor {
+        schedule_detail_page(state, fetch_tx, thread_id, Some(cursor), direction).await
+    } else {
+        state.pending_detail_jump = None;
+        match jump {
+            DetailJump::Start => jump_to_top(state),
+            DetailJump::End => jump_to_bottom(state),
+        }
+        Ok(())
+    }
+}
+
 fn jump_to_top(state: &mut TuiState) {
+    state.pending_detail_jump = None;
     match state.mode {
         Mode::Detail => {
             if let Some(detail) = &mut state.detail {
@@ -1315,6 +1347,7 @@ fn jump_to_top(state: &mut TuiState) {
 }
 
 fn jump_to_bottom(state: &mut TuiState) {
+    state.pending_detail_jump = None;
     match state.mode {
         Mode::Detail => {
             if let Some(detail) = &mut state.detail {
@@ -5224,7 +5257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detail_left_bracket_schedules_older_page() {
+    async fn detail_gg_loads_older_pages_before_jumping_to_real_start() {
         let target = test_target();
         let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
         let (app_tx, _app_rx) = mpsc::unbounded_channel();
@@ -5255,7 +5288,20 @@ mod tests {
         ));
 
         handle_terminal_event(
-            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::empty())),
+            Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty())),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        assert!(fetch_rx.try_recv().is_err());
+        assert!(state.pending_goto_top);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty())),
             &mut state,
             &target,
             false,
@@ -5266,6 +5312,7 @@ mod tests {
         .unwrap();
 
         let FetchRequest::Detail {
+            epoch,
             thread_id,
             cursor,
             page_direction,
@@ -5277,6 +5324,38 @@ mod tests {
         assert_eq!(thread_id, "t1");
         assert_eq!(cursor.as_deref(), Some("older"));
         assert_eq!(page_direction, DetailPageDirection::Older);
+        assert_eq!(state.pending_detail_jump, Some(DetailJump::Start));
+
+        handle_app_event(
+            AppEvent::DetailLoaded {
+                epoch,
+                detail: Box::new(detail_state(
+                    serde_json::json!({
+                        "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                        "turns": {"nextCursor": null, "backwardsCursor": "newer", "data": [
+                            {"id": "turn-1", "items": [
+                                {"id": "old", "type": "agentMessage", "text": "old"}
+                            ]},
+                            {"id": "turn-2", "items": [
+                                {"id": "middle", "type": "agentMessage", "text": "middle"}
+                            ]}
+                        ]}
+                    }),
+                    None,
+                    "t1".to_string(),
+                    epoch,
+                    Some("older".to_string()),
+                )),
+                page_direction: DetailPageDirection::Older,
+            },
+            &mut state,
+        );
+        schedule_pending_detail_jump(&mut state, &fetch_tx)
+            .await
+            .unwrap();
+        assert_eq!(state.pending_detail_jump, None);
+        assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+        assert!(fetch_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6691,8 +6770,8 @@ mod tests {
         assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
     }
 
-    #[test]
-    fn vim_goto_shortcuts_jump_browser_and_detail() {
+    #[tokio::test]
+    async fn vim_goto_shortcuts_jump_browser_and_detail() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -6715,13 +6794,21 @@ mod tests {
                 raw: serde_json::json!({}),
             });
         }
-        handle_goto_key(KeyCode::Char('G'), &mut state);
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        handle_goto_key(KeyCode::Char('G'), &mut state, &fetch_tx)
+            .await
+            .unwrap();
         assert_eq!(state.browser.selected, 3);
-        handle_goto_key(KeyCode::Char('g'), &mut state);
+        handle_goto_key(KeyCode::Char('g'), &mut state, &fetch_tx)
+            .await
+            .unwrap();
         assert!(state.pending_goto_top);
-        handle_goto_key(KeyCode::Char('g'), &mut state);
+        handle_goto_key(KeyCode::Char('g'), &mut state, &fetch_tx)
+            .await
+            .unwrap();
         assert_eq!(state.browser.selected, 0);
         assert!(!state.pending_goto_top);
+        assert!(fetch_rx.try_recv().is_err());
 
         state.mode = Mode::Detail;
         state.detail = Some(detail_state(
@@ -6738,10 +6825,15 @@ mod tests {
             1,
             None,
         ));
-        handle_goto_key(KeyCode::Char('G'), &mut state);
+        handle_goto_key(KeyCode::Char('G'), &mut state, &fetch_tx)
+            .await
+            .unwrap();
         assert!(state.detail.as_ref().unwrap().scroll > 0);
-        handle_goto_key(KeyCode::Home, &mut state);
+        handle_goto_key(KeyCode::Home, &mut state, &fetch_tx)
+            .await
+            .unwrap();
         assert_eq!(state.detail.as_ref().unwrap().scroll, 0);
+        assert!(fetch_rx.try_recv().is_err());
     }
 
     #[test]
