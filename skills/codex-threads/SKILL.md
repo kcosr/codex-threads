@@ -115,6 +115,8 @@ Useful TUI keys:
 - `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
   `Tab` toggles stream/no-wait. Browser compose streams into the preview while
   the thread remains selected and detaches locally when selection moves away.
+  If the initial selected browser row is active, the TUI attaches to it
+  automatically.
 - Opening a detail view loads a small recent turn window and starts at the
   transcript bottom; while in detail, `Enter` opens the message action, `n/N`
   move between message-search matches, and `Esc` unlinks the local detail view

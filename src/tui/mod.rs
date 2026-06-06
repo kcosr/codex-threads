@@ -126,11 +126,21 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 }
             }
             Some(event) = app_rx.recv() => {
+                let auto_attach_initial_active =
+                    initial_browser_load_needs_auto_attach(&event, &state);
                 let refresh_detail_after_stream = stream_finish_detail_thread(&event, &state);
                 let refresh_after_archive = archive_changed_thread(&event);
                 let refresh_after_rename = rename_changed_thread(&event);
                 let refresh_after_submit = turn_submitted_thread(&event);
                 handle_app_event(event, &mut state);
+                if auto_attach_initial_active && !state.should_quit {
+                    auto_attach_selected_browser_thread_if_active(
+                        &mut state,
+                        target.clone(),
+                        yolo,
+                        app_tx.clone(),
+                    );
+                }
                 if let Some(thread_id) = refresh_detail_after_stream
                     && !state.should_quit
                     && state
@@ -1780,7 +1790,7 @@ fn spawn_browser_attach_task(
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            let turn_id = active_turn_id_for_thread(&target, &mut client, &thread_id)
+            let turn_id = active_turn_id_for_thread(&target, &mut client, &thread_id, true)
                 .await?
                 .ok_or_else(|| usage_error(format!("thread `{thread_id}` has no active turn")))?;
             stream_turn_id = Some(turn_id.clone());
@@ -1989,7 +1999,7 @@ fn spawn_no_wait_send_task(
             let active_turn_id = if active_turn_hint.is_some() {
                 active_turn_hint
             } else if probe_active_turn {
-                active_turn_id_for_thread(&target, &mut client, &thread_id).await?
+                active_turn_id_for_thread(&target, &mut client, &thread_id, true).await?
             } else {
                 None
             };
@@ -2037,13 +2047,14 @@ async fn active_turn_id_for_thread(
     target: &Target,
     client: &mut RpcClient,
     thread_id: &str,
+    load: bool,
 ) -> Result<Option<String>> {
     let status = thread_status(
         target,
         client,
         ThreadStatusRequest {
             thread_id: thread_id.to_string(),
-            load: false,
+            load,
             turn_scan_limit: TURN_SCAN_LIMIT,
         },
     )
@@ -2081,7 +2092,7 @@ fn spawn_browser_watch_send_task(
             let active_turn_id = if active_turn_hint.is_some() {
                 active_turn_hint
             } else if probe_active_turn {
-                active_turn_id_for_thread(&target, &mut client, &thread_id).await?
+                active_turn_id_for_thread(&target, &mut client, &thread_id, true).await?
             } else {
                 None
             };
@@ -2785,6 +2796,42 @@ fn unlink_detail_session(state: &mut TuiState) {
     }
     state.detail = None;
     state.mode = Mode::Browser;
+}
+
+fn initial_browser_load_needs_auto_attach(event: &AppEvent, state: &TuiState) -> bool {
+    matches!(event, AppEvent::BrowserLoaded { .. })
+        && matches!(state.mode, Mode::Browser)
+        && state.browser.rows.is_empty()
+        && state.stream.is_none()
+}
+
+fn auto_attach_selected_browser_thread_if_active(
+    state: &mut TuiState,
+    target: Target,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    if !matches!(state.mode, Mode::Browser) || state.stream.is_some() {
+        return;
+    }
+    let Some(row) = state.browser.rows.get(state.browser.selected) else {
+        return;
+    };
+    if !row.is_running() {
+        return;
+    }
+    let thread_id = row.id.clone();
+    let stream_id = state.allocate_stream_id();
+    state.stream = Some(StreamState::new_with_id(
+        stream_id,
+        thread_id.clone(),
+        None,
+        StreamStatus::Starting,
+        true,
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    state.stream_control = Some(control_tx);
+    spawn_browser_attach_task(target, thread_id, yolo, control_rx, stream_id, app_tx);
 }
 
 fn stream_finish_detail_thread(event: &AppEvent, state: &TuiState) -> Option<String> {
@@ -6155,6 +6202,63 @@ mod tests {
             "active-thread",
             None
         ));
+    }
+
+    #[test]
+    fn initial_browser_load_needs_auto_attach_only_for_empty_browser() {
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let event = AppEvent::BrowserLoaded {
+            epoch: 1,
+            rows: vec![test_thread_row("active-thread", "active")],
+            next_cursor: None,
+            backwards_cursor: None,
+        };
+        assert!(initial_browser_load_needs_auto_attach(&event, &state));
+
+        let mut loaded = state.clone();
+        loaded.browser.rows = vec![test_thread_row("active-thread", "active")];
+        assert!(!initial_browser_load_needs_auto_attach(&event, &loaded));
+    }
+
+    #[tokio::test]
+    async fn initial_active_browser_selection_auto_attaches() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("active-thread", "active")];
+
+        auto_attach_selected_browser_thread_if_active(&mut state, target, true, app_tx);
+
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.thread_id, "active-thread");
+        assert_eq!(stream.status, StreamStatus::Starting);
+        assert!(stream.attached);
+        assert!(state.stream_control.is_some());
     }
 
     #[test]

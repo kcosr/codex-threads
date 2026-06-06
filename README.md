@@ -213,7 +213,8 @@ active thread, `r` to refresh, `y` to copy the active thread id with OSC 52, and
 `m` to compose.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns. Browser compose streams into the preview while the
-thread remains selected, and detaches locally when selection moves away.
+thread remains selected, and detaches locally when selection moves away. If the
+initial selected browser row is active, the TUI attaches to it automatically.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
