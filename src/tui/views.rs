@@ -63,7 +63,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 area,
                 "Annotation",
                 draft,
-                "Ctrl-S save, Ctrl-D clear, Esc cancel",
+                "Enter save, Ctrl-D clear, Esc cancel",
             );
         }
         Mode::FilterMenu => draw_filter_menu(frame, area, state),
@@ -984,7 +984,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("annotation text"));
-        assert!(text.contains("Ctrl-S save, Ctrl-D clear, Esc cancel"));
+        assert!(text.contains("Enter save, Ctrl-D clear, Esc cancel"));
         assert!(
             buffer
                 .content()

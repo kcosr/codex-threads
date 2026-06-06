@@ -1142,7 +1142,7 @@ fn handle_annotation_input(
     };
     match key.code {
         KeyCode::Esc => state.mode = return_mode.clone(),
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Enter => {
             save_annotation_draft(target, state, &thread_id, draft)?;
             state.mode = return_mode.clone();
         }
@@ -1159,15 +1159,10 @@ fn handle_annotation_input(
                 return_to_detail,
             };
         }
-        KeyCode::Enter => {
-            draft.push('\n');
-            state.mode = Mode::AnnotationInput {
-                thread_id,
-                draft,
-                return_to_detail,
-            };
-        }
-        KeyCode::Char(ch) => {
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
             draft.push(ch);
             state.mode = Mode::AnnotationInput {
                 thread_id,
@@ -3514,6 +3509,43 @@ mod tests {
         set_annotation_in_state(&mut state, "t1", None);
         assert!(state.browser.rows[0].annotation.is_none());
         assert!(state.detail.as_ref().unwrap().annotation.is_none());
+    }
+
+    #[test]
+    fn annotation_input_ignores_control_s_instead_of_inserting_text() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        handle_annotation_input(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &target,
+            &mut state,
+            "t1".to_string(),
+            "note".to_string(),
+            false,
+        )
+        .unwrap();
+
+        let Mode::AnnotationInput { draft, .. } = &state.mode else {
+            panic!("expected annotation input");
+        };
+        assert_eq!(draft, "note");
     }
 
     #[test]

@@ -211,7 +211,7 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 active thread id with OSC 52, and `m` to compose.
 Compose uses `Enter` to send and `Shift-J` to insert a newline; `Tab` toggles
 stream/no-wait for new turns.
-Annotation editing uses `Ctrl-S` to save and `Ctrl-D` to clear. In detail, `T`
+Annotation editing uses `Enter` to save and `Ctrl-D` to clear. In detail, `T`
 attaches to an active turn, `S` steers it, `i` confirms interrupt, `Enter` opens
 the message action, and `q` quits. Opening a thread starts at the bottom of the
 transcript; detail views refresh in place while open, and `Esc` returns to the

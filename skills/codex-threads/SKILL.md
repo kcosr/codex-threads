@@ -101,7 +101,7 @@ Useful TUI keys:
 - `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
   relative updated-time display toggle. In filters, `a` toggles the archived
   thread filter.
-- `a` edits the local annotation with `Ctrl-S` save and `Ctrl-D` clear.
+- `a` edits the local annotation with `Enter` save and `Ctrl-D` clear.
 - `A` archives or unarchives the active thread.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
