@@ -404,6 +404,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let mut previous_turn_id: Option<&str> = None;
     for message in messages {
         let role_style = match message.role.as_str() {
             "user" => Style::default()
@@ -419,10 +420,13 @@ fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'s
         } else {
             role_style
         };
+        let turn_id = message.turn_id.as_deref();
+        let show_timestamp = turn_id.is_none() || turn_id != previous_turn_id;
         lines.push(Line::from(Span::styled(
-            message_header(message),
+            message_header(message, show_timestamp),
             header_style,
         )));
+        previous_turn_id = turn_id;
         for line in &message.lines {
             let mut text_style = match line.kind {
                 MessageLineKind::Text => Style::default(),
@@ -483,8 +487,11 @@ fn matching_detail_stream(state: &TuiState) -> Option<&crate::tui::state::Stream
         .filter(|stream| stream.thread_id == detail.thread_id)
 }
 
-fn message_header(message: &crate::tui::state::MessageBlock) -> String {
+fn message_header(message: &crate::tui::state::MessageBlock, show_timestamp: bool) -> String {
     let role = message.role.to_uppercase();
+    if !show_timestamp {
+        return role;
+    }
     let timestamp = message.timestamp.as_deref().unwrap_or("");
     if timestamp.is_empty() {
         role
@@ -1517,6 +1524,18 @@ mod tests {
                     ],
                     is_match: false,
                 },
+                MessageBlock {
+                    turn_id: Some("turn-2".to_string()),
+                    item_id: Some("item-3".to_string()),
+                    role: "user".to_string(),
+                    timestamp: Some("2026-06-05 09:02".to_string()),
+                    lines: vec![MessageLine {
+                        kind: MessageLineKind::Text,
+                        text: "Next turn".to_string(),
+                        spans: Vec::new(),
+                    }],
+                    is_match: false,
+                },
             ],
             scroll: 0,
             search_query: String::new(),
@@ -1539,11 +1558,14 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("USER · 2026-06-05 09:00"));
-        assert!(text.contains("ASSISTANT · 2026-06-05 09:01"));
+        assert!(text.contains("ASSISTANT"));
+        assert!(!text.contains("ASSISTANT · 2026-06-05 09:01"));
+        assert!(text.contains("USER · 2026-06-05 09:02"));
         assert!(!text.contains("USER · 2026-06-05 09:00 · turn-1"));
         assert!(!text.contains("ASSISTANT · 2026-06-05 09:01 · turn-1"));
         assert!(text.contains("First response line"));
         assert!(text.contains("Continuation line"));
+        assert!(text.contains("Next turn"));
         assert!(!text.contains("assistant Continuation line"));
     }
 

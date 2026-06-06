@@ -39,6 +39,8 @@
   timestamps inherited from active-turn snapshots.
 - Let CLI/TUI turn waits complete when live app-server returns a temporary
   `turn/start` id that differs from the persisted turn id in history.
+- Show turn timestamps only on the first rendered TUI message block for a turn
+  instead of repeating the same turn timestamp on every message.
 
 ## [0.1.5] - 2026-06-05
 

@@ -3087,7 +3087,7 @@ fn upsert_streaming_assistant_message(
     turn_id: Option<String>,
     item_id: Option<String>,
     text: &str,
-    finalized: bool,
+    _finalized: bool,
 ) {
     let Some(stream) = &state.stream else {
         return;
@@ -3121,17 +3121,12 @@ fn upsert_streaming_assistant_message(
         if message.item_id.is_none() {
             message.item_id = item_id.clone();
         }
-        update_live_message_timestamp(message, finalized);
     } else {
         detail.messages.push(message_block(
             turn_id,
             item_id,
             "assistant",
-            Some(if finalized {
-                format_current_epoch()
-            } else {
-                "streaming".to_string()
-            }),
+            None,
             text,
             100,
         ));
@@ -3150,7 +3145,7 @@ fn upsert_preview_assistant_message(
     turn_id: Option<String>,
     item_id: Option<String>,
     text: &str,
-    finalized: bool,
+    _finalized: bool,
 ) {
     let Some(stream) = &state.stream else {
         return;
@@ -3182,26 +3177,15 @@ fn upsert_preview_assistant_message(
         if message.item_id.is_none() {
             message.item_id = item_id.clone();
         }
-        update_live_message_timestamp(message, finalized);
     } else {
         messages.push(message_block(
             turn_id,
             item_id,
             "assistant",
-            Some(if finalized {
-                format_current_epoch()
-            } else {
-                "streaming".to_string()
-            }),
+            None,
             text,
             100,
         ));
-    }
-}
-
-fn update_live_message_timestamp(message: &mut MessageBlock, finalized: bool) {
-    if finalized || message.timestamp.as_deref() != Some("streaming") {
-        message.timestamp = Some(format_current_epoch());
     }
 }
 
@@ -4635,13 +4619,13 @@ mod tests {
         assert_eq!(detail.messages[0].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(detail.messages[1].role, "assistant");
         assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-1"));
-        assert_eq!(detail.messages[1].timestamp.as_deref(), Some("streaming"));
+        assert_eq!(detail.messages[1].timestamp, None);
         assert_eq!(detail.messages[1].lines[0].text, "first prune chunk");
         assert_eq!(detail.matches, vec![1]);
     }
 
     #[test]
-    fn stream_delta_retimestamps_existing_active_turn_message() {
+    fn stream_delta_preserves_existing_active_turn_timestamp() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -4707,9 +4691,7 @@ mod tests {
         let message = detail.messages.first().expect("message");
         assert_eq!(message.lines[0].text, "old text");
         assert_eq!(message.lines[1].text, "live update");
-        assert_ne!(message.timestamp.as_deref(), Some(old_timestamp.as_str()));
-        assert_ne!(message.timestamp.as_deref(), Some("streaming"));
-        assert!(message.timestamp.is_some());
+        assert_eq!(message.timestamp.as_deref(), Some(old_timestamp.as_str()));
     }
 
     #[test]
@@ -4828,8 +4810,7 @@ mod tests {
         let detail = state.detail.as_ref().expect("detail");
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
-        assert_ne!(detail.messages[0].timestamp.as_deref(), Some("streaming"));
-        assert!(detail.messages[0].timestamp.is_some());
+        assert_eq!(detail.messages[0].timestamp, None);
         assert_eq!(
             detail.messages[0].lines[0].text,
             "Verification passed. I'm installing the rebuilt binary."
@@ -4885,8 +4866,7 @@ mod tests {
         let detail = state.detail.as_ref().expect("detail");
         assert_eq!(detail.messages.len(), 1);
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
-        assert_ne!(detail.messages[0].timestamp.as_deref(), Some("streaming"));
-        assert!(detail.messages[0].timestamp.is_some());
+        assert_eq!(detail.messages[0].timestamp, None);
         assert_eq!(detail.messages[0].lines[0].text, "Done.");
     }
 
