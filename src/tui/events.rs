@@ -72,6 +72,13 @@ pub(crate) enum AppEvent {
     StreamEvent(Value),
     StreamFailed(String),
     StreamFinished(StreamStatus),
+    TurnSubmitted {
+        thread_id: String,
+    },
+    TurnSubmitFailed {
+        thread_id: String,
+        error: String,
+    },
     ArchiveChanged {
         thread_id: String,
         archived: bool,

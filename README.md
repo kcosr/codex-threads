@@ -210,8 +210,8 @@ to toggle the lazy recent-message preview pane, `f` for filters, `s` for sort,
 `c` for visible columns and updated-time display, `a` to annotate, `e` to
 rename, `A` to confirm archive or unarchive, `r` to refresh, `y` to copy the
 active thread id with OSC 52, and `m` to compose.
-Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
-stream/no-wait for new turns.
+Compose uses `Enter` to send and `Ctrl-J` to insert a newline. Browser compose
+sends no-wait; detail compose can use `Tab` to toggle stream/no-wait.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name

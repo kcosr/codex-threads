@@ -110,8 +110,9 @@ Useful TUI keys:
 - `A` opens confirmation to archive or unarchive the active thread.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
-- `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
-  `Tab` toggles stream/no-wait for new turns.
+- `m` composes a follow-up; `Enter` sends and `Ctrl-J` inserts a newline.
+  Browser compose sends no-wait; detail compose can use `Tab` to toggle
+  stream/no-wait.
 - Opening a detail view loads a small recent turn window and starts at the
   transcript bottom; while in detail, `Enter` opens the message action, `n/N`
   move between message-search matches, and `Esc` unlinks the local detail view

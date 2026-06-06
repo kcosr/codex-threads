@@ -98,6 +98,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         Mode::Compose(compose) => {
             let label = match compose.target {
                 ComposeTarget::Steer { .. } => "Steer active turn",
+                ComposeTarget::NewTurn { .. } if !compose.return_to_detail => "Compose no-wait",
                 ComposeTarget::NewTurn { .. } => match compose.send_mode {
                     SendMode::Stream => "Compose stream",
                     SendMode::NoWait => "Compose no-wait",
@@ -105,6 +106,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             };
             let footer = match compose.target {
                 ComposeTarget::Steer { .. } => "Enter steer, Ctrl-J newline, Esc cancel",
+                ComposeTarget::NewTurn { .. } if !compose.return_to_detail => {
+                    "Enter send no-wait, Ctrl-J newline, Esc cancel"
+                }
                 ComposeTarget::NewTurn { .. } => "Enter send, Ctrl-J newline, Tab mode, Esc cancel",
             };
             draw_compose(frame, area, label, &compose.text, footer);
@@ -837,7 +841,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  a annotate  e rename  A confirm archive/unarchive  T attach  S steer  i interrupt",
         "",
         "Compose and Text Inputs",
-        "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
+        "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait in detail  Esc cancel",
         "  Search: Enter apply  Ctrl-D clear  Esc cancel",
         "  Rename: Enter save  Ctrl-D clear draft  Esc cancel",
         "  Annotation: Enter save  Ctrl-D clear  Esc cancel",

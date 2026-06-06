@@ -127,6 +127,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 let refresh_detail_after_stream = stream_finish_detail_thread(&event, &state);
                 let refresh_after_archive = archive_changed_thread(&event);
                 let refresh_after_rename = rename_changed_thread(&event);
+                let refresh_after_submit = turn_submitted_thread(&event);
                 handle_app_event(event, &mut state);
                 if let Some(thread_id) = refresh_detail_after_stream
                     && !state.should_quit
@@ -141,6 +142,9 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
                 if refresh_after_rename.is_some() && !state.should_quit {
+                    schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                }
+                if refresh_after_submit.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
                 schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
@@ -1180,6 +1184,11 @@ fn jump_to_bottom(state: &mut TuiState) {
 
 fn open_message_action(state: &mut TuiState, thread_id: String) {
     let return_to_detail = matches!(state.mode, Mode::Detail);
+    let send_mode = if return_to_detail {
+        SendMode::Stream
+    } else {
+        SendMode::NoWait
+    };
     if return_to_detail
         && let Some(detail) = &state.detail
         && detail.thread_id == thread_id
@@ -1190,7 +1199,7 @@ fn open_message_action(state: &mut TuiState, thread_id: String) {
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn { thread_id },
             text: String::new(),
-            send_mode: SendMode::Stream,
+            send_mode,
             return_to_detail,
         });
     }
@@ -1488,7 +1497,7 @@ async fn handle_compose_input(
     match key.code {
         KeyCode::Esc => state.mode = return_mode.clone(),
         KeyCode::Tab => {
-            if matches!(compose.target, ComposeTarget::NewTurn { .. }) {
+            if compose.return_to_detail && matches!(compose.target, ComposeTarget::NewTurn { .. }) {
                 compose.send_mode = match compose.send_mode {
                     SendMode::Stream => SendMode::NoWait,
                     SendMode::NoWait => SendMode::Stream,
@@ -1531,14 +1540,6 @@ fn submit_compose(
     }
     match compose.target {
         ComposeTarget::NewTurn { thread_id } => {
-            let (control_tx, control_rx) = mpsc::unbounded_channel();
-            state.stream = Some(StreamState::new(
-                thread_id.clone(),
-                None,
-                StreamStatus::Starting,
-                false,
-            ));
-            state.stream_control = Some(control_tx);
             append_detail_message(
                 state,
                 thread_id.as_str(),
@@ -1548,15 +1549,35 @@ fn submit_compose(
                 &prompt,
             );
             state.mode = return_mode;
-            spawn_send_task(
-                target.clone(),
-                thread_id,
-                prompt,
-                compose.send_mode,
-                yolo,
-                control_rx,
-                app_tx.clone(),
-            );
+            match compose.send_mode {
+                SendMode::Stream => {
+                    let (control_tx, control_rx) = mpsc::unbounded_channel();
+                    state.stream = Some(StreamState::new(
+                        thread_id.clone(),
+                        None,
+                        StreamStatus::Starting,
+                        false,
+                    ));
+                    state.stream_control = Some(control_tx);
+                    spawn_stream_send_task(
+                        target.clone(),
+                        thread_id,
+                        prompt,
+                        yolo,
+                        control_rx,
+                        app_tx.clone(),
+                    );
+                }
+                SendMode::NoWait => {
+                    spawn_no_wait_send_task(
+                        target.clone(),
+                        thread_id,
+                        prompt,
+                        yolo,
+                        app_tx.clone(),
+                    );
+                }
+            }
         }
         ComposeTarget::Steer { thread_id, turn_id } => {
             state.mode = return_mode;
@@ -1723,11 +1744,48 @@ fn spawn_rename_task(
     });
 }
 
-fn spawn_send_task(
+fn spawn_no_wait_send_task(
     target: Target,
     thread_id: String,
     prompt: String,
-    send_mode: SendMode,
+    yolo: bool,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            start_turn_request(
+                &target,
+                &mut client,
+                thread_id.clone(),
+                prompt,
+                TurnStartOptions {
+                    model: None,
+                    effort: None,
+                    service_tier: None,
+                    yolo,
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => app_tx.send(AppEvent::TurnSubmitted { thread_id }).ok(),
+            Err(err) => app_tx
+                .send(AppEvent::TurnSubmitFailed {
+                    thread_id,
+                    error: err.to_string(),
+                })
+                .ok(),
+        };
+    });
+}
+
+fn spawn_stream_send_task(
+    target: Target,
+    thread_id: String,
+    prompt: String,
     yolo: bool,
     control_rx: mpsc::UnboundedReceiver<TurnControl>,
     app_tx: mpsc::UnboundedSender<AppEvent>,
@@ -1751,9 +1809,6 @@ fn spawn_send_task(
             app_tx
                 .send(AppEvent::StreamEvent(started.acceptance.clone()))
                 .ok();
-            if send_mode == SendMode::NoWait {
-                return Ok(StreamStatus::Detached);
-            }
             let tx = app_tx.clone();
             match wait_for_turn_controlled(
                 &target,
@@ -1942,6 +1997,12 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
             state.stream_control = None;
         }
+        AppEvent::TurnSubmitted { thread_id } => {
+            state.set_notice(format!("sent {thread_id}"));
+        }
+        AppEvent::TurnSubmitFailed { thread_id, error } => {
+            state.set_notice(format!("failed to send {thread_id}: {error}"));
+        }
         AppEvent::ArchiveChanged {
             thread_id,
             archived,
@@ -1995,6 +2056,13 @@ fn archive_changed_thread(event: &AppEvent) -> Option<String> {
 fn rename_changed_thread(event: &AppEvent) -> Option<String> {
     match event {
         AppEvent::RenameChanged { thread_id, .. } => Some(thread_id.clone()),
+        _ => None,
+    }
+}
+
+fn turn_submitted_thread(event: &AppEvent) -> Option<String> {
+    match event {
+        AppEvent::TurnSubmitted { thread_id } => Some(thread_id.clone()),
         _ => None,
     }
 }
@@ -4214,6 +4282,7 @@ mod tests {
             state.mode,
             Mode::Compose(ComposeState {
                 target: ComposeTarget::NewTurn { ref thread_id },
+                send_mode: SendMode::Stream,
                 return_to_detail: true,
                 ..
             }) if thread_id == "t1"
@@ -4991,7 +5060,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(state.mode, Mode::Browser));
-        assert!(state.stream.is_some());
+        assert!(state.stream.is_none());
     }
 
     #[tokio::test]
@@ -5046,13 +5115,114 @@ mod tests {
         .unwrap();
 
         assert!(matches!(state.mode, Mode::Browser));
-        assert_eq!(
-            state
-                .stream
-                .as_ref()
-                .map(|stream| stream.thread_id.as_str()),
-            Some("new")
-        );
+        assert!(state.stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_compose_defaults_no_wait_and_ignores_tab() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        open_message_action(&mut state, "t1".to_string());
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::NoWait);
+        assert!(!compose.return_to_detail);
+        let compose = compose.clone();
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            compose,
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::NoWait);
+    }
+
+    #[tokio::test]
+    async fn detail_compose_can_toggle_stream_mode() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        open_message_action(&mut state, "t1".to_string());
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::Stream);
+        assert!(compose.return_to_detail);
+        let compose = compose.clone();
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            compose,
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose mode");
+        };
+        assert_eq!(compose.send_mode, SendMode::NoWait);
     }
 
     #[test]
