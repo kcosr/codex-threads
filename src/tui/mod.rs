@@ -57,6 +57,7 @@ use crate::turns::{
 
 const DEFAULT_LIMIT: u32 = 50;
 const DETAIL_TURN_LIMIT: u32 = 10;
+const DETAIL_JUMP_TURN_LIMIT: u32 = 100;
 const PREVIEW_TURN_LIMIT: u32 = 3;
 const DETAIL_FOLLOW_REFRESH_SECS: u64 = 5;
 const AUTO_REFRESH_MIN_SECS: u64 = 5;
@@ -345,9 +346,11 @@ async fn fetch_worker(
                 epoch,
                 thread_id,
                 cursor,
+                limit,
                 page_direction,
             } => {
-                let result = fetch_detail(&target, &mut client, thread_id, cursor, epoch).await;
+                let result =
+                    fetch_detail(&target, &mut client, thread_id, cursor, limit, epoch).await;
                 match result {
                     Ok(detail) => {
                         let _ = app_tx.send(AppEvent::DetailLoaded {
@@ -495,6 +498,7 @@ async fn fetch_detail(
     client: &mut RpcClient,
     thread_id: String,
     cursor: Option<String>,
+    limit: u32,
     epoch: u64,
 ) -> Result<DetailState> {
     let mut output = read_thread_detail(
@@ -502,7 +506,7 @@ async fn fetch_detail(
         client,
         ShowThreadRequest {
             thread_id: thread_id.clone(),
-            last: DETAIL_TURN_LIMIT,
+            last: limit,
             cursor: cursor.clone(),
             asc: false,
             desc: true,
@@ -645,6 +649,25 @@ async fn schedule_detail_page(
     cursor: Option<String>,
     page_direction: DetailPageDirection,
 ) -> Result<()> {
+    schedule_detail_page_with_limit(
+        state,
+        fetch_tx,
+        thread_id,
+        cursor,
+        page_direction,
+        DETAIL_TURN_LIMIT,
+    )
+    .await
+}
+
+async fn schedule_detail_page_with_limit(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    thread_id: String,
+    cursor: Option<String>,
+    page_direction: DetailPageDirection,
+    limit: u32,
+) -> Result<()> {
     let epoch = state
         .detail
         .as_ref()
@@ -689,6 +712,7 @@ async fn schedule_detail_page(
             epoch,
             thread_id,
             cursor,
+            limit,
             page_direction,
         })
         .await
@@ -965,11 +989,8 @@ async fn handle_terminal_event(
         other => state.mode = other,
     }
 
-    if matches!(
-        key.code,
-        KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Home | KeyCode::End
-    ) {
-        handle_goto_key(key.code, state, fetch_tx).await?;
+    if let Some(goto_key) = normalized_goto_key(&key) {
+        handle_goto_key(goto_key, state, fetch_tx).await?;
         return Ok(());
     }
     state.pending_goto_top = false;
@@ -1286,6 +1307,16 @@ async fn handle_goto_key(
     }
 }
 
+fn normalized_goto_key(key: &KeyEvent) -> Option<KeyCode> {
+    match key.code {
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(KeyCode::Char('G'))
+        }
+        KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::Home | KeyCode::End => Some(key.code),
+        _ => None,
+    }
+}
+
 async fn begin_detail_jump_or_browser_jump(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
@@ -1323,7 +1354,15 @@ async fn schedule_pending_detail_jump(
         DetailJump::End => (detail.backwards_cursor.clone(), DetailPageDirection::Newer),
     };
     if let Some(cursor) = cursor {
-        schedule_detail_page(state, fetch_tx, thread_id, Some(cursor), direction).await
+        schedule_detail_page_with_limit(
+            state,
+            fetch_tx,
+            thread_id,
+            Some(cursor),
+            direction,
+            DETAIL_JUMP_TURN_LIMIT,
+        )
+        .await
     } else {
         state.pending_detail_jump = None;
         match jump {
@@ -5245,6 +5284,7 @@ mod tests {
             epoch,
             thread_id,
             cursor,
+            limit,
             page_direction,
         } = request
         else {
@@ -5253,6 +5293,7 @@ mod tests {
         assert_eq!(epoch, 4);
         assert_eq!(thread_id, "t1");
         assert_eq!(cursor.as_deref(), Some("current"));
+        assert_eq!(limit, DETAIL_TURN_LIMIT);
         assert_eq!(page_direction, DetailPageDirection::Replace);
     }
 
@@ -5315,6 +5356,7 @@ mod tests {
             epoch,
             thread_id,
             cursor,
+            limit,
             page_direction,
             ..
         } = fetch_rx.recv().await.expect("detail request")
@@ -5323,6 +5365,7 @@ mod tests {
         };
         assert_eq!(thread_id, "t1");
         assert_eq!(cursor.as_deref(), Some("older"));
+        assert_eq!(limit, DETAIL_JUMP_TURN_LIMIT);
         assert_eq!(page_direction, DetailPageDirection::Older);
         assert_eq!(state.pending_detail_jump, Some(DetailJump::Start));
 
@@ -5403,6 +5446,7 @@ mod tests {
         let FetchRequest::Detail {
             thread_id,
             cursor,
+            limit,
             page_direction,
             ..
         } = fetch_rx.recv().await.expect("detail request")
@@ -5411,7 +5455,67 @@ mod tests {
         };
         assert_eq!(thread_id, "t1");
         assert_eq!(cursor.as_deref(), Some("older"));
+        assert_eq!(limit, DETAIL_TURN_LIMIT);
         assert_eq!(page_direction, DetailPageDirection::Older);
+    }
+
+    #[tokio::test]
+    async fn shifted_lowercase_g_jumps_to_real_end() {
+        let target = test_target();
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": "newer", "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "old", "type": "agentMessage", "text": "old"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT)),
+            &mut state,
+            &target,
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::Detail {
+            thread_id,
+            cursor,
+            limit,
+            page_direction,
+            ..
+        } = fetch_rx.recv().await.expect("detail request")
+        else {
+            panic!("expected detail request");
+        };
+        assert_eq!(thread_id, "t1");
+        assert_eq!(cursor.as_deref(), Some("newer"));
+        assert_eq!(limit, DETAIL_JUMP_TURN_LIMIT);
+        assert_eq!(page_direction, DetailPageDirection::Newer);
+        assert_eq!(state.pending_detail_jump, Some(DetailJump::End));
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub(crate) enum FetchRequest {
         epoch: u64,
         thread_id: String,
         cursor: Option<String>,
+        limit: u32,
         page_direction: DetailPageDirection,
     },
     LoadThread {

@@ -25,7 +25,9 @@
 - Keep normal TUI compose sends on Codex app-server's `turn/start` path while
   exposing explicit browser steer and interrupt controls for active threads.
 - Let TUI detail scrolling and `gg`/`G` load history through to real transcript
-  start/end boundaries instead of stopping at the prefetched window.
+  start/end boundaries instead of stopping at the prefetched window, using the
+  server's maximum turn page size for full-history jumps.
+- Recognize Shift-G in terminals that report it as shifted lowercase `g`.
 
 ## [0.1.5] - 2026-06-05
 
