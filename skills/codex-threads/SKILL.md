@@ -108,11 +108,13 @@ Useful TUI keys:
 - `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
   but app-server does not expose a clear-name operation.
 - `A` opens confirmation to archive or unarchive the active thread.
+- `T` attaches to the selected active thread in the browser or the open active
+  thread in detail.
 - `r` refreshes; `R` resets pagination; `t` toggles auto-refresh.
 - `y` copies the active thread id with OSC 52.
-- `m` composes a follow-up; `Enter` sends and `Ctrl-J` inserts a newline.
-  Browser compose sends no-wait; detail compose can use `Tab` to toggle
-  stream/no-wait.
+- `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
+  `Tab` toggles stream/no-wait. Browser compose streams into the preview while
+  the thread remains selected and detaches locally when selection moves away.
 - Opening a detail view loads a small recent turn window and starts at the
   transcript bottom; while in detail, `Enter` opens the message action, `n/N`
   move between message-search matches, and `Esc` unlinks the local detail view

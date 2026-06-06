@@ -118,8 +118,10 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
         tokio::select! {
             maybe_event = events.next() => {
                 if let Some(Ok(event)) = maybe_event {
+                    let previous_selection = state.selected_thread_id().map(str::to_string);
                     handle_terminal_event(event, &mut state, &target, yolo, &fetch_tx, &app_tx)
                         .await?;
+                    detach_stream_if_browser_selection_changed(&mut state, previous_selection);
                     schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
                 }
             }
@@ -1070,6 +1072,25 @@ async fn handle_terminal_event(
                     control_rx,
                     app_tx.clone(),
                 );
+            } else if matches!(state.mode, Mode::Browser)
+                && let Some(thread_id) = state.selected_thread_id().map(str::to_string)
+            {
+                detach_stream(state);
+                state.stream = Some(StreamState::new(
+                    thread_id.clone(),
+                    None,
+                    StreamStatus::Starting,
+                    true,
+                ));
+                let (control_tx, control_rx) = mpsc::unbounded_channel();
+                state.stream_control = Some(control_tx);
+                spawn_browser_attach_task(
+                    target.clone(),
+                    thread_id,
+                    yolo,
+                    control_rx,
+                    app_tx.clone(),
+                );
             }
         }
         KeyCode::Char('i') => {
@@ -1184,11 +1205,6 @@ fn jump_to_bottom(state: &mut TuiState) {
 
 fn open_message_action(state: &mut TuiState, thread_id: String) {
     let return_to_detail = matches!(state.mode, Mode::Detail);
-    let send_mode = if return_to_detail {
-        SendMode::Stream
-    } else {
-        SendMode::NoWait
-    };
     if return_to_detail
         && let Some(detail) = &state.detail
         && detail.thread_id == thread_id
@@ -1199,7 +1215,7 @@ fn open_message_action(state: &mut TuiState, thread_id: String) {
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn { thread_id },
             text: String::new(),
-            send_mode,
+            send_mode: SendMode::Stream,
             return_to_detail,
         });
     }
@@ -1497,7 +1513,7 @@ async fn handle_compose_input(
     match key.code {
         KeyCode::Esc => state.mode = return_mode.clone(),
         KeyCode::Tab => {
-            if compose.return_to_detail && matches!(compose.target, ComposeTarget::NewTurn { .. }) {
+            if matches!(compose.target, ComposeTarget::NewTurn { .. }) {
                 compose.send_mode = match compose.send_mode {
                     SendMode::Stream => SendMode::NoWait,
                     SendMode::NoWait => SendMode::Stream,
@@ -1548,9 +1564,18 @@ fn submit_compose(
                 Some("draft sent".to_string()),
                 &prompt,
             );
+            append_preview_message(
+                state,
+                thread_id.as_str(),
+                None,
+                "user",
+                Some("draft sent".to_string()),
+                &prompt,
+            );
             state.mode = return_mode;
             match compose.send_mode {
                 SendMode::Stream => {
+                    detach_stream(state);
                     let (control_tx, control_rx) = mpsc::unbounded_channel();
                     state.stream = Some(StreamState::new(
                         thread_id.clone(),
@@ -1559,14 +1584,25 @@ fn submit_compose(
                         false,
                     ));
                     state.stream_control = Some(control_tx);
-                    spawn_stream_send_task(
-                        target.clone(),
-                        thread_id,
-                        prompt,
-                        yolo,
-                        control_rx,
-                        app_tx.clone(),
-                    );
+                    if compose.return_to_detail {
+                        spawn_stream_send_task(
+                            target.clone(),
+                            thread_id,
+                            prompt,
+                            yolo,
+                            control_rx,
+                            app_tx.clone(),
+                        );
+                    } else {
+                        spawn_browser_watch_send_task(
+                            target.clone(),
+                            thread_id,
+                            prompt,
+                            yolo,
+                            control_rx,
+                            app_tx.clone(),
+                        );
+                    }
                 }
                 SendMode::NoWait => {
                     spawn_no_wait_send_task(
@@ -1604,6 +1640,57 @@ fn spawn_attach_task(
     tokio::spawn(async move {
         let result: Result<StreamStatus> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
+            let tx = app_tx.clone();
+            match attach_turn(
+                &target,
+                &mut client,
+                AttachTurnOptions {
+                    thread_id,
+                    turn_id,
+                    yolo,
+                    poll_limit: TURN_SCAN_LIMIT,
+                    timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                },
+                control_rx,
+                |event| {
+                    tx.send(AppEvent::StreamEvent(event.clone())).ok();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .await?
+            {
+                TurnWaitOutcome::Terminal(terminal) => {
+                    tx.send(AppEvent::StreamEvent(terminal.output)).ok();
+                    Ok(match terminal.exit_code {
+                        0 => StreamStatus::Completed,
+                        _ => StreamStatus::Failed,
+                    })
+                }
+                TurnWaitOutcome::LocalInterrupt { .. } => Ok(StreamStatus::Detached),
+            }
+        }
+        .await;
+        match result {
+            Ok(status) => app_tx.send(AppEvent::StreamFinished(status)).ok(),
+            Err(err) => app_tx.send(AppEvent::StreamFailed(err.to_string())).ok(),
+        };
+    });
+}
+
+fn spawn_browser_attach_task(
+    target: Target,
+    thread_id: String,
+    yolo: bool,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let turn_id = active_turn_id_for_thread(&target, &mut client, &thread_id)
+                .await?
+                .ok_or_else(|| usage_error(format!("thread `{thread_id}` has no active turn")))?;
             let tx = app_tx.clone();
             match attach_turn(
                 &target,
@@ -1754,19 +1841,33 @@ fn spawn_no_wait_send_task(
     tokio::spawn(async move {
         let result: Result<()> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
-            start_turn_request(
-                &target,
-                &mut client,
-                thread_id.clone(),
-                prompt,
-                TurnStartOptions {
-                    model: None,
-                    effort: None,
-                    service_tier: None,
+            if let Some(turn_id) =
+                active_turn_id_for_thread(&target, &mut client, &thread_id).await?
+            {
+                steer_turn(
+                    &target,
+                    &mut client,
+                    thread_id.clone(),
+                    turn_id,
+                    prompt,
                     yolo,
-                },
-            )
-            .await?;
+                )
+                .await?;
+            } else {
+                start_turn_request(
+                    &target,
+                    &mut client,
+                    thread_id.clone(),
+                    prompt,
+                    TurnStartOptions {
+                        model: None,
+                        effort: None,
+                        service_tier: None,
+                        yolo,
+                    },
+                )
+                .await?;
+            }
             Ok(())
         }
         .await;
@@ -1778,6 +1879,132 @@ fn spawn_no_wait_send_task(
                     error: err.to_string(),
                 })
                 .ok(),
+        };
+    });
+}
+
+async fn active_turn_id_for_thread(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let status = thread_status(
+        target,
+        client,
+        ThreadStatusRequest {
+            thread_id: thread_id.to_string(),
+            load: false,
+            turn_scan_limit: TURN_SCAN_LIMIT,
+        },
+    )
+    .await?;
+    Ok(status["activeTurnId"].as_str().map(str::to_string))
+}
+
+fn spawn_browser_watch_send_task(
+    target: Target,
+    thread_id: String,
+    prompt: String,
+    yolo: bool,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let active_turn_id =
+                active_turn_id_for_thread(&target, &mut client, &thread_id).await?;
+            if let Some(turn_id) = active_turn_id {
+                let accepted = steer_turn(
+                    &target,
+                    &mut client,
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    prompt,
+                    yolo,
+                )
+                .await?;
+                app_tx.send(AppEvent::StreamEvent(accepted)).ok();
+                let tx = app_tx.clone();
+                match attach_turn(
+                    &target,
+                    &mut client,
+                    AttachTurnOptions {
+                        thread_id,
+                        turn_id,
+                        yolo,
+                        poll_limit: TURN_SCAN_LIMIT,
+                        timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                    },
+                    control_rx,
+                    |event| {
+                        tx.send(AppEvent::StreamEvent(event.clone())).ok();
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                )
+                .await?
+                {
+                    TurnWaitOutcome::Terminal(terminal) => {
+                        tx.send(AppEvent::StreamEvent(terminal.output)).ok();
+                        Ok(match terminal.exit_code {
+                            0 => StreamStatus::Completed,
+                            _ => StreamStatus::Failed,
+                        })
+                    }
+                    TurnWaitOutcome::LocalInterrupt { .. } => Ok(StreamStatus::Detached),
+                }
+            } else {
+                let started = start_turn_request(
+                    &target,
+                    &mut client,
+                    thread_id,
+                    prompt,
+                    TurnStartOptions {
+                        model: None,
+                        effort: None,
+                        service_tier: None,
+                        yolo,
+                    },
+                )
+                .await?;
+                app_tx
+                    .send(AppEvent::StreamEvent(started.acceptance.clone()))
+                    .ok();
+                let tx = app_tx.clone();
+                match wait_for_turn_controlled(
+                    &target,
+                    &mut client,
+                    started,
+                    ControlledTurnWaitOptions {
+                        poll_limit: TURN_SCAN_LIMIT,
+                        timeout: Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+                        unsubscribe_on_detach: false,
+                    },
+                    control_rx,
+                    |event| {
+                        tx.send(AppEvent::StreamEvent(event.clone())).ok();
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                )
+                .await?
+                {
+                    TurnWaitOutcome::Terminal(terminal) => {
+                        tx.send(AppEvent::StreamEvent(terminal.output)).ok();
+                        Ok(match terminal.exit_code {
+                            0 => StreamStatus::Completed,
+                            _ => StreamStatus::Failed,
+                        })
+                    }
+                    TurnWaitOutcome::LocalInterrupt { .. } => Ok(StreamStatus::Detached),
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(status) => app_tx.send(AppEvent::StreamFinished(status)).ok(),
+            Err(err) => app_tx.send(AppEvent::StreamFailed(err.to_string())).ok(),
         };
     });
 }
@@ -1883,9 +2110,13 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         } => state.set_preview_error(epoch, thread_id, error),
         AppEvent::StreamEvent(event) => {
             log_stream_event(&event);
+            let event_thread_id = event["threadId"].as_str();
             if state.stream.is_none()
-                && let Some(thread_id) = event["threadId"].as_str()
+                && let Some(thread_id) = event_thread_id
             {
+                if !stream_event_matches_visible_thread(state, thread_id) {
+                    return;
+                }
                 state.stream = Some(StreamState::new(
                     thread_id.to_string(),
                     event["turnId"].as_str().map(str::to_string),
@@ -1969,15 +2200,24 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 if event["source"].as_str() == Some("poll") {
                     stream.last_poll_at = Some(std::time::Instant::now());
                 }
-                stream.events.push(event);
+                stream.events.push(event.clone());
             }
             if let Some(turn_id) = pending_turn_id {
                 fill_pending_turn_ids(state, &turn_id);
+                fill_preview_pending_turn_ids(state, &turn_id);
             }
             if let Some(detail) = snapshot_detail {
                 state.replace_detail(detail.epoch, detail);
             }
+            seed_preview_from_resume_snapshot(state, &event);
             for (turn_id, item_id, text, finalized) in assistant_updates {
+                upsert_preview_assistant_message(
+                    state,
+                    turn_id.clone(),
+                    item_id.clone(),
+                    &text,
+                    finalized,
+                );
                 upsert_streaming_assistant_message(state, turn_id, item_id, &text, finalized);
             }
         }
@@ -1985,6 +2225,8 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             if let Some(stream) = &mut state.stream {
                 stream.status = StreamStatus::Failed;
                 stream.last_error = Some(error);
+            } else {
+                state.set_notice(format!("stream failed: {error}"));
             }
             state.stream_control = None;
         }
@@ -2166,6 +2408,32 @@ fn stream_is_running(state: &TuiState) -> bool {
     })
 }
 
+fn stream_is_visible_in_browser(state: &TuiState, thread_id: &str) -> bool {
+    state.selected_thread_id() == Some(thread_id)
+        || state
+            .browser
+            .preview
+            .thread_id
+            .as_deref()
+            .is_some_and(|preview_thread_id| preview_thread_id == thread_id)
+        || (state.selected_thread_id().is_none()
+            && state.browser.preview.thread_id.is_none()
+            && state
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.thread_id == thread_id))
+}
+
+fn stream_event_matches_visible_thread(state: &TuiState, thread_id: &str) -> bool {
+    match state.mode {
+        Mode::Browser => stream_is_visible_in_browser(state, thread_id),
+        _ => state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.thread_id == thread_id),
+    }
+}
+
 fn detach_stream(state: &mut TuiState) {
     if let Some(control) = &state.stream_control {
         let _ = control.send(TurnControl::Detach);
@@ -2180,6 +2448,27 @@ fn detach_stream(state: &mut TuiState) {
         stream.detached = true;
     }
     state.stream_control = None;
+}
+
+fn detach_stream_if_browser_selection_changed(
+    state: &mut TuiState,
+    previous_selection: Option<String>,
+) {
+    if !matches!(state.mode, Mode::Browser) {
+        return;
+    }
+    let current_selection = state.selected_thread_id().map(str::to_string);
+    if previous_selection == current_selection {
+        return;
+    }
+    let Some(stream_thread_id) = state.stream.as_ref().map(|stream| stream.thread_id.clone())
+    else {
+        return;
+    };
+    if current_selection.as_deref() != Some(stream_thread_id.as_str()) {
+        detach_stream(state);
+        state.stream = None;
+    }
 }
 
 fn unlink_detail_session(state: &mut TuiState) {
@@ -2252,6 +2541,39 @@ fn append_detail_message(
     }
 }
 
+fn preview_matches_thread(state: &TuiState, thread_id: &str) -> bool {
+    state.browser.preview.thread_id.as_deref() == Some(thread_id)
+        || (matches!(state.mode, Mode::Browser) && state.selected_thread_id() == Some(thread_id))
+}
+
+fn ensure_preview_thread(state: &mut TuiState, thread_id: &str) {
+    if state.browser.preview.thread_id.as_deref() != Some(thread_id) {
+        state.browser.preview.thread_id = Some(thread_id.to_string());
+        state.browser.preview.loading = false;
+        state.browser.preview.messages.clear();
+        state.browser.preview.error = None;
+    }
+}
+
+fn append_preview_message(
+    state: &mut TuiState,
+    thread_id: &str,
+    turn_id: Option<String>,
+    role: &str,
+    timestamp: Option<String>,
+    text: &str,
+) {
+    if !preview_matches_thread(state, thread_id) {
+        return;
+    }
+    ensure_preview_thread(state, thread_id);
+    state
+        .browser
+        .preview
+        .messages
+        .push(message_block(turn_id, None, role, timestamp, text, 100));
+}
+
 fn fill_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
     let Some(detail) = &mut state.detail else {
         return;
@@ -2261,6 +2583,40 @@ fn fill_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
             message.turn_id = Some(turn_id.to_string());
         }
     }
+}
+
+fn fill_preview_pending_turn_ids(state: &mut TuiState, turn_id: &str) {
+    for message in &mut state.browser.preview.messages {
+        if message.turn_id.is_none() {
+            message.turn_id = Some(turn_id.to_string());
+        }
+    }
+}
+
+fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
+    let Some(thread) = event.get("thread") else {
+        return;
+    };
+    let Some(thread_id) = thread["id"].as_str().or_else(|| event["threadId"].as_str()) else {
+        return;
+    };
+    if !preview_matches_thread(state, thread_id) || thread["turns"].as_array().is_none() {
+        return;
+    }
+    let output = json!({
+        "thread": thread,
+        "turns": {
+            "data": thread["turns"].clone(),
+            "nextCursor": Value::Null,
+            "backwardsCursor": Value::Null
+        }
+    });
+    let status_output = event["turnId"]
+        .as_str()
+        .map(|turn_id| json!({"activeTurnId": turn_id}));
+    let detail = detail_state(output, status_output, thread_id.to_string(), 0, None);
+    ensure_preview_thread(state, thread_id);
+    state.browser.preview.messages = detail.messages;
 }
 
 fn append_stream_assistant_delta(
@@ -2407,6 +2763,62 @@ fn upsert_streaming_assistant_message(
     if !detail.search_query.is_empty() {
         let query = detail.search_query.clone();
         state.update_message_search(query);
+    }
+}
+
+fn upsert_preview_assistant_message(
+    state: &mut TuiState,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    text: &str,
+    finalized: bool,
+) {
+    let Some(stream) = &state.stream else {
+        return;
+    };
+    if !preview_matches_thread(state, &stream.thread_id) {
+        return;
+    }
+    let thread_id = stream.thread_id.clone();
+    ensure_preview_thread(state, &thread_id);
+    let messages = &mut state.browser.preview.messages;
+    let match_index = messages.iter().rposition(|message| {
+        streaming_message_exact_match(message, turn_id.as_deref(), item_id.as_deref())
+    });
+    let provisional_index = if item_id.is_some() && match_index.is_none() {
+        messages
+            .iter()
+            .rposition(|message| streaming_message_provisional_match(message, turn_id.as_deref()))
+    } else {
+        None
+    };
+    if let Some(message) = match_index
+        .or(provisional_index)
+        .and_then(|index| messages.get_mut(index))
+    {
+        message.lines = markdown_lines(text, 100);
+        if message.turn_id.is_none() {
+            message.turn_id = turn_id.clone();
+        }
+        if message.item_id.is_none() {
+            message.item_id = item_id.clone();
+        }
+        if finalized {
+            message.timestamp = Some(format_current_epoch());
+        }
+    } else {
+        messages.push(message_block(
+            turn_id,
+            item_id,
+            "assistant",
+            Some(if finalized {
+                format_current_epoch()
+            } else {
+                "streaming".to_string()
+            }),
+            text,
+            100,
+        ));
     }
 }
 
@@ -4901,6 +5313,38 @@ mod tests {
     }
 
     #[test]
+    fn browser_selection_change_detaches_stream_for_previous_thread() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![
+            test_thread_row("t1", "active"),
+            test_thread_row("t2", "idle"),
+        ];
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        state.stream_control = Some(control_tx);
+
+        state.move_selection(1);
+        detach_stream_if_browser_selection_changed(&mut state, Some("t1".to_string()));
+
+        assert!(state.stream.is_none());
+        assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
+    }
+
+    #[test]
     fn mouse_wheel_scrolls_detail_transcript() {
         let mut state = TuiState::new(TuiInit {
             query: None,
@@ -5119,7 +5563,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_compose_defaults_no_wait_and_ignores_tab() {
+    async fn browser_stream_compose_sets_stream_and_preview_draft() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/tmp/missing.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        state.browser.preview.thread_id = Some("t1".to_string());
+
+        handle_compose_input(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            ComposeState {
+                target: ComposeTarget::NewTurn {
+                    thread_id: "t1".to_string(),
+                },
+                text: "send me".to_string(),
+                send_mode: SendMode::Stream,
+                return_to_detail: false,
+            },
+            &target,
+            true,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Browser));
+        assert_eq!(
+            state
+                .stream
+                .as_ref()
+                .map(|stream| stream.thread_id.as_str()),
+            Some("t1")
+        );
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(state.browser.preview.messages[0].role, "user");
+        assert_eq!(state.browser.preview.messages[0].lines[0].text, "send me");
+    }
+
+    #[tokio::test]
+    async fn browser_compose_defaults_stream_and_tab_toggles_no_wait() {
         let target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
@@ -5145,7 +5644,7 @@ mod tests {
         let Mode::Compose(compose) = &state.mode else {
             panic!("expected compose mode");
         };
-        assert_eq!(compose.send_mode, SendMode::NoWait);
+        assert_eq!(compose.send_mode, SendMode::Stream);
         assert!(!compose.return_to_detail);
         let compose = compose.clone();
 
