@@ -33,6 +33,12 @@ pub(crate) enum FetchRequest {
 }
 
 #[derive(Debug)]
+pub(crate) struct PreviewRequest {
+    pub epoch: u64,
+    pub thread_id: String,
+}
+
+#[derive(Debug)]
 pub(crate) enum AppEvent {
     BrowserLoaded {
         epoch: u64,
@@ -51,6 +57,16 @@ pub(crate) enum AppEvent {
     },
     DetailLoadFailed {
         epoch: u64,
+        error: String,
+    },
+    PreviewLoaded {
+        epoch: u64,
+        thread_id: String,
+        text: Option<String>,
+    },
+    PreviewLoadFailed {
+        epoch: u64,
+        thread_id: String,
         error: String,
     },
     StreamEvent(Value),

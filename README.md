@@ -206,8 +206,9 @@ Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `?` for keyboard help, `/` to search threads or loaded transcript messages,
 `Enter` to open a thread, `]` and `[` to page when cursors are available, `p`
-to toggle the preview pane, `f` for filters, `s` for sort, `c` for visible
-columns and updated-time display, `a` to annotate, `e` to rename, `A` to archive
+to toggle the lazy last-message preview pane, `f` for filters, `s` for sort,
+`c` for visible columns and updated-time display, `a` to annotate, `e` to
+rename, `A` to archive
 or unarchive, `r` to refresh, `y` to copy the active thread id with OSC 52, and
 `m` to compose.
 Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
@@ -218,10 +219,11 @@ and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
 operation. In detail, `T` attaches to an active turn, `S` steers it, `i`
 confirms interrupt, `Enter` opens the message action, and `q` quits. Attaching
 resumes the thread with turns included so the active-turn snapshot appears
-before new stream notifications. Opening a thread starts at the bottom of the
-transcript; detail views refresh in place while open, and `Esc` returns to the
-browser after unlinking the local detail view and detaching any local stream.
-Local detach leaves remote turns running.
+before new stream notifications. Opening a thread loads a small recent turn
+window, orders it chronologically, and starts at the bottom of the transcript;
+detail views refresh in place while open, and `Esc` returns to the browser after
+unlinking the local detail view and detaching any local stream. Local detach
+leaves remote turns running.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted

@@ -99,7 +99,8 @@ Useful TUI keys:
 - `/` searches threads in the browser or loaded transcript lines in detail.
 - Search prompts use `Enter` to apply and `Ctrl-D` to clear.
 - `]` and `[` page through browser/detail cursors when available.
-- `p` toggles the browser preview pane.
+- `p` toggles the browser preview pane, which lazily fetches the selected
+  thread's last message.
 - `f` opens filters, `s` opens sort, and `c` opens visible columns plus the
   relative updated-time display toggle. In filters, `a` toggles the archived
   thread filter.
@@ -111,9 +112,10 @@ Useful TUI keys:
 - `y` copies the active thread id with OSC 52.
 - `m` composes a follow-up; `Enter` sends, `Ctrl-J` inserts a newline, and
   `Tab` toggles stream/no-wait for new turns.
-- Opening a detail view starts at the transcript bottom; while in detail,
-  `Enter` opens the message action, `n/N` move between message-search matches,
-  and `Esc` unlinks the local detail view and returns to the browser.
+- Opening a detail view loads a small recent turn window and starts at the
+  transcript bottom; while in detail, `Enter` opens the message action, `n/N`
+  move between message-search matches, and `Esc` unlinks the local detail view
+  and returns to the browser.
 - In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms
   interrupt. Attach resumes with a turn snapshot first, then streams new events.
 - `q` quits. Local detach leaves remote turns running unless interrupted.

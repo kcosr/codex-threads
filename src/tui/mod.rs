@@ -38,7 +38,9 @@ use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStatusRequest, list_threads,
     read_thread_detail, search_threads, set_thread_archived, set_thread_name, thread_status,
 };
-use crate::tui::events::{AppEvent, BrowserQuery, DetailPageDirection, FetchRequest};
+use crate::tui::events::{
+    AppEvent, BrowserQuery, DetailPageDirection, FetchRequest, PreviewRequest,
+};
 use crate::tui::input::{InputAction, ModeKind};
 use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
@@ -53,7 +55,8 @@ use crate::turns::{
 };
 
 const DEFAULT_LIMIT: u32 = 50;
-const DETAIL_TURN_LIMIT: u32 = 80;
+const DETAIL_TURN_LIMIT: u32 = 10;
+const PREVIEW_TURN_LIMIT: u32 = 3;
 const DETAIL_FOLLOW_REFRESH_SECS: u64 = 5;
 const TURN_SCAN_LIMIT: u32 = 200;
 const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
@@ -92,8 +95,10 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     terminal.clear()?;
 
     let (fetch_tx, fetch_rx) = mpsc::channel(32);
+    let (preview_tx, preview_rx) = mpsc::channel(8);
     let (app_tx, mut app_rx) = mpsc::unbounded_channel();
     tokio::spawn(fetch_worker(target.clone(), fetch_rx, app_tx.clone()));
+    tokio::spawn(preview_worker(target.clone(), preview_rx, app_tx.clone()));
     spawn_shutdown_signal_task(app_tx.clone());
     schedule_browser_refresh(&mut state, &fetch_tx).await?;
 
@@ -113,7 +118,9 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
         tokio::select! {
             maybe_event = events.next() => {
                 if let Some(Ok(event)) = maybe_event {
-                    handle_terminal_event(event, &mut state, &target, yolo, &fetch_tx, &app_tx).await?;
+                    handle_terminal_event(event, &mut state, &target, yolo, &fetch_tx, &app_tx)
+                        .await?;
+                    schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
                 }
             }
             Some(event) = app_rx.recv() => {
@@ -136,6 +143,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 if refresh_after_rename.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
+                schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
             }
             _ = tick.tick() => {
                 state.clear_expired_notice();
@@ -316,6 +324,49 @@ async fn fetch_worker(
     }
 }
 
+async fn preview_worker(
+    target: Target,
+    mut preview_rx: mpsc::Receiver<PreviewRequest>,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut client = match RpcClient::connect(&target.endpoint).await {
+        Ok(client) => client,
+        Err(err) => {
+            while let Some(request) = preview_rx.recv().await {
+                let _ = app_tx.send(AppEvent::PreviewLoadFailed {
+                    epoch: request.epoch,
+                    thread_id: request.thread_id,
+                    error: err.to_string(),
+                });
+            }
+            return;
+        }
+    };
+
+    while let Some(mut request) = preview_rx.recv().await {
+        while let Ok(newer) = preview_rx.try_recv() {
+            request = newer;
+        }
+        let result = fetch_preview(&target, &mut client, request.thread_id.clone()).await;
+        match result {
+            Ok(text) => {
+                let _ = app_tx.send(AppEvent::PreviewLoaded {
+                    epoch: request.epoch,
+                    thread_id: request.thread_id,
+                    text,
+                });
+            }
+            Err(err) => {
+                let _ = app_tx.send(AppEvent::PreviewLoadFailed {
+                    epoch: request.epoch,
+                    thread_id: request.thread_id,
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+}
+
 async fn fetch_browser(
     target: &Target,
     client: &mut RpcClient,
@@ -379,19 +430,20 @@ async fn fetch_detail(
     cursor: Option<String>,
     epoch: u64,
 ) -> Result<DetailState> {
-    let output = read_thread_detail(
+    let mut output = read_thread_detail(
         target,
         client,
         ShowThreadRequest {
             thread_id: thread_id.clone(),
             last: DETAIL_TURN_LIMIT,
             cursor: cursor.clone(),
-            asc: true,
-            desc: false,
+            asc: false,
+            desc: true,
             items: ItemsView::Full,
         },
     )
     .await?;
+    normalize_detail_turns_for_display(&mut output);
     let status = thread_status(
         target,
         client,
@@ -404,6 +456,28 @@ async fn fetch_detail(
     .await
     .ok();
     Ok(detail_state(output, status, thread_id, epoch, cursor))
+}
+
+async fn fetch_preview(
+    target: &Target,
+    client: &mut RpcClient,
+    thread_id: String,
+) -> Result<Option<String>> {
+    let mut output = read_thread_detail(
+        target,
+        client,
+        ShowThreadRequest {
+            thread_id,
+            last: PREVIEW_TURN_LIMIT,
+            cursor: None,
+            asc: false,
+            desc: true,
+            items: ItemsView::Full,
+        },
+    )
+    .await?;
+    normalize_detail_turns_for_display(&mut output);
+    Ok(last_message_preview(&output))
 }
 
 async fn schedule_browser_refresh(
@@ -536,6 +610,30 @@ async fn schedule_detail_page(
         })
         .await
         .context("failed to schedule detail load")
+}
+
+async fn schedule_selected_preview_if_needed(
+    state: &mut TuiState,
+    preview_tx: &mpsc::Sender<PreviewRequest>,
+) -> Result<()> {
+    if !state.prefs.browser.preview_pane || !matches!(state.mode, Mode::Browser) {
+        return Ok(());
+    }
+    let Some(thread_id) = state.selected_thread_id().map(str::to_string) else {
+        return Ok(());
+    };
+    if state.browser.preview.thread_id.as_deref() == Some(thread_id.as_str())
+        && (state.browser.preview.loading
+            || state.browser.preview.text.is_some()
+            || state.browser.preview.error.is_some())
+    {
+        return Ok(());
+    }
+    let epoch = state.set_preview_loading(thread_id.clone());
+    preview_tx
+        .send(PreviewRequest { epoch, thread_id })
+        .await
+        .context("failed to schedule preview load")
 }
 
 async fn handle_terminal_event(
@@ -959,6 +1057,9 @@ async fn handle_terminal_event(
         }
         KeyCode::Char('p') if matches!(state.mode, Mode::Browser) => {
             state.prefs.browser.preview_pane = !state.prefs.browser.preview_pane;
+            if !state.prefs.browser.preview_pane {
+                state.browser.preview = Default::default();
+            }
             let _ = save_prefs(&state.prefs);
         }
         KeyCode::Char('s') if matches!(state.mode, Mode::Browser) => state.mode = Mode::SortMenu,
@@ -1676,6 +1777,16 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             DetailPageDirection::Newer => state.extend_detail_newer(epoch, *detail),
         },
         AppEvent::DetailLoadFailed { epoch, error } => state.set_detail_error(epoch, error),
+        AppEvent::PreviewLoaded {
+            epoch,
+            thread_id,
+            text,
+        } => state.set_preview_loaded(epoch, thread_id, text),
+        AppEvent::PreviewLoadFailed {
+            epoch,
+            thread_id,
+            error,
+        } => state.set_preview_error(epoch, thread_id, error),
         AppEvent::StreamEvent(event) => {
             log_stream_event(&event);
             if state.stream.is_none()
@@ -2351,6 +2462,69 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     encoded
+}
+
+fn normalize_detail_turns_for_display(output: &mut Value) {
+    if let Some(turns) = output["turns"]["data"].as_array_mut() {
+        turns.reverse();
+    }
+}
+
+fn last_message_preview(output: &Value) -> Option<String> {
+    let mut last = None;
+    for turn in output["turns"]["data"].as_array()? {
+        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
+            let role = match item["type"].as_str() {
+                Some("userMessage") => "user",
+                Some("agentMessage") => "assistant",
+                _ => continue,
+            };
+            let Some(text) = message_text_from_item(item) else {
+                continue;
+            };
+            let text = compact_preview_text(&text);
+            if !text.is_empty() {
+                last = Some(format!("{role}: {text}"));
+            }
+        }
+    }
+    last
+}
+
+fn message_text_from_item(item: &Value) -> Option<String> {
+    match item["type"].as_str() {
+        Some("userMessage") => {
+            let parts = item["content"]
+                .as_array()
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|input| input["text"].as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        Some("agentMessage") => item["text"].as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+fn compact_preview_text(text: &str) -> String {
+    let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_PREVIEW_CHARS: usize = 700;
+    if compact.chars().count() > MAX_PREVIEW_CHARS {
+        compact = compact
+            .chars()
+            .take(MAX_PREVIEW_CHARS.saturating_sub(1))
+            .collect::<String>();
+        compact.push_str("...");
+    }
+    compact
 }
 
 fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> ThreadRow {
@@ -3081,6 +3255,100 @@ mod tests {
     }
 
     #[test]
+    fn detail_output_normalizes_descending_turns_for_display() {
+        let mut output = serde_json::json!({
+            "thread": {"id": "t1"},
+            "turns": {"data": [
+                {"id": "new"},
+                {"id": "middle"},
+                {"id": "old"}
+            ]}
+        });
+
+        normalize_detail_turns_for_display(&mut output);
+
+        let ids = output["turns"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|turn| turn["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["old", "middle", "new"]);
+    }
+
+    #[test]
+    fn last_message_preview_uses_recent_message_text() {
+        let output = serde_json::json!({
+            "thread": {"id": "t1"},
+            "turns": {"data": [
+                {"id": "old", "items": [
+                    {"id": "u1", "type": "userMessage", "content": [{"text": "older user"}]},
+                    {"id": "a1", "type": "agentMessage", "text": "older assistant"}
+                ]},
+                {"id": "new", "items": [
+                    {"id": "u2", "type": "userMessage", "content": [{"text": "latest user"}]},
+                    {"id": "a2", "type": "agentMessage", "text": "latest\nassistant"}
+                ]}
+            ]}
+        });
+
+        assert_eq!(
+            last_message_preview(&output).as_deref(),
+            Some("assistant: latest assistant")
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_preview_schedules_and_ignores_stale_results() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+        let (preview_tx, mut preview_rx) = mpsc::channel(1);
+
+        schedule_selected_preview_if_needed(&mut state, &preview_tx)
+            .await
+            .unwrap();
+
+        let request = preview_rx.recv().await.expect("preview request");
+        assert_eq!(request.thread_id, "t1");
+        assert_eq!(request.epoch, 1);
+        assert!(state.browser.preview.loading);
+
+        handle_app_event(
+            AppEvent::PreviewLoaded {
+                epoch: 0,
+                thread_id: "t1".to_string(),
+                text: Some("assistant: stale".to_string()),
+            },
+            &mut state,
+        );
+        assert!(state.browser.preview.text.is_none());
+
+        handle_app_event(
+            AppEvent::PreviewLoaded {
+                epoch: 1,
+                thread_id: "t1".to_string(),
+                text: Some("assistant: fresh".to_string()),
+            },
+            &mut state,
+        );
+        assert_eq!(
+            state.browser.preview.text.as_deref(),
+            Some("assistant: fresh")
+        );
+    }
+
+    #[test]
     fn markdown_lines_preserve_paragraph_and_code_gaps() {
         let lines = markdown_lines(
             "first paragraph\n\nsecond paragraph\n\n```text\none\n\ntwo\n```",
@@ -3192,11 +3460,11 @@ mod tests {
             serde_json::json!({
                 "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
                 "turns": {"nextCursor": null, "backwardsCursor": "newer", "data": [
-                    {"id": "turn-2", "items": [
-                        {"id": "middle", "type": "agentMessage", "text": "middle"}
-                    ]},
                     {"id": "turn-1", "items": [
                         {"id": "old", "type": "agentMessage", "text": "old"}
+                    ]},
+                    {"id": "turn-2", "items": [
+                        {"id": "middle", "type": "agentMessage", "text": "middle"}
                     ]}
                 ]}
             }),
@@ -3208,18 +3476,18 @@ mod tests {
         state.extend_detail_older(1, older);
         let detail = state.detail.as_ref().expect("detail");
         assert_eq!(detail.messages.len(), 2);
-        assert_eq!(detail.messages[0].item_id.as_deref(), Some("middle"));
-        assert_eq!(detail.messages[1].item_id.as_deref(), Some("old"));
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("old"));
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("middle"));
 
         let newer = detail_state(
             serde_json::json!({
                 "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
                 "turns": {"nextCursor": "older", "backwardsCursor": null, "data": [
-                    {"id": "turn-3", "items": [
-                        {"id": "new", "type": "agentMessage", "text": "new"}
-                    ]},
                     {"id": "turn-2", "items": [
                         {"id": "middle", "type": "agentMessage", "text": "middle"}
+                    ]},
+                    {"id": "turn-3", "items": [
+                        {"id": "new", "type": "agentMessage", "text": "new"}
                     ]}
                 ]}
             }),
@@ -3231,9 +3499,9 @@ mod tests {
         state.extend_detail_newer(1, newer);
         let detail = state.detail.as_ref().expect("detail");
         assert_eq!(detail.messages.len(), 3);
-        assert_eq!(detail.messages[0].item_id.as_deref(), Some("new"));
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("old"));
         assert_eq!(detail.messages[1].item_id.as_deref(), Some("middle"));
-        assert_eq!(detail.messages[2].item_id.as_deref(), Some("old"));
+        assert_eq!(detail.messages[2].item_id.as_deref(), Some("new"));
     }
 
     #[test]

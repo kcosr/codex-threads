@@ -67,8 +67,18 @@ pub struct BrowserState {
     pub auto_refresh: bool,
     pub auto_refresh_seconds: u64,
     pub epoch: u64,
+    pub preview: BrowserPreviewState,
     pub last_refresh_at: Option<Instant>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BrowserPreviewState {
+    pub epoch: u64,
+    pub thread_id: Option<String>,
+    pub loading: bool,
+    pub text: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +287,7 @@ impl TuiState {
                 auto_refresh,
                 auto_refresh_seconds,
                 epoch: 0,
+                preview: BrowserPreviewState::default(),
                 last_refresh_at: None,
                 last_error: None,
             },
@@ -334,6 +345,36 @@ impl TuiState {
         let current = self.browser.selected as isize;
         let next = (current + delta).clamp(0, len - 1);
         self.browser.selected = next as usize;
+    }
+
+    pub fn set_preview_loading(&mut self, thread_id: String) -> u64 {
+        self.browser.preview.epoch += 1;
+        self.browser.preview.thread_id = Some(thread_id);
+        self.browser.preview.loading = true;
+        self.browser.preview.text = None;
+        self.browser.preview.error = None;
+        self.browser.preview.epoch
+    }
+
+    pub fn set_preview_loaded(&mut self, epoch: u64, thread_id: String, text: Option<String>) {
+        if self.browser.preview.epoch != epoch
+            || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
+        {
+            return;
+        }
+        self.browser.preview.loading = false;
+        self.browser.preview.text = text;
+        self.browser.preview.error = None;
+    }
+
+    pub fn set_preview_error(&mut self, epoch: u64, thread_id: String, error: String) {
+        if self.browser.preview.epoch != epoch
+            || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
+        {
+            return;
+        }
+        self.browser.preview.loading = false;
+        self.browser.preview.error = Some(error);
     }
 
     pub fn set_browser_rows(
@@ -409,7 +450,17 @@ impl TuiState {
         if detail.epoch != epoch || detail.thread_id != page.thread_id {
             return;
         }
-        append_unique_messages(&mut detail.messages, page.messages.drain(..));
+        let previous_offset = detail.scroll as usize;
+        let previous_lines = page.transcript_line_count();
+        let mut merged = Vec::new();
+        append_unique_messages(&mut merged, page.messages.drain(..));
+        append_unique_messages(&mut merged, detail.messages.drain(..));
+        detail.messages = merged;
+        if previous_offset > 0 || previous_lines > 0 {
+            detail.scroll = previous_offset
+                .saturating_add(previous_lines)
+                .min(u16::MAX as usize) as u16;
+        }
         detail.next_cursor = page.next_cursor;
         detail.backwards_cursor = page.backwards_cursor.or(detail.backwards_cursor.clone());
         detail.current_cursor = page.current_cursor;
@@ -431,10 +482,8 @@ impl TuiState {
         if detail.epoch != epoch || detail.thread_id != page.thread_id {
             return;
         }
-        let mut merged = Vec::new();
-        append_unique_messages(&mut merged, page.messages.drain(..));
-        append_unique_messages(&mut merged, detail.messages.drain(..));
-        detail.messages = merged;
+        let was_at_bottom = detail.scroll == u16::MAX || detail.scroll >= detail.max_scroll();
+        append_unique_messages(&mut detail.messages, page.messages.drain(..));
         detail.next_cursor = page.next_cursor.or(detail.next_cursor.clone());
         detail.backwards_cursor = page.backwards_cursor;
         detail.current_cursor = page.current_cursor;
@@ -443,6 +492,9 @@ impl TuiState {
         detail.loading = false;
         detail.last_refresh_at = Some(Instant::now());
         detail.last_error = None;
+        if was_at_bottom {
+            detail.scroll = detail.bottom_scroll_position();
+        }
         let query = detail.search_query.clone();
         if !query.is_empty() {
             self.update_message_search(query);

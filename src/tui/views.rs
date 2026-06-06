@@ -283,24 +283,24 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         );
         return;
     };
-    let mut text = vec![
-        Line::from(row.title.clone()),
-        Line::from(format!("cwd: {}", compact_home_path(&row.cwd))),
-        Line::from(format!("thread: {}", row.id)),
-        Line::from(format!("updated: {}", row.updated)),
-        Line::from(format!(
-            "annotation: {}",
-            row.annotation.as_deref().unwrap_or("")
-        )),
-    ];
-    if let Some(snippet) = &row.snippet {
-        text.push(Line::from("Last message:"));
-        text.push(Line::from(snippet.clone()));
-    }
+    let preview = &state.browser.preview;
+    let text = if preview.thread_id.as_deref() != Some(row.id.as_str()) || preview.loading {
+        vec![Line::from("Loading last message...")]
+    } else if let Some(error) = &preview.error {
+        vec![Line::from(format!("Preview failed: {error}"))]
+    } else if let Some(text) = &preview.text {
+        vec![Line::from(text.clone())]
+    } else if let Some(snippet) = &row.snippet {
+        vec![Line::from(snippet.clone())]
+    } else {
+        vec![Line::from("No message preview available")]
+    };
     frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title(" Preview ").borders(Borders::ALL)),
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(" Last Message ")
+                .borders(Borders::ALL),
+        ),
         area,
     );
 }
@@ -898,6 +898,12 @@ mod tests {
             snippet: Some("recent assistant message".to_string()),
             raw: serde_json::json!({}),
         });
+        state
+            .browser
+            .preview
+            .thread_id
+            .replace("thread-1".to_string());
+        state.browser.preview.text = Some("assistant: recent assistant message".to_string());
         let backend = TestBackend::new(100, 18);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state)).unwrap();
@@ -907,7 +913,7 @@ mod tests {
         assert!(text.contains("2026-06-05 09:30"));
         assert!(text.contains("~/repo"));
         assert!(text.contains("needs review"));
-        assert!(text.contains("recent assistant message"));
+        assert!(text.contains("assistant: recent assistant message"));
     }
 
     #[test]
