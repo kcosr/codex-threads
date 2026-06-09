@@ -415,6 +415,8 @@ async fn next_terminal_event(events: &mut Option<EventStream>) -> Option<io::Res
 
 fn suspend_terminal_events(events: &mut Option<EventStream>) {
     let _ = events.take();
+    // Dropping EventStream only signals crossterm's background poll thread; give
+    // it a brief chance to stop reading the tty before the child inherits stdin.
     std::thread::sleep(Duration::from_millis(20));
 }
 
