@@ -150,7 +150,7 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
     spawn_shutdown_signal_task(app_tx.clone());
     schedule_browser_refresh(&mut state, &fetch_tx).await?;
 
-    let mut events = EventStream::new();
+    let mut events = Some(EventStream::new());
     let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_TICK_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -168,11 +168,40 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
         }
 
         tokio::select! {
-            maybe_event = events.next() => {
+            maybe_event = next_terminal_event(&mut events) => {
                 if let Some(Ok(event)) = maybe_event {
                     let previous_selection = state.selected_thread_key();
-                    handle_terminal_event(event, &mut state, &targets, yolo, &fetch_tx, &app_tx)
+                    let outcome = handle_terminal_event(event, &mut state, &targets, yolo, &fetch_tx, &app_tx)
                         .await?;
+                    if let Some(launch) = outcome.codex_launch {
+                        suspend_terminal_events(&mut events);
+                        let status = launch_codex_resume(&launch.launch);
+                        resume_terminal_events(&mut events);
+                        match status {
+                            Ok(status) if status.success() => {
+                                state.set_notice("codex exited");
+                            }
+                            Ok(status) => {
+                                state.set_notice(format!("codex exited with {status}"));
+                            }
+                            Err(error) => {
+                                state.set_notice(format!("failed to launch codex: {error}"));
+                            }
+                        }
+                        state.force_terminal_clear = true;
+                        schedule_browser_refresh(&mut state, &fetch_tx).await?;
+                        if state.detail.as_ref().is_some_and(|detail| {
+                            detail.server == launch.server && detail.thread_id == launch.thread_id
+                        }) {
+                            schedule_detail_refresh_for_server(
+                                &mut state,
+                                &fetch_tx,
+                                launch.server,
+                                launch.thread_id,
+                            )
+                            .await?;
+                        }
+                    }
                     detach_stream_if_browser_selection_changed(&mut state, previous_selection);
                     schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
                 }
@@ -357,6 +386,40 @@ struct CodexResumeLaunch {
     program: OsString,
     args: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalEventOutcome {
+    codex_launch: Option<PendingCodexLaunch>,
+}
+
+impl TerminalEventOutcome {
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug)]
+struct PendingCodexLaunch {
+    launch: CodexResumeLaunch,
+    server: String,
+    thread_id: String,
+}
+
+async fn next_terminal_event(events: &mut Option<EventStream>) -> Option<io::Result<Event>> {
+    match events.as_mut() {
+        Some(events) => events.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn suspend_terminal_events(events: &mut Option<EventStream>) {
+    let _ = events.take();
+    std::thread::sleep(Duration::from_millis(20));
+}
+
+fn resume_terminal_events(events: &mut Option<EventStream>) {
+    *events = Some(EventStream::new());
 }
 
 fn build_codex_resume_launch(
@@ -1200,19 +1263,19 @@ async fn handle_terminal_event(
     yolo: bool,
     fetch_tx: &mpsc::Sender<FetchRequest>,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
-) -> Result<()> {
+) -> Result<TerminalEventOutcome> {
     let key = match event {
         Event::Key(key) => key,
         Event::Mouse(mouse) => {
             if handle_mouse_event(mouse, state) {
                 schedule_detail_older_if_available(state, fetch_tx).await?;
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
-        _ => return Ok(()),
+        _ => return Ok(TerminalEventOutcome::none()),
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return Ok(TerminalEventOutcome::none());
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         if let Some(stream) = &state.stream
@@ -1231,7 +1294,7 @@ async fn handle_terminal_event(
         } else {
             state.should_quit = true;
         }
-        return Ok(());
+        return Ok(TerminalEventOutcome::none());
     }
 
     let current_mode = std::mem::replace(&mut state.mode, Mode::Browser);
@@ -1248,7 +1311,8 @@ async fn handle_terminal_event(
                 state,
                 fetch_tx,
             )
-            .await;
+            .await
+            .map(|()| TerminalEventOutcome::none());
         }
         Mode::MessageSearchInput { draft } => {
             return handle_text_input(
@@ -1262,7 +1326,8 @@ async fn handle_terminal_event(
                 state,
                 fetch_tx,
             )
-            .await;
+            .await
+            .map(|()| TerminalEventOutcome::none());
         }
         Mode::AnnotationInput {
             server,
@@ -1271,7 +1336,8 @@ async fn handle_terminal_event(
             return_to_detail,
         } => {
             let target = targets.get(&server)?;
-            return handle_annotation_input(key, target, state, thread_id, draft, return_to_detail);
+            return handle_annotation_input(key, target, state, thread_id, draft, return_to_detail)
+                .map(|()| TerminalEventOutcome::none());
         }
         Mode::RenameInput {
             server,
@@ -1288,11 +1354,14 @@ async fn handle_terminal_event(
                 draft,
                 return_to_detail,
                 app_tx,
-            );
+            )
+            .map(|()| TerminalEventOutcome::none());
         }
         Mode::Compose(compose) => {
             let target = targets.get(compose_target_server(&compose.target))?;
-            return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx).await;
+            return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx)
+                .await
+                .map(|()| TerminalEventOutcome::none());
         }
         Mode::FilterMenu => {
             match key.code {
@@ -1304,7 +1373,7 @@ async fn handle_terminal_event(
                 }
                 _ => state.mode = Mode::FilterMenu,
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         Mode::SortMenu => {
             match key.code {
@@ -1326,7 +1395,7 @@ async fn handle_terminal_event(
                 }
                 _ => state.mode = Mode::SortMenu,
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         Mode::ColumnsMenu => {
             let mut changed = false;
@@ -1376,7 +1445,7 @@ async fn handle_terminal_event(
             if changed {
                 let _ = save_prefs(&state.prefs);
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         Mode::ConfirmInterrupt {
             server,
@@ -1405,7 +1474,7 @@ async fn handle_terminal_event(
                     }
                 }
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         Mode::ConfirmArchive {
             server,
@@ -1438,7 +1507,7 @@ async fn handle_terminal_event(
                     }
                 }
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         Mode::ConfirmOpenCodex {
             server,
@@ -1457,27 +1526,13 @@ async fn handle_terminal_event(
                 KeyCode::Enter => {
                     state.mode = return_mode;
                     detach_stream(state);
-                    let launch = build_codex_resume_launch(target, &thread_id, &cwd, yolo);
-                    let status = launch_codex_resume(&launch);
-                    match status {
-                        Ok(status) if status.success() => {
-                            state.set_notice("codex exited");
-                        }
-                        Ok(status) => {
-                            state.set_notice(format!("codex exited with {status}"));
-                        }
-                        Err(error) => {
-                            state.set_notice(format!("failed to launch codex: {error}"));
-                        }
-                    }
-                    state.force_terminal_clear = true;
-                    schedule_browser_refresh(state, fetch_tx).await?;
-                    if state.detail.as_ref().is_some_and(|detail| {
-                        detail.server == server && detail.thread_id == thread_id
-                    }) {
-                        schedule_detail_refresh_for_server(state, fetch_tx, server, thread_id)
-                            .await?;
-                    }
+                    return Ok(TerminalEventOutcome {
+                        codex_launch: Some(PendingCodexLaunch {
+                            launch: build_codex_resume_launch(target, &thread_id, &cwd, yolo),
+                            server,
+                            thread_id,
+                        }),
+                    });
                 }
                 _ => {
                     state.mode = Mode::ConfirmOpenCodex {
@@ -1488,18 +1543,18 @@ async fn handle_terminal_event(
                     }
                 }
             }
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         Mode::Help => {
             state.mode = Mode::Browser;
-            return Ok(());
+            return Ok(TerminalEventOutcome::none());
         }
         other => state.mode = other,
     }
 
     if let Some(goto_key) = normalized_goto_key(&key) {
         handle_goto_key(goto_key, state, fetch_tx).await?;
-        return Ok(());
+        return Ok(TerminalEventOutcome::none());
     }
     state.pending_goto_top = false;
 
@@ -1777,7 +1832,7 @@ async fn handle_terminal_event(
         },
         _ => {}
     }
-    Ok(())
+    Ok(TerminalEventOutcome::none())
 }
 
 async fn handle_goto_key(

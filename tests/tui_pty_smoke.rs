@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -777,6 +778,15 @@ fn page(data: Value) -> Value {
 
 impl TuiPty {
     fn spawn(server: &TuiMockServer, state_dir: &TempDir, stream_log: &PathBuf) -> Self {
+        Self::spawn_with_env(server, state_dir, stream_log, &[])
+    }
+
+    fn spawn_with_env(
+        server: &TuiMockServer,
+        state_dir: &TempDir,
+        stream_log: &PathBuf,
+        extra_env: &[(&str, PathBuf)],
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -791,6 +801,9 @@ impl TuiPty {
         command.env("TERM", "xterm-256color");
         command.env("CODEX_THREADS_STATE", state_dir.path());
         command.env("CODEX_THREADS_TUI_STREAM_LOG", stream_log);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         command.arg("--config");
         command.arg(&server.config);
         command.arg("tui");
@@ -896,6 +909,20 @@ fn wait_for_file_contains(path: &PathBuf, expected: &str) {
     );
 }
 
+fn fake_codex_script(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let script = temp.path().join("fake-codex");
+    let stdin_log = temp.path().join("fake-codex-stdin.log");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'fake codex ready\\n'\nIFS= read -r line\nprintf '%s\\n' \"$line\" > \"$FAKE_CODEX_STDIN_LOG\"\nprintf 'fake codex exiting\\n'\n",
+    )
+    .expect("fake codex script");
+    let mut permissions = fs::metadata(&script).expect("fake metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("fake chmod");
+    (script, stdin_log)
+}
+
 #[test]
 #[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
 fn tui_browser_merges_all_configured_servers_by_default() {
@@ -917,6 +944,36 @@ fn tui_browser_merges_all_configured_servers_by_default() {
         server.method_count("thread/list") >= 2,
         "TUI should fetch browser rows from both configured servers"
     );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_codex_launch_hands_pty_input_to_child() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let fake_dir = TempDir::new().expect("fake dir");
+    let (fake_codex, fake_stdin_log) = fake_codex_script(&fake_dir);
+    let mut tui = TuiPty::spawn_with_env(
+        &server,
+        &state_dir,
+        &stream_log,
+        &[
+            ("CODEX_THREADS_CODEX_BIN", fake_codex),
+            ("FAKE_CODEX_STDIN_LOG", fake_stdin_log.clone()),
+        ],
+    );
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"j");
+    tui.write(b"o");
+    tui.wait_for_all(&["Open In Codex", "thread_beta"]);
+    tui.write(b"\r");
+    tui.wait_for("fake codex ready");
+    tui.write(b"child-input\r");
+    wait_for_file_contains(&fake_stdin_log, "child-input");
+    tui.wait_for("codex exited");
+    tui.quit();
 }
 
 #[test]
