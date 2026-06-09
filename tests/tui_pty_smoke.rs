@@ -74,27 +74,43 @@ impl TuiMockServer {
         )
         .expect("config");
 
-        let std_listener = StdUnixListener::bind(&socket).expect("bind mock socket");
-        std_listener.set_nonblocking(true).expect("nonblocking");
         let state = Arc::new(Mutex::new(ServerState::new()));
         let received = Arc::new(Mutex::new(Vec::new()));
-        let state_for_thread = Arc::clone(&state);
-        let received_for_thread = Arc::clone(&received);
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("runtime");
-            runtime.block_on(async move {
-                let listener = UnixListener::from_std(std_listener).expect("tokio listener");
-                loop {
-                    let (stream, _) = listener.accept().await.expect("accept");
-                    let state = Arc::clone(&state_for_thread);
-                    let received = Arc::clone(&received_for_thread);
-                    tokio::spawn(async move {
-                        let ws = accept_async(stream).await.expect("websocket accept");
-                        handle_websocket(ws, state, received).await;
-                    });
-                }
-            });
-        });
+        spawn_mock_listener(socket, state, Arc::clone(&received));
+
+        Self {
+            _temp: temp,
+            config,
+            received,
+        }
+    }
+
+    fn start_multi() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let main_socket = temp.path().join("main.sock");
+        let work_socket = temp.path().join("work.sock");
+        let config = temp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "[servers.main]\ntype = \"uds\"\npath = \"{}\"\n\n[servers.work]\ntype = \"uds\"\npath = \"{}\"\n",
+                main_socket.display(),
+                work_socket.display()
+            ),
+        )
+        .expect("config");
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        spawn_mock_listener(
+            main_socket,
+            Arc::new(Mutex::new(ServerState::named("Main"))),
+            Arc::clone(&received),
+        );
+        spawn_mock_listener(
+            work_socket,
+            Arc::new(Mutex::new(ServerState::named("Work"))),
+            Arc::clone(&received),
+        );
 
         Self {
             _temp: temp,
@@ -137,6 +153,30 @@ impl TuiMockServer {
             self.method_count(method)
         );
     }
+}
+
+fn spawn_mock_listener(
+    socket: PathBuf,
+    state: Arc<Mutex<ServerState>>,
+    received: Arc<Mutex<Vec<Value>>>,
+) {
+    let std_listener = StdUnixListener::bind(&socket).expect("bind mock socket");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async move {
+            let listener = UnixListener::from_std(std_listener).expect("tokio listener");
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let state = Arc::clone(&state);
+                let received = Arc::clone(&received);
+                tokio::spawn(async move {
+                    let ws = accept_async(stream).await.expect("websocket accept");
+                    handle_websocket(ws, state, received).await;
+                });
+            }
+        });
+    });
 }
 
 impl ServerState {
@@ -248,6 +288,15 @@ impl ServerState {
             ],
             next_turn: 2,
         }
+    }
+
+    fn named(prefix: &str) -> Self {
+        let mut state = Self::new();
+        for thread in state.threads.values_mut() {
+            thread.name = format!("{prefix} {}", thread.name);
+            thread.cwd = format!("{}/{}", thread.cwd, prefix.to_ascii_lowercase());
+        }
+        state
     }
 
     fn thread_json(&self, id: &str) -> Value {
@@ -844,6 +893,29 @@ fn wait_for_file_contains(path: &PathBuf, expected: &str) {
     panic!(
         "timed out waiting for {path:?} to contain {expected:?}\n--- file ---\n{}",
         fs::read_to_string(path).unwrap_or_default()
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_merges_all_configured_servers_by_default() {
+    let server = TuiMockServer::start_multi();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&[
+        "SERVER",
+        "main",
+        "work",
+        "Main Active stream",
+        "Work Active stream",
+    ]);
+    tui.quit();
+
+    assert!(
+        server.method_count("thread/list") >= 2,
+        "TUI should fetch browser rows from both configured servers"
     );
 }
 
