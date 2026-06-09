@@ -138,7 +138,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn compose_new_turn_can_steer(state: &TuiState, compose: &ComposeState) -> bool {
-    let ComposeTarget::NewTurn { thread_id } = &compose.target else {
+    let ComposeTarget::NewTurn { thread_id, .. } = &compose.target else {
         return false;
     };
     state.stream.as_ref().is_some_and(|stream| {
@@ -200,6 +200,9 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     let visible = state.visible_columns();
     let mut header = vec![Cell::from("THREAD")];
+    if state.browser.multi_server {
+        header.push(Cell::from("SERVER"));
+    }
     if visible.status {
         header.push(Cell::from("STATUS"));
     }
@@ -212,7 +215,7 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if visible.annotation {
         header.push(Cell::from("ANNOTATION"));
     }
-    let widths = browser_column_widths(table_area.width, visible);
+    let widths = browser_column_widths(table_area.width, visible, state.browser.multi_server);
 
     let rows = state.browser.rows.iter().enumerate().map(|(index, row)| {
         let title = if let Some(snippet) = &row.snippet {
@@ -221,8 +224,16 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             row.title.clone()
         };
         let mut cells = vec![Cell::from(title)];
+        if state.browser.multi_server {
+            cells.push(Cell::from(row.server.clone()));
+        }
         if visible.status {
-            cells.push(Cell::from(browser_row_status(state, &row.id, &row.status)));
+            cells.push(Cell::from(browser_row_status(
+                state,
+                &row.server,
+                &row.id,
+                &row.status,
+            )));
         }
         if visible.updated {
             cells.push(Cell::from(row.updated.clone()));
@@ -264,11 +275,11 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 }
 
-fn browser_row_status(state: &TuiState, thread_id: &str, fallback: &str) -> String {
+fn browser_row_status(state: &TuiState, server: &str, thread_id: &str, fallback: &str) -> String {
     let Some(stream) = &state.stream else {
         return fallback.to_string();
     };
-    if stream.thread_id != thread_id {
+    if stream.server != server || stream.thread_id != thread_id {
         return fallback.to_string();
     }
     match stream.status {
@@ -285,8 +296,10 @@ fn browser_row_status(state: &TuiState, thread_id: &str, fallback: &str) -> Stri
 fn browser_column_widths(
     table_width: u16,
     visible: &crate::tui::prefs::VisibleColumns,
+    multi_server: bool,
 ) -> Vec<Constraint> {
     const TITLE_MAX: u16 = 44;
+    const SERVER_WIDTH: u16 = 12;
     const CWD_MAX: u16 = 46;
     const ANNOTATION_MAX: u16 = 40;
     const STATUS_WIDTH: u16 = 11;
@@ -294,6 +307,9 @@ fn browser_column_widths(
 
     let mut fixed_width = 0;
     let mut flexible_columns = vec![(0_u16, TITLE_MAX, 4_u16)];
+    if multi_server {
+        fixed_width += SERVER_WIDTH;
+    }
     if visible.status {
         fixed_width += STATUS_WIDTH;
     }
@@ -308,6 +324,7 @@ fn browser_column_widths(
     }
 
     let column_count = 1
+        + usize::from(multi_server)
         + usize::from(visible.status)
         + usize::from(visible.updated)
         + usize::from(visible.cwd)
@@ -320,6 +337,9 @@ fn browser_column_widths(
     let flexible_widths = allocate_flexible_widths(available, &flexible_columns);
 
     let mut widths = vec![Constraint::Length(flexible_widths[0])];
+    if multi_server {
+        widths.push(Constraint::Length(SERVER_WIDTH));
+    }
     if visible.status {
         widths.push(Constraint::Length(STATUS_WIDTH));
     }
@@ -1075,6 +1095,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows.push(ThreadRow {
+            server: "work".to_string(),
             id: "thread-1".to_string(),
             title: "Fix tests".to_string(),
             status: "idle".to_string(),
@@ -1143,6 +1164,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows.push(ThreadRow {
+            server: "work".to_string(),
             id: "thread-1".to_string(),
             title: "Running task".to_string(),
             status: "idle".to_string(),
@@ -1220,6 +1242,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "active".to_string(),
@@ -1278,6 +1301,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1397,7 +1421,7 @@ mod tests {
         let prefs = TuiPrefs::default();
 
         assert_eq!(
-            browser_column_widths(250, &prefs.browser.columns),
+            browser_column_widths(250, &prefs.browser.columns, false),
             vec![
                 Constraint::Length(44),
                 Constraint::Length(11),
@@ -1406,6 +1430,46 @@ mod tests {
                 Constraint::Length(40),
             ]
         );
+    }
+
+    #[test]
+    fn browser_draws_server_column_when_multiple_servers_are_visible() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.multi_server = true;
+        state.browser.rows = vec![ThreadRow {
+            server: "main".to_string(),
+            id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            updated: "now".to_string(),
+            cwd: "~".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }];
+
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("SERVER"));
+        assert!(text.contains("main"));
     }
 
     #[test]
@@ -1436,6 +1500,7 @@ mod tests {
         });
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn {
+                server: "work".to_string(),
                 thread_id: "thread-1".to_string(),
             },
             text: "first line\nsecond line".to_string(),
@@ -1466,6 +1531,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::AnnotationInput {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             draft: "annotation text".to_string(),
             return_to_detail: false,
@@ -1503,6 +1569,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::RenameInput {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             draft: "New thread name".to_string(),
             return_to_detail: false,
@@ -1541,6 +1608,7 @@ mod tests {
         });
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn {
+                server: "work".to_string(),
                 thread_id: "thread-1".to_string(),
             },
             text: (1..=30)
@@ -1574,6 +1642,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1687,6 +1756,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1742,11 +1812,13 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::ConfirmInterrupt {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             turn_id: Some("turn-1".to_string()),
             return_to_detail: true,
         };
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1801,6 +1873,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),

@@ -7,6 +7,7 @@ mod prefs;
 mod state;
 mod views;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
@@ -73,10 +74,44 @@ const FOLLOW_NEXT_TURN_POLL_INTERVAL_MS: u64 = 500;
 const CODEX_BIN_ENV: &str = "CODEX_THREADS_CODEX_BIN";
 const CODEX_REMOTE_AUTH_ENV: &str = "CODEX_THREADS_CODEX_REMOTE_AUTH_TOKEN";
 
-pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<i32> {
+#[derive(Debug, Clone)]
+struct TuiTargets {
+    targets: BTreeMap<String, Target>,
+}
+
+impl TuiTargets {
+    fn new(targets: Vec<Target>) -> Result<Self> {
+        if targets.is_empty() {
+            return Err(usage_error("tui requires at least one server target"));
+        }
+        Ok(Self {
+            targets: targets
+                .into_iter()
+                .map(|target| (target.server.clone(), target))
+                .collect(),
+        })
+    }
+
+    fn is_multi(&self) -> bool {
+        self.targets.len() > 1
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Target> {
+        self.targets.values()
+    }
+
+    fn get(&self, server: &str) -> Result<&Target> {
+        self.targets
+            .get(server)
+            .ok_or_else(|| usage_error(format!("unknown TUI server `{server}`")))
+    }
+}
+
+pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> Result<i32> {
     if !io::stdout().is_terminal() {
         return Err(usage_error("tui requires an interactive terminal"));
     }
+    let targets = TuiTargets::new(targets)?;
 
     let since = command.since.as_deref().map(parse_since).transpose()?;
     let limit = command.limit.unwrap_or(DEFAULT_LIMIT);
@@ -99,6 +134,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
         descending,
         prefs,
     });
+    state.browser.multi_server = targets.is_multi();
     state.browser.last_error = loaded_prefs.warning;
 
     let _guard = TerminalGuard::enter()?;
@@ -109,8 +145,8 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
     let (fetch_tx, fetch_rx) = mpsc::channel(32);
     let (preview_tx, preview_rx) = mpsc::channel(8);
     let (app_tx, mut app_rx) = mpsc::unbounded_channel();
-    tokio::spawn(fetch_worker(target.clone(), fetch_rx, app_tx.clone()));
-    tokio::spawn(preview_worker(target.clone(), preview_rx, app_tx.clone()));
+    tokio::spawn(fetch_worker(targets.clone(), fetch_rx, app_tx.clone()));
+    tokio::spawn(preview_worker(targets.clone(), preview_rx, app_tx.clone()));
     spawn_shutdown_signal_task(app_tx.clone());
     schedule_browser_refresh(&mut state, &fetch_tx).await?;
 
@@ -134,8 +170,8 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
         tokio::select! {
             maybe_event = events.next() => {
                 if let Some(Ok(event)) = maybe_event {
-                    let previous_selection = state.selected_thread_id().map(str::to_string);
-                    handle_terminal_event(event, &mut state, &target, yolo, &fetch_tx, &app_tx)
+                    let previous_selection = state.selected_thread_key();
+                    handle_terminal_event(event, &mut state, &targets, yolo, &fetch_tx, &app_tx)
                         .await?;
                     detach_stream_if_browser_selection_changed(&mut state, previous_selection);
                     schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
@@ -165,7 +201,7 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 if detail_replace_loaded && !state.should_quit {
                     auto_attach_open_detail_thread_if_active(
                         &mut state,
-                        target.clone(),
+                        targets.clone(),
                         yolo,
                         app_tx.clone(),
                     );
@@ -173,19 +209,20 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 if auto_attach_initial_active && !state.should_quit {
                     auto_attach_selected_browser_thread_if_active(
                         &mut state,
-                        target.clone(),
+                        targets.clone(),
                         yolo,
                         app_tx.clone(),
                     );
                 }
-                if let Some(thread_id) = refresh_detail_after_stream
+                if let Some((server, thread_id)) = refresh_detail_after_stream
                     && !state.should_quit
                     && state
                         .detail
                         .as_ref()
-                        .is_some_and(|detail| detail.thread_id == thread_id)
+                        .is_some_and(|detail| detail.server == server && detail.thread_id == thread_id)
                 {
-                    schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                    schedule_detail_refresh_for_server(&mut state, &fetch_tx, server, thread_id)
+                        .await?;
                 }
                 if refresh_after_archive.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
@@ -196,27 +233,29 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 if refresh_after_submit.is_some() && !state.should_quit {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
-                if let Some(thread_id) = follow_after_stream
+                if let Some((server, thread_id)) = follow_after_stream
                     && !state.should_quit
                 {
                     follow_thread_stream_if_active(
                         &mut state,
-                        target.clone(),
+                        targets.clone(),
                         yolo,
+                        server,
                         thread_id,
                         app_tx.clone(),
                     );
                 }
-                if let Some(thread_id) = refresh_after_load
+                if let Some((server, thread_id)) = refresh_after_load
                     && !state.should_quit
                 {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                     if state
                         .detail
                         .as_ref()
-                        .is_some_and(|detail| detail.thread_id == thread_id)
+                        .is_some_and(|detail| detail.server == server && detail.thread_id == thread_id)
                     {
-                        schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                        schedule_detail_refresh_for_server(&mut state, &fetch_tx, server, thread_id)
+                            .await?;
                     }
                 }
                 schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
@@ -231,8 +270,9 @@ pub async fn run_tui(target: Target, command: TuiCommand, yolo: bool) -> Result<
                 {
                     schedule_browser_refresh(&mut state, &fetch_tx).await?;
                 }
-                if let Some(thread_id) = detail_follow_refresh_thread(&state) {
-                    schedule_detail_refresh(&mut state, &fetch_tx, thread_id).await?;
+                if let Some((server, thread_id)) = detail_follow_refresh_thread(&state) {
+                    schedule_detail_refresh_for_server(&mut state, &fetch_tx, server, thread_id)
+                        .await?;
                 }
             }
         }
@@ -392,50 +432,22 @@ fn spawn_shutdown_signal_task(app_tx: mpsc::UnboundedSender<AppEvent>) {
 fn spawn_shutdown_signal_task(_app_tx: mpsc::UnboundedSender<AppEvent>) {}
 
 async fn fetch_worker(
-    target: Target,
+    targets: TuiTargets,
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    let mut client = match RpcClient::connect(&target.endpoint).await {
-        Ok(client) => client,
-        Err(err) => {
-            while let Some(request) = fetch_rx.recv().await {
-                match request {
-                    FetchRequest::Browser { epoch, .. } => {
-                        let _ = app_tx.send(AppEvent::BrowserLoadFailed {
-                            epoch,
-                            error: err.to_string(),
-                        });
-                    }
-                    FetchRequest::Detail { epoch, .. } => {
-                        let _ = app_tx.send(AppEvent::DetailLoadFailed {
-                            epoch,
-                            error: err.to_string(),
-                        });
-                    }
-                    FetchRequest::LoadThread { thread_id } => {
-                        let _ = app_tx.send(AppEvent::ThreadLoadFailed {
-                            thread_id,
-                            error: err.to_string(),
-                        });
-                    }
-                }
-            }
-            return;
-        }
-    };
-
     while let Some(request) = fetch_rx.recv().await {
         match request {
             FetchRequest::Browser { epoch, query } => {
-                let result = fetch_browser(&target, &mut client, query).await;
+                let result = fetch_browser_all(&targets, query).await;
                 match result {
-                    Ok((rows, next_cursor, backwards_cursor)) => {
+                    Ok((rows, next_cursor, backwards_cursor, warning)) => {
                         let _ = app_tx.send(AppEvent::BrowserLoaded {
                             epoch,
                             rows,
                             next_cursor,
                             backwards_cursor,
+                            warning,
                         });
                     }
                     Err(err) => {
@@ -448,13 +460,18 @@ async fn fetch_worker(
             }
             FetchRequest::Detail {
                 epoch,
+                server,
                 thread_id,
                 cursor,
                 limit,
                 page_direction,
             } => {
-                let result =
-                    fetch_detail(&target, &mut client, thread_id, cursor, limit, epoch).await;
+                let result = async {
+                    let target = targets.get(&server)?;
+                    let mut client = RpcClient::connect(&target.endpoint).await?;
+                    fetch_detail(target, &mut client, thread_id, cursor, limit, epoch).await
+                }
+                .await;
                 match result {
                     Ok(detail) => {
                         let _ = app_tx.send(AppEvent::DetailLoaded {
@@ -471,23 +488,33 @@ async fn fetch_worker(
                     }
                 }
             }
-            FetchRequest::LoadThread { thread_id } => {
-                let result = thread_status(
-                    &target,
-                    &mut client,
-                    ThreadStatusRequest {
-                        thread_id: thread_id.clone(),
-                        load: true,
-                        turn_scan_limit: TURN_SCAN_LIMIT,
-                    },
-                )
+            FetchRequest::LoadThread { server, thread_id } => {
+                let result = async {
+                    let target = targets.get(&server)?;
+                    let mut client = RpcClient::connect(&target.endpoint).await?;
+                    thread_status(
+                        target,
+                        &mut client,
+                        ThreadStatusRequest {
+                            thread_id: thread_id.clone(),
+                            load: true,
+                            turn_scan_limit: TURN_SCAN_LIMIT,
+                        },
+                    )
+                    .await
+                }
                 .await;
                 match result {
                     Ok(status) => {
-                        let _ = app_tx.send(AppEvent::ThreadLoaded { thread_id, status });
+                        let _ = app_tx.send(AppEvent::ThreadLoaded {
+                            server,
+                            thread_id,
+                            status,
+                        });
                     }
                     Err(err) => {
                         let _ = app_tx.send(AppEvent::ThreadLoadFailed {
+                            server,
                             thread_id,
                             error: err.to_string(),
                         });
@@ -499,33 +526,25 @@ async fn fetch_worker(
 }
 
 async fn preview_worker(
-    target: Target,
+    targets: TuiTargets,
     mut preview_rx: mpsc::Receiver<PreviewRequest>,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    let mut client = match RpcClient::connect(&target.endpoint).await {
-        Ok(client) => client,
-        Err(err) => {
-            while let Some(request) = preview_rx.recv().await {
-                let _ = app_tx.send(AppEvent::PreviewLoadFailed {
-                    epoch: request.epoch,
-                    thread_id: request.thread_id,
-                    error: err.to_string(),
-                });
-            }
-            return;
-        }
-    };
-
     while let Some(mut request) = preview_rx.recv().await {
         while let Ok(newer) = preview_rx.try_recv() {
             request = newer;
         }
-        let result = fetch_preview(&target, &mut client, request.thread_id.clone()).await;
+        let result = async {
+            let target = targets.get(&request.server)?;
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            fetch_preview(target, &mut client, request.thread_id.clone()).await
+        }
+        .await;
         match result {
             Ok(text) => {
                 let _ = app_tx.send(AppEvent::PreviewLoaded {
                     epoch: request.epoch,
+                    server: request.server,
                     thread_id: request.thread_id,
                     messages: text,
                 });
@@ -533,6 +552,7 @@ async fn preview_worker(
             Err(err) => {
                 let _ = app_tx.send(AppEvent::PreviewLoadFailed {
                     epoch: request.epoch,
+                    server: request.server,
                     thread_id: request.thread_id,
                     error: err.to_string(),
                 });
@@ -588,13 +608,68 @@ async fn fetch_browser(
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .map(|item| thread_row(item, query.source, query.relative_updated))
+        .map(|item| {
+            thread_row(
+                target.server.clone(),
+                item,
+                query.source,
+                query.relative_updated,
+            )
+        })
         .collect();
     Ok((
         rows,
         output["nextCursor"].as_str().map(str::to_string),
         output["backwardsCursor"].as_str().map(str::to_string),
     ))
+}
+
+async fn fetch_browser_all(
+    targets: &TuiTargets,
+    query: BrowserQuery,
+) -> Result<(
+    Vec<ThreadRow>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    let mut rows = Vec::new();
+    let mut next_cursor = None;
+    let mut backwards_cursor = None;
+    let mut errors = Vec::new();
+    for target in targets.all() {
+        let result = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            fetch_browser(target, &mut client, query.clone()).await
+        }
+        .await;
+        match result {
+            Ok((mut target_rows, target_next, target_backwards)) => {
+                rows.append(&mut target_rows);
+                if !targets.is_multi() {
+                    next_cursor = target_next;
+                    backwards_cursor = target_backwards;
+                }
+            }
+            Err(err) if targets.is_multi() => errors.push(format!("{}: {err}", target.server)),
+            Err(err) => return Err(err),
+        }
+    }
+    if rows.is_empty() && !errors.is_empty() {
+        return Err(anyhow::anyhow!(errors.join("; ")));
+    }
+    rows.sort_by(|left, right| {
+        thread_row_updated_epoch(right)
+            .cmp(&thread_row_updated_epoch(left))
+            .then_with(|| left.server.cmp(&right.server))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let warning = if errors.is_empty() {
+        None
+    } else {
+        Some(format!("some servers failed: {}", errors.join("; ")))
+    };
+    Ok((rows, next_cursor, backwards_cursor, warning))
 }
 
 async fn fetch_detail(
@@ -630,7 +705,14 @@ async fn fetch_detail(
     )
     .await
     .ok();
-    Ok(detail_state(output, status, thread_id, epoch, cursor))
+    Ok(detail_state_for_server(
+        target.server.clone(),
+        output,
+        status,
+        thread_id,
+        epoch,
+        cursor,
+    ))
 }
 
 async fn fetch_preview(
@@ -652,7 +734,7 @@ async fn fetch_preview(
     )
     .await?;
     normalize_detail_turns_for_display(&mut output);
-    Ok(detail_state(output, None, thread_id, 0, None).messages)
+    Ok(detail_state_for_server(target.server.clone(), output, None, thread_id, 0, None).messages)
 }
 
 async fn schedule_browser_refresh(
@@ -667,8 +749,13 @@ async fn schedule_thread_load(
     fetch_tx: &mpsc::Sender<FetchRequest>,
     thread_id: String,
 ) -> Result<()> {
+    let Some(server) = active_server_for_thread(state, &thread_id) else {
+        state.set_notice(format!("failed to load {thread_id}: no server selected"));
+        return Ok(());
+    };
     state.set_notice(format!("loading {thread_id}..."));
     match fetch_tx.try_send(FetchRequest::LoadThread {
+        server,
         thread_id: thread_id.clone(),
     }) {
         Ok(()) => Ok(()),
@@ -725,9 +812,14 @@ async fn schedule_detail_load(
     fetch_tx: &mpsc::Sender<FetchRequest>,
     thread_id: String,
 ) -> Result<()> {
+    let Some(server) = active_server_for_thread(state, &thread_id) else {
+        state.set_notice(format!("failed to open {thread_id}: no server selected"));
+        return Ok(());
+    };
     schedule_detail_page(
         state,
         fetch_tx,
+        server,
         thread_id,
         None,
         DetailPageDirection::Replace,
@@ -740,14 +832,27 @@ async fn schedule_detail_refresh(
     fetch_tx: &mpsc::Sender<FetchRequest>,
     thread_id: String,
 ) -> Result<()> {
+    let Some(server) = active_server_for_thread(state, &thread_id) else {
+        return Ok(());
+    };
+    schedule_detail_refresh_for_server(state, fetch_tx, server, thread_id).await
+}
+
+async fn schedule_detail_refresh_for_server(
+    state: &mut TuiState,
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    server: String,
+    thread_id: String,
+) -> Result<()> {
     let cursor = state
         .detail
         .as_ref()
-        .filter(|detail| detail.thread_id == thread_id)
+        .filter(|detail| detail.server == server && detail.thread_id == thread_id)
         .and_then(|detail| detail.current_cursor.clone());
     schedule_detail_page(
         state,
         fetch_tx,
+        server,
         thread_id,
         cursor,
         DetailPageDirection::Replace,
@@ -758,6 +863,7 @@ async fn schedule_detail_refresh(
 async fn schedule_detail_page(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
+    server: String,
     thread_id: String,
     cursor: Option<String>,
     page_direction: DetailPageDirection,
@@ -765,6 +871,7 @@ async fn schedule_detail_page(
     schedule_detail_page_with_limit(
         state,
         fetch_tx,
+        server,
         thread_id,
         cursor,
         page_direction,
@@ -776,6 +883,7 @@ async fn schedule_detail_page(
 async fn schedule_detail_page_with_limit(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
+    server: String,
     thread_id: String,
     cursor: Option<String>,
     page_direction: DetailPageDirection,
@@ -787,6 +895,7 @@ async fn schedule_detail_page_with_limit(
         .map(|detail| detail.epoch + 1)
         .unwrap_or(1);
     if let Some(detail) = &mut state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
     {
         detail.epoch = epoch;
@@ -795,6 +904,7 @@ async fn schedule_detail_page_with_limit(
         detail.current_cursor = cursor.clone();
     } else {
         state.detail = Some(DetailState {
+            server: server.clone(),
             thread_id: thread_id.clone(),
             title: thread_id.clone(),
             status: "loading".to_string(),
@@ -822,6 +932,7 @@ async fn schedule_detail_page_with_limit(
     state.mode = Mode::Detail;
     match fetch_tx.try_send(FetchRequest::Detail {
         epoch,
+        server,
         thread_id,
         cursor,
         limit,
@@ -838,6 +949,29 @@ async fn schedule_detail_page_with_limit(
     }
 }
 
+fn active_server_for_thread(state: &TuiState, thread_id: &str) -> Option<String> {
+    if let Some(row) = state
+        .browser
+        .rows
+        .get(state.browser.selected)
+        .filter(|row| row.id == thread_id)
+        && !matches!(state.mode, Mode::Detail)
+    {
+        return Some(row.server.clone());
+    }
+    if let Some(detail) = &state.detail
+        && detail.thread_id == thread_id
+    {
+        return Some(detail.server.clone());
+    }
+    state
+        .browser
+        .rows
+        .iter()
+        .find(|row| row.id == thread_id)
+        .map(|row| row.server.clone())
+}
+
 async fn schedule_selected_preview_if_needed(
     state: &mut TuiState,
     preview_tx: &mpsc::Sender<PreviewRequest>,
@@ -845,27 +979,36 @@ async fn schedule_selected_preview_if_needed(
     if !state.prefs.browser.preview_pane || !matches!(state.mode, Mode::Browser) {
         return Ok(());
     }
-    let Some(thread_id) = state.selected_thread_id().map(str::to_string) else {
+    let Some((server, thread_id)) = state.selected_thread_key() else {
         return Ok(());
     };
-    if state.browser.preview.thread_id.as_deref() == Some(thread_id.as_str())
+    if state.browser.preview.server.as_deref() == Some(server.as_str())
+        && state.browser.preview.thread_id.as_deref() == Some(thread_id.as_str())
         && (state.browser.preview.loading
             || !state.browser.preview.messages.is_empty()
             || state.browser.preview.error.is_some())
     {
         return Ok(());
     }
-    let epoch = state.set_preview_loading(thread_id.clone());
-    preview_tx
-        .send(PreviewRequest { epoch, thread_id })
-        .await
-        .context("failed to schedule preview load")
+    let epoch = state.set_preview_loading(server.clone(), thread_id.clone());
+    match preview_tx.try_send(PreviewRequest {
+        epoch,
+        server,
+        thread_id,
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            state.browser.preview.loading = false;
+            state.browser.preview.error = Some(format!("failed to schedule preview load: {err}"));
+            Ok(())
+        }
+    }
 }
 
 async fn handle_terminal_event(
     event: Event,
     state: &mut TuiState,
-    target: &Target,
+    targets: &TuiTargets,
     yolo: bool,
     fetch_tx: &mpsc::Sender<FetchRequest>,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
@@ -892,6 +1035,7 @@ async fn handle_terminal_event(
             && let Some(turn_id) = stream.turn_id.clone()
         {
             state.mode = Mode::ConfirmInterrupt {
+                server: stream.server.clone(),
                 thread_id: stream.thread_id.clone(),
                 turn_id: Some(turn_id),
                 return_to_detail: matches!(state.mode, Mode::Detail),
@@ -933,17 +1077,21 @@ async fn handle_terminal_event(
             .await;
         }
         Mode::AnnotationInput {
+            server,
             thread_id,
             draft,
             return_to_detail,
         } => {
+            let target = targets.get(&server)?;
             return handle_annotation_input(key, target, state, thread_id, draft, return_to_detail);
         }
         Mode::RenameInput {
+            server,
             thread_id,
             draft,
             return_to_detail,
         } => {
+            let target = targets.get(&server)?;
             return handle_rename_input(
                 key,
                 target,
@@ -955,6 +1103,7 @@ async fn handle_terminal_event(
             );
         }
         Mode::Compose(compose) => {
+            let target = targets.get(compose_target_server(&compose.target))?;
             return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx).await;
         }
         Mode::FilterMenu => {
@@ -1042,10 +1191,12 @@ async fn handle_terminal_event(
             return Ok(());
         }
         Mode::ConfirmInterrupt {
+            server,
             thread_id,
             turn_id,
             return_to_detail,
         } => {
+            let target = targets.get(&server)?;
             let return_mode = if return_to_detail {
                 Mode::Detail
             } else {
@@ -1059,6 +1210,7 @@ async fn handle_terminal_event(
                 }
                 _ => {
                     state.mode = Mode::ConfirmInterrupt {
+                        server,
                         thread_id,
                         turn_id,
                         return_to_detail,
@@ -1068,10 +1220,12 @@ async fn handle_terminal_event(
             return Ok(());
         }
         Mode::ConfirmArchive {
+            server,
             thread_id,
             archived,
             return_to_detail,
         } => {
+            let target = targets.get(&server)?;
             let return_mode = if return_to_detail {
                 Mode::Detail
             } else {
@@ -1089,6 +1243,7 @@ async fn handle_terminal_event(
                 }
                 _ => {
                     state.mode = Mode::ConfirmArchive {
+                        server,
                         thread_id,
                         archived,
                         return_to_detail,
@@ -1098,10 +1253,12 @@ async fn handle_terminal_event(
             return Ok(());
         }
         Mode::ConfirmOpenCodex {
+            server,
             thread_id,
             cwd,
             return_to_detail,
         } => {
+            let target = targets.get(&server)?;
             let return_mode = if return_to_detail {
                 Mode::Detail
             } else {
@@ -1127,16 +1284,16 @@ async fn handle_terminal_event(
                     }
                     state.force_terminal_clear = true;
                     schedule_browser_refresh(state, fetch_tx).await?;
-                    if state
-                        .detail
-                        .as_ref()
-                        .is_some_and(|detail| detail.thread_id == thread_id)
-                    {
-                        schedule_detail_refresh(state, fetch_tx, thread_id).await?;
+                    if state.detail.as_ref().is_some_and(|detail| {
+                        detail.server == server && detail.thread_id == thread_id
+                    }) {
+                        schedule_detail_refresh_for_server(state, fetch_tx, server, thread_id)
+                            .await?;
                     }
                 }
                 _ => {
                     state.mode = Mode::ConfirmOpenCodex {
+                        server,
                         thread_id,
                         cwd,
                         return_to_detail,
@@ -1231,10 +1388,11 @@ async fn handle_terminal_event(
             state.previous_message_match();
         }
         KeyCode::Char('a') => {
-            if let Some(thread_id) = active_thread_id(state) {
+            if let Some((server, thread_id)) = active_thread_key(state) {
                 let draft = active_annotation(state).unwrap_or_default();
                 let return_to_detail = matches!(state.mode, Mode::Detail);
                 state.mode = Mode::AnnotationInput {
+                    server,
                     thread_id,
                     draft,
                     return_to_detail,
@@ -1242,10 +1400,11 @@ async fn handle_terminal_event(
             }
         }
         KeyCode::Char('A') => {
-            if let Some(thread_id) = active_thread_id(state) {
+            if let Some((server, thread_id)) = active_thread_key(state) {
                 let archived = !active_thread_is_archived(state);
                 let return_to_detail = matches!(state.mode, Mode::Detail);
                 state.mode = Mode::ConfirmArchive {
+                    server,
                     thread_id,
                     archived,
                     return_to_detail,
@@ -1253,10 +1412,11 @@ async fn handle_terminal_event(
             }
         }
         KeyCode::Char('e') => {
-            if let Some(thread_id) = active_thread_id(state) {
+            if let Some((server, thread_id)) = active_thread_key(state) {
                 let draft = active_thread_title(state).unwrap_or_default();
                 let return_to_detail = matches!(state.mode, Mode::Detail);
                 state.mode = Mode::RenameInput {
+                    server,
                     thread_id,
                     draft,
                     return_to_detail,
@@ -1264,10 +1424,11 @@ async fn handle_terminal_event(
             }
         }
         KeyCode::Char('o') => {
-            if let Some(thread_id) = active_thread_id(state) {
-                if let Some(cwd) = active_thread_cwd(state, &thread_id) {
+            if let Some((server, thread_id)) = active_thread_key(state) {
+                if let Some(cwd) = active_thread_cwd(state, &server, &thread_id) {
                     let return_to_detail = matches!(state.mode, Mode::Detail);
                     state.mode = Mode::ConfirmOpenCodex {
+                        server,
                         thread_id,
                         cwd,
                         return_to_detail,
@@ -1281,8 +1442,8 @@ async fn handle_terminal_event(
             copy_active_thread_id(state)?;
         }
         KeyCode::Char('m') => {
-            if let Some(thread_id) = active_thread_id(state) {
-                open_message_action(state, thread_id);
+            if let Some((server, thread_id)) = active_thread_key(state) {
+                open_message_action(state, server, thread_id);
             }
         }
         KeyCode::Char('l') => {
@@ -1295,12 +1456,14 @@ async fn handle_terminal_event(
                 && let Some(detail) = &state.detail
                 && let Some(turn_id) = detail.active_turn_id.clone()
             {
+                let server = detail.server.clone();
                 let thread_id = detail.thread_id.clone();
                 detach_stream(state);
                 let (control_tx, control_rx) = mpsc::unbounded_channel();
                 let stream_id = state.allocate_stream_id();
-                state.stream = Some(StreamState::new_with_id(
+                state.stream = Some(StreamState::new_for_server_with_id(
                     stream_id,
+                    server.clone(),
                     thread_id.clone(),
                     Some(turn_id.clone()),
                     StreamStatus::Running,
@@ -1308,7 +1471,7 @@ async fn handle_terminal_event(
                 ));
                 state.stream_control = Some(control_tx);
                 spawn_attach_task(
-                    target.clone(),
+                    targets.get(&server)?.clone(),
                     thread_id.clone(),
                     turn_id,
                     yolo,
@@ -1317,12 +1480,13 @@ async fn handle_terminal_event(
                     app_tx.clone(),
                 );
             } else if matches!(state.mode, Mode::Browser)
-                && let Some(thread_id) = state.selected_thread_id().map(str::to_string)
+                && let Some((server, thread_id)) = state.selected_thread_key()
             {
                 detach_stream(state);
                 let stream_id = state.allocate_stream_id();
-                state.stream = Some(StreamState::new_with_id(
+                state.stream = Some(StreamState::new_for_server_with_id(
                     stream_id,
+                    server.clone(),
                     thread_id.clone(),
                     None,
                     StreamStatus::Starting,
@@ -1331,7 +1495,7 @@ async fn handle_terminal_event(
                 let (control_tx, control_rx) = mpsc::unbounded_channel();
                 state.stream_control = Some(control_tx);
                 spawn_browser_attach_task(
-                    target.clone(),
+                    targets.get(&server)?.clone(),
                     thread_id,
                     yolo,
                     control_rx,
@@ -1346,6 +1510,7 @@ async fn handle_terminal_event(
                     && let Some(turn_id) = detail.active_turn_id.clone()
                 {
                     state.mode = Mode::ConfirmInterrupt {
+                        server: detail.server.clone(),
                         thread_id: detail.thread_id.clone(),
                         turn_id: Some(turn_id),
                         return_to_detail: true,
@@ -1353,11 +1518,12 @@ async fn handle_terminal_event(
                 }
             }
             Mode::Browser => {
-                if let Some(thread_id) = state.selected_thread_id().map(str::to_string)
-                    && selected_thread_is_running(state, &thread_id)
+                if let Some((server, thread_id)) = state.selected_thread_key()
+                    && selected_thread_is_running(state, &server, &thread_id)
                 {
-                    let turn_id = active_turn_hint_for_compose(state, &thread_id);
+                    let turn_id = active_turn_hint_for_compose(state, &server, &thread_id);
                     state.mode = Mode::ConfirmInterrupt {
+                        server,
                         thread_id,
                         turn_id,
                         return_to_detail: false,
@@ -1405,8 +1571,8 @@ async fn handle_terminal_event(
                 }
             }
             Mode::Detail => {
-                if let Some(thread_id) = active_thread_id(state) {
-                    open_message_action(state, thread_id);
+                if let Some((server, thread_id)) = active_thread_key(state) {
+                    open_message_action(state, server, thread_id);
                 }
             }
             _ => {}
@@ -1495,6 +1661,7 @@ async fn schedule_pending_detail_jump(
     if detail.loading {
         return Ok(());
     }
+    let server = detail.server.clone();
     let thread_id = detail.thread_id.clone();
     let (cursor, direction) = match jump {
         DetailJump::Start => (detail.next_cursor.clone(), DetailPageDirection::Older),
@@ -1509,6 +1676,7 @@ async fn schedule_pending_detail_jump(
         schedule_detail_page_with_limit(
             state,
             fetch_tx,
+            server,
             thread_id,
             Some(cursor),
             direction,
@@ -1551,9 +1719,9 @@ fn jump_to_bottom(state: &mut TuiState) {
     }
 }
 
-fn open_message_action(state: &mut TuiState, thread_id: String) {
+fn open_message_action(state: &mut TuiState, server: String, thread_id: String) {
     let return_to_detail = matches!(state.mode, Mode::Detail);
-    let (target, send_mode) = default_compose_target(state, thread_id, return_to_detail);
+    let (target, send_mode) = default_compose_target(state, server, thread_id, return_to_detail);
     state.mode = Mode::Compose(ComposeState {
         target,
         text: String::new(),
@@ -1564,27 +1732,35 @@ fn open_message_action(state: &mut TuiState, thread_id: String) {
 
 fn default_compose_target(
     state: &TuiState,
+    server: String,
     thread_id: String,
     return_to_detail: bool,
 ) -> (ComposeTarget, SendMode) {
-    if let Some(target) = steer_target_for_thread(state, &thread_id, return_to_detail) {
+    if let Some(target) = steer_target_for_thread(state, &server, &thread_id, return_to_detail) {
         (target, SendMode::Stream)
     } else {
-        (ComposeTarget::NewTurn { thread_id }, SendMode::Stream)
+        (
+            ComposeTarget::NewTurn { server, thread_id },
+            SendMode::Stream,
+        )
     }
 }
 
 fn toggle_compose_target_or_mode(state: &TuiState, mut compose: ComposeState) -> ComposeState {
     match &compose.target {
-        ComposeTarget::Steer { thread_id, .. } | ComposeTarget::SteerSelected { thread_id } => {
+        ComposeTarget::Steer {
+            server, thread_id, ..
+        }
+        | ComposeTarget::SteerSelected { server, thread_id } => {
             compose.target = ComposeTarget::NewTurn {
+                server: server.clone(),
                 thread_id: thread_id.clone(),
             };
             compose.send_mode = SendMode::Stream;
         }
-        ComposeTarget::NewTurn { thread_id } => {
+        ComposeTarget::NewTurn { server, thread_id } => {
             if let Some(target) =
-                steer_target_for_thread(state, thread_id, compose.return_to_detail)
+                steer_target_for_thread(state, server, thread_id, compose.return_to_detail)
             {
                 compose.target = target;
                 compose.send_mode = SendMode::Stream;
@@ -1601,20 +1777,24 @@ fn toggle_compose_target_or_mode(state: &TuiState, mut compose: ComposeState) ->
 
 fn steer_target_for_thread(
     state: &TuiState,
+    server: &str,
     thread_id: &str,
     return_to_detail: bool,
 ) -> Option<ComposeTarget> {
     if return_to_detail
         && let Some(detail) = &state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
         && let Some(turn_id) = detail.active_turn_id.clone()
     {
         return Some(ComposeTarget::Steer {
+            server: server.to_string(),
             thread_id: thread_id.to_string(),
             turn_id,
         });
     }
     if let Some(stream) = &state.stream
+        && stream.server == server
         && stream.thread_id == thread_id
         && matches!(
             stream.status,
@@ -1623,11 +1803,13 @@ fn steer_target_for_thread(
     {
         if let Some(turn_id) = stream.turn_id.clone() {
             return Some(ComposeTarget::Steer {
+                server: server.to_string(),
                 thread_id: thread_id.to_string(),
                 turn_id,
             });
         }
         return Some(ComposeTarget::SteerSelected {
+            server: server.to_string(),
             thread_id: thread_id.to_string(),
         });
     }
@@ -1635,9 +1817,10 @@ fn steer_target_for_thread(
         .browser
         .rows
         .iter()
-        .any(|row| row.id == thread_id && row.is_running())
+        .any(|row| row.server == server && row.id == thread_id && row.is_running())
     {
         return Some(ComposeTarget::SteerSelected {
+            server: server.to_string(),
             thread_id: thread_id.to_string(),
         });
     }
@@ -1648,7 +1831,7 @@ async fn schedule_detail_older_if_available(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
 ) -> Result<()> {
-    let Some((thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
+    let Some((server, thread_id, cursor)) = state.detail.as_ref().and_then(|detail| {
         if detail.loading {
             return None;
         }
@@ -1662,13 +1845,14 @@ async fn schedule_detail_older_if_available(
         detail
             .next_cursor
             .clone()
-            .map(|cursor| (detail.thread_id.clone(), cursor))
+            .map(|cursor| (detail.server.clone(), detail.thread_id.clone(), cursor))
     }) else {
         return Ok(());
     };
     schedule_detail_page(
         state,
         fetch_tx,
+        server,
         thread_id,
         Some(cursor),
         DetailPageDirection::Older,
@@ -1839,12 +2023,13 @@ fn handle_annotation_input(
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             clear_annotation(target, &thread_id)?;
-            set_annotation_in_state(state, &thread_id, None);
+            set_annotation_in_state(state, &target.server, &thread_id, None);
             state.mode = return_mode.clone();
         }
         KeyCode::Backspace => {
             draft.pop();
             state.mode = Mode::AnnotationInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1856,6 +2041,7 @@ fn handle_annotation_input(
         {
             draft.push(ch);
             state.mode = Mode::AnnotationInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1863,6 +2049,7 @@ fn handle_annotation_input(
         }
         _ => {
             state.mode = Mode::AnnotationInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1893,6 +2080,7 @@ fn handle_rename_input(
             if name.is_empty() {
                 state.set_notice("name cannot be empty");
                 state.mode = Mode::RenameInput {
+                    server: target.server.clone(),
                     thread_id,
                     draft,
                     return_to_detail,
@@ -1906,6 +2094,7 @@ fn handle_rename_input(
         KeyCode::Backspace => {
             draft.pop();
             state.mode = Mode::RenameInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1914,6 +2103,7 @@ fn handle_rename_input(
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             draft.clear();
             state.mode = Mode::RenameInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1925,6 +2115,7 @@ fn handle_rename_input(
         {
             draft.push(ch);
             state.mode = Mode::RenameInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1932,6 +2123,7 @@ fn handle_rename_input(
         }
         _ => {
             state.mode = Mode::RenameInput {
+                server: target.server.clone(),
                 thread_id,
                 draft,
                 return_to_detail,
@@ -1949,24 +2141,30 @@ fn save_annotation_draft(
 ) -> Result<()> {
     if value.trim().is_empty() {
         clear_annotation(target, thread_id)?;
-        set_annotation_in_state(state, thread_id, None);
+        set_annotation_in_state(state, &target.server, thread_id, None);
     } else {
         set_annotation(target, thread_id, &value)?;
-        set_annotation_in_state(state, thread_id, Some(value));
+        set_annotation_in_state(state, &target.server, thread_id, Some(value));
     }
     Ok(())
 }
 
-fn set_annotation_in_state(state: &mut TuiState, thread_id: &str, value: Option<String>) {
+fn set_annotation_in_state(
+    state: &mut TuiState,
+    server: &str,
+    thread_id: &str,
+    value: Option<String>,
+) {
     if let Some(row) = state
         .browser
         .rows
         .iter_mut()
-        .find(|row| row.id == thread_id)
+        .find(|row| row.server == server && row.id == thread_id)
     {
         row.annotation = value.clone();
     }
     if let Some(detail) = &mut state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
     {
         detail.annotation = value;
@@ -2026,7 +2224,7 @@ fn submit_compose(
         return;
     }
     match compose.target {
-        ComposeTarget::NewTurn { thread_id } => {
+        ComposeTarget::NewTurn { server, thread_id } => {
             let sent_at = format_current_epoch();
             append_detail_message(
                 state,
@@ -2038,17 +2236,18 @@ fn submit_compose(
             );
             append_preview_message(
                 state,
+                &server,
                 thread_id.as_str(),
                 None,
                 "user",
                 Some(sent_at),
                 &prompt,
             );
-            touch_browser_thread_updated(state, &thread_id);
+            touch_browser_thread_updated(state, &server, &thread_id);
             state.mode = return_mode;
             match compose.send_mode {
                 SendMode::Stream => {
-                    if active_stream_can_queue_prompt(state, &thread_id) {
+                    if active_stream_can_queue_prompt(state, &server, &thread_id) {
                         if let Some(control) = &state.stream_control {
                             let _ = control.send(TurnControl::Submit { prompt, yolo });
                         } else {
@@ -2064,8 +2263,9 @@ fn submit_compose(
                         detach_stream(state);
                         let (control_tx, control_rx) = mpsc::unbounded_channel();
                         let stream_id = state.allocate_stream_id();
-                        state.stream = Some(StreamState::new_with_id(
+                        state.stream = Some(StreamState::new_for_server_with_id(
                             stream_id,
+                            server.clone(),
                             thread_id.clone(),
                             None,
                             StreamStatus::Starting,
@@ -2094,7 +2294,11 @@ fn submit_compose(
                 }
             }
         }
-        ComposeTarget::Steer { thread_id, turn_id } => {
+        ComposeTarget::Steer {
+            server,
+            thread_id,
+            turn_id,
+        } => {
             let sent_at = format_current_epoch();
             append_detail_message(
                 state,
@@ -2106,13 +2310,14 @@ fn submit_compose(
             );
             append_preview_message(
                 state,
+                &server,
                 thread_id.as_str(),
                 Some(turn_id.clone()),
                 "user",
                 Some(sent_at),
                 &prompt,
             );
-            touch_browser_thread_updated(state, &thread_id);
+            touch_browser_thread_updated(state, &server, &thread_id);
             state.mode = return_mode;
             spawn_steer_task(
                 target.clone(),
@@ -2123,7 +2328,7 @@ fn submit_compose(
                 app_tx.clone(),
             );
         }
-        ComposeTarget::SteerSelected { thread_id } => {
+        ComposeTarget::SteerSelected { server, thread_id } => {
             let sent_at = format_current_epoch();
             append_detail_message(
                 state,
@@ -2135,13 +2340,14 @@ fn submit_compose(
             );
             append_preview_message(
                 state,
+                &server,
                 thread_id.as_str(),
                 None,
                 "user",
                 Some(sent_at),
                 &prompt,
             );
-            touch_browser_thread_updated(state, &thread_id);
+            touch_browser_thread_updated(state, &server, &thread_id);
             state.mode = return_mode;
             spawn_steer_task(
                 target.clone(),
@@ -2155,9 +2361,18 @@ fn submit_compose(
     }
 }
 
-fn active_turn_hint_for_compose(state: &TuiState, thread_id: &str) -> Option<String> {
+fn compose_target_server(target: &ComposeTarget) -> &str {
+    match target {
+        ComposeTarget::NewTurn { server, .. }
+        | ComposeTarget::Steer { server, .. }
+        | ComposeTarget::SteerSelected { server, .. } => server,
+    }
+}
+
+fn active_turn_hint_for_compose(state: &TuiState, server: &str, thread_id: &str) -> Option<String> {
     state.stream.as_ref().and_then(|stream| {
-        if stream.thread_id == thread_id
+        if stream.server == server
+            && stream.thread_id == thread_id
             && matches!(
                 stream.status,
                 StreamStatus::Starting | StreamStatus::Running
@@ -2170,9 +2385,10 @@ fn active_turn_hint_for_compose(state: &TuiState, thread_id: &str) -> Option<Str
     })
 }
 
-fn active_stream_can_queue_prompt(state: &TuiState, thread_id: &str) -> bool {
+fn active_stream_can_queue_prompt(state: &TuiState, server: &str, thread_id: &str) -> bool {
     state.stream.as_ref().is_some_and(|stream| {
-        stream.thread_id == thread_id
+        stream.server == server
+            && stream.thread_id == thread_id
             && matches!(
                 stream.status,
                 StreamStatus::Starting | StreamStatus::Running
@@ -2262,6 +2478,7 @@ async fn wait_started_turn_stream(
 fn report_stream_task_result(
     app_tx: &mpsc::UnboundedSender<AppEvent>,
     stream_id: u64,
+    server: String,
     thread_id: String,
     turn_id: Option<String>,
     result: Result<StreamStatus>,
@@ -2270,6 +2487,7 @@ fn report_stream_task_result(
         Ok(status) => app_tx
             .send(AppEvent::StreamFinished {
                 stream_id,
+                server: server.clone(),
                 thread_id,
                 turn_id,
                 status,
@@ -2278,6 +2496,7 @@ fn report_stream_task_result(
         Err(err) => app_tx
             .send(AppEvent::StreamFailed {
                 stream_id: Some(stream_id),
+                server,
                 thread_id,
                 turn_id,
                 error: err.to_string(),
@@ -2296,6 +2515,7 @@ fn spawn_attach_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let stream_thread_id = thread_id.clone();
         let stream_turn_id = Some(turn_id.clone());
         let result: Result<StreamStatus> = async {
@@ -2317,7 +2537,14 @@ fn spawn_attach_task(
             .await
         }
         .await;
-        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+        report_stream_task_result(
+            &app_tx,
+            stream_id,
+            server,
+            stream_thread_id,
+            stream_turn_id,
+            result,
+        );
     });
 }
 
@@ -2330,6 +2557,7 @@ fn spawn_browser_attach_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
@@ -2355,7 +2583,14 @@ fn spawn_browser_attach_task(
             .await
         }
         .await;
-        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+        report_stream_task_result(
+            &app_tx,
+            stream_id,
+            server,
+            stream_thread_id,
+            stream_turn_id,
+            result,
+        );
     });
 }
 
@@ -2368,6 +2603,7 @@ fn spawn_thread_follow_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = None;
         let result: Result<Option<StreamStatus>> = async {
@@ -2407,6 +2643,7 @@ fn spawn_thread_follow_task(
             Ok(Some(status)) => report_stream_task_result(
                 &app_tx,
                 stream_id,
+                server.clone(),
                 stream_thread_id,
                 stream_turn_id,
                 Ok(status),
@@ -2414,12 +2651,14 @@ fn spawn_thread_follow_task(
             Ok(None) => {
                 let _ = app_tx.send(AppEvent::StreamIdle {
                     stream_id,
+                    server: server.clone(),
                     thread_id: stream_thread_id,
                 });
             }
             Err(err) => {
                 let _ = app_tx.send(AppEvent::StreamFailed {
                     stream_id: Some(stream_id),
+                    server,
                     thread_id: stream_thread_id,
                     turn_id: stream_turn_id,
                     error: err.to_string(),
@@ -2494,6 +2733,7 @@ fn spawn_steer_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = turn_id.clone();
         let result: Result<Value> = async {
@@ -2520,6 +2760,7 @@ fn spawn_steer_task(
             Err(err) => app_tx
                 .send(AppEvent::StreamFailed {
                     stream_id: None,
+                    server,
                     thread_id: stream_thread_id,
                     turn_id: stream_turn_id,
                     error: err.to_string(),
@@ -2536,6 +2777,7 @@ fn spawn_interrupt_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = turn_id.clone();
         let result: Result<Value> = async {
@@ -2562,6 +2804,7 @@ fn spawn_interrupt_task(
             Err(err) => app_tx
                 .send(AppEvent::StreamFailed {
                     stream_id: None,
+                    server,
                     thread_id: stream_thread_id,
                     turn_id: stream_turn_id,
                     error: err.to_string(),
@@ -2578,6 +2821,7 @@ fn spawn_archive_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let result: Result<Value> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
             set_thread_archived(&target, &mut client, thread_id.clone(), archived).await
@@ -2586,6 +2830,7 @@ fn spawn_archive_task(
         match result {
             Ok(output) => app_tx
                 .send(AppEvent::ArchiveChanged {
+                    server: server.clone(),
                     thread_id,
                     archived,
                     thread: output["thread"].clone(),
@@ -2593,6 +2838,7 @@ fn spawn_archive_task(
                 .ok(),
             Err(err) => app_tx
                 .send(AppEvent::ArchiveChangeFailed {
+                    server,
                     thread_id,
                     archived,
                     error: err.to_string(),
@@ -2609,6 +2855,7 @@ fn spawn_rename_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let result: Result<Value> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
             set_thread_name(&target, &mut client, thread_id.clone(), name.clone()).await
@@ -2617,6 +2864,7 @@ fn spawn_rename_task(
         match result {
             Ok(output) => app_tx
                 .send(AppEvent::RenameChanged {
+                    server: server.clone(),
                     thread_id,
                     name,
                     thread: output["thread"].clone(),
@@ -2624,6 +2872,7 @@ fn spawn_rename_task(
                 .ok(),
             Err(err) => app_tx
                 .send(AppEvent::RenameChangeFailed {
+                    server,
                     thread_id,
                     name,
                     error: err.to_string(),
@@ -2641,6 +2890,7 @@ fn spawn_no_wait_send_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let result: Result<StartedTurn> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
             start_turn_request(
@@ -2663,6 +2913,7 @@ fn spawn_no_wait_send_task(
                 let prompt = started.prompt().unwrap_or_default().to_string();
                 app_tx
                     .send(AppEvent::TurnQueued {
+                        server: server.clone(),
                         thread_id,
                         turn_id: started.turn_id,
                         prompt,
@@ -2671,6 +2922,7 @@ fn spawn_no_wait_send_task(
             }
             Err(err) => app_tx
                 .send(AppEvent::TurnSubmitFailed {
+                    server,
                     thread_id,
                     error: err.to_string(),
                 })
@@ -2687,6 +2939,7 @@ fn spawn_queue_turn_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let result: Result<StartedTurn> = async {
             let mut client = RpcClient::connect(&target.endpoint).await?;
             start_turn_request(
@@ -2709,6 +2962,7 @@ fn spawn_queue_turn_task(
                 let prompt = started.prompt().unwrap_or_default().to_string();
                 app_tx
                     .send(AppEvent::TurnQueued {
+                        server: server.clone(),
                         thread_id,
                         turn_id: started.turn_id,
                         prompt,
@@ -2717,6 +2971,7 @@ fn spawn_queue_turn_task(
             }
             Err(err) => app_tx
                 .send(AppEvent::TurnSubmitFailed {
+                    server,
                     thread_id,
                     error: err.to_string(),
                 })
@@ -2754,6 +3009,7 @@ fn spawn_stream_send_task(
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
+        let server = target.server.clone();
         let stream_thread_id = thread_id.clone();
         let mut stream_turn_id = None;
         let result: Result<StreamStatus> = async {
@@ -2787,7 +3043,14 @@ fn spawn_stream_send_task(
             .await
         }
         .await;
-        report_stream_task_result(&app_tx, stream_id, stream_thread_id, stream_turn_id, result);
+        report_stream_task_result(
+            &app_tx,
+            stream_id,
+            server,
+            stream_thread_id,
+            stream_turn_id,
+            result,
+        );
     });
 }
 
@@ -2798,13 +3061,14 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             rows,
             next_cursor,
             backwards_cursor,
-        } => state.set_browser_rows(
-            epoch,
-            rows,
-            next_cursor,
-            backwards_cursor,
-            state.browser.current_cursor.clone(),
-        ),
+            warning,
+        } => {
+            let current_cursor = state.browser.current_cursor.clone();
+            state.set_browser_rows(epoch, rows, next_cursor, backwards_cursor, current_cursor);
+            if state.browser.epoch == epoch {
+                state.browser.last_error = warning;
+            }
+        }
         AppEvent::BrowserLoadFailed { epoch, error } => state.set_browser_error(epoch, error),
         AppEvent::DetailLoaded {
             epoch,
@@ -2818,54 +3082,75 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         AppEvent::DetailLoadFailed { epoch, error } => state.set_detail_error(epoch, error),
         AppEvent::PreviewLoaded {
             epoch,
+            server,
             thread_id,
             messages,
-        } => state.set_preview_loaded(epoch, thread_id, messages),
+        } => state.set_preview_loaded(epoch, server, thread_id, messages),
         AppEvent::PreviewLoadFailed {
             epoch,
+            server,
             thread_id,
             error,
-        } => state.set_preview_error(epoch, thread_id, error),
-        AppEvent::ThreadLoaded { thread_id, status } => {
-            apply_thread_load_status(state, &thread_id, &status);
-            reset_preview_for_thread(state, &thread_id);
+        } => state.set_preview_error(epoch, server, thread_id, error),
+        AppEvent::ThreadLoaded {
+            server,
+            thread_id,
+            status,
+        } => {
+            apply_thread_load_status(state, &server, &thread_id, &status);
+            reset_preview_for_thread(state, &server, &thread_id);
             state.set_notice(format!("loaded {thread_id}"));
         }
-        AppEvent::ThreadLoadFailed { thread_id, error } => {
-            state.set_notice(format!("failed to load {thread_id}: {error}"));
+        AppEvent::ThreadLoadFailed {
+            server,
+            thread_id,
+            error,
+        } => {
+            state.set_notice(format!("failed to load {server}/{thread_id}: {error}"));
         }
         AppEvent::StreamEvent { stream_id, event } => {
             log_stream_event(&event);
             let event_thread_id = event["threadId"].as_str();
+            let event_server = event["server"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| state.stream.as_ref().map(|stream| stream.server.clone()))
+                .or_else(|| {
+                    event_thread_id.and_then(|thread_id| active_server_for_thread(state, thread_id))
+                })
+                .unwrap_or_default();
+            let event_server = event_server.as_str();
             let event_type = event["type"].as_str();
             if let Some(current_stream) = &state.stream {
                 if let Some(stream_id) = stream_id {
                     if current_stream.id != stream_id {
                         return;
                     }
-                } else if event_thread_id
-                    .is_some_and(|thread_id| thread_id != current_stream.thread_id.as_str())
-                {
+                } else if event_thread_id.is_some_and(|thread_id| {
+                    event_server != current_stream.server
+                        || thread_id != current_stream.thread_id.as_str()
+                }) {
                     return;
                 }
             }
             if let Some(thread_id) = event_thread_id {
-                touch_browser_thread_updated(state, thread_id);
+                touch_browser_thread_updated(state, event_server, thread_id);
                 match event["status"].as_str() {
                     Some("completed" | "failed" | "interrupted") => {
-                        set_browser_thread_status(state, thread_id, "idle");
+                        set_browser_thread_status(state, event_server, thread_id, "idle");
                     }
-                    _ => set_browser_thread_status(state, thread_id, "active"),
+                    _ => set_browser_thread_status(state, event_server, thread_id, "active"),
                 }
             }
             if state.stream.is_none()
                 && let Some(thread_id) = event_thread_id
             {
-                if !stream_event_matches_visible_thread(state, thread_id) {
+                if !stream_event_matches_visible_thread(state, event_server, thread_id) {
                     return;
                 }
-                state.stream = Some(StreamState::new_with_id(
+                state.stream = Some(StreamState::new_for_server_with_id(
                     stream_id.unwrap_or(0),
+                    event_server.to_string(),
                     thread_id.to_string(),
                     event["turnId"].as_str().map(str::to_string),
                     StreamStatus::Running,
@@ -2960,8 +3245,13 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 }
             }
             if let Some(turn_id) = pending_turn_id {
-                fill_pending_turn_id(state, &turn_id, pending_prompt.as_deref());
-                fill_preview_pending_turn_id(state, &turn_id, pending_prompt.as_deref());
+                fill_pending_turn_id(state, event_server, &turn_id, pending_prompt.as_deref());
+                fill_preview_pending_turn_id(
+                    state,
+                    event_server,
+                    &turn_id,
+                    pending_prompt.as_deref(),
+                );
             }
             if let Some(detail) = snapshot_detail {
                 state.replace_detail(detail.epoch, detail);
@@ -2980,14 +3270,21 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         }
         AppEvent::StreamFailed {
             stream_id,
+            server,
             thread_id,
             turn_id,
             error,
         } => {
-            if !stream_terminal_event_applies(state, stream_id, &thread_id, turn_id.as_deref()) {
+            if !stream_terminal_event_applies(
+                state,
+                stream_id,
+                &server,
+                &thread_id,
+                turn_id.as_deref(),
+            ) {
                 return;
             }
-            touch_browser_thread_updated(state, &thread_id);
+            touch_browser_thread_updated(state, &server, &thread_id);
             if let Some(stream) = &mut state.stream {
                 stream.status = StreamStatus::Failed;
                 stream.last_error = Some(error);
@@ -2998,6 +3295,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         }
         AppEvent::StreamFinished {
             stream_id,
+            server,
             thread_id,
             turn_id,
             status,
@@ -3005,14 +3303,15 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             if !stream_terminal_event_applies(
                 state,
                 Some(stream_id),
+                &server,
                 &thread_id,
                 turn_id.as_deref(),
             ) {
                 return;
             }
-            touch_browser_thread_updated(state, &thread_id);
+            touch_browser_thread_updated(state, &server, &thread_id);
             if status != StreamStatus::Detached {
-                set_browser_thread_status(state, &thread_id, "idle");
+                set_browser_thread_status(state, &server, &thread_id, "idle");
             }
             if let Some(stream) = &mut state.stream {
                 stream.status = status;
@@ -3024,15 +3323,15 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         }
         AppEvent::StreamIdle {
             stream_id,
+            server,
             thread_id,
         } => {
-            if state
-                .stream
-                .as_ref()
-                .is_some_and(|stream| stream.id == stream_id && stream.thread_id == thread_id)
-            {
-                set_browser_thread_status(state, &thread_id, "idle");
+            if state.stream.as_ref().is_some_and(|stream| {
+                stream.id == stream_id && stream.server == server && stream.thread_id == thread_id
+            }) {
+                set_browser_thread_status(state, &server, &thread_id, "idle");
                 if let Some(detail) = &mut state.detail
+                    && detail.server == server
                     && detail.thread_id == thread_id
                 {
                     detail.status = "idle".to_string();
@@ -3046,54 +3345,65 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             }
         }
         AppEvent::TurnQueued {
+            server,
             thread_id,
             turn_id,
             prompt,
         } => {
-            set_browser_thread_status(state, &thread_id, "active");
-            touch_browser_thread_updated(state, &thread_id);
-            fill_pending_turn_id(state, &turn_id, Some(&prompt));
-            fill_preview_pending_turn_id(state, &turn_id, Some(&prompt));
+            set_browser_thread_status(state, &server, &thread_id, "active");
+            touch_browser_thread_updated(state, &server, &thread_id);
+            fill_pending_turn_id(state, &server, &turn_id, Some(&prompt));
+            fill_preview_pending_turn_id(state, &server, &turn_id, Some(&prompt));
             state.set_notice(format!("sent {thread_id}"));
         }
-        AppEvent::TurnSubmitFailed { thread_id, error } => {
-            state.set_notice(format!("failed to send {thread_id}: {error}"));
+        AppEvent::TurnSubmitFailed {
+            server,
+            thread_id,
+            error,
+        } => {
+            state.set_notice(format!("failed to send {server}/{thread_id}: {error}"));
         }
         AppEvent::ArchiveChanged {
+            server,
             thread_id,
             archived,
             thread,
         } => {
-            apply_archive_change(state, &thread_id, archived, &thread);
+            apply_archive_change(state, &server, &thread_id, archived, &thread);
             state.set_notice(format!(
                 "{} {thread_id}",
                 if archived { "archived" } else { "unarchived" }
             ));
         }
         AppEvent::ArchiveChangeFailed {
+            server,
             thread_id,
             archived,
             error,
         } => {
             state.set_notice(format!(
-                "failed to {} {thread_id}: {error}",
+                "failed to {} {server}/{thread_id}: {error}",
                 if archived { "archive" } else { "unarchive" }
             ));
         }
         AppEvent::RenameChanged {
+            server,
             thread_id,
             name,
             thread,
         } => {
-            set_thread_name_in_state(state, &thread_id, &name, &thread);
+            set_thread_name_in_state(state, &server, &thread_id, &name, &thread);
             state.set_notice(format!("renamed {thread_id}"));
         }
         AppEvent::RenameChangeFailed {
+            server,
             thread_id,
             name,
             error,
         } => {
-            state.set_notice(format!("failed to rename {thread_id} to {name}: {error}"));
+            state.set_notice(format!(
+                "failed to rename {server}/{thread_id} to {name}: {error}"
+            ));
         }
         AppEvent::ShutdownSignal => {
             detach_stream(state);
@@ -3102,30 +3412,38 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
     }
 }
 
-fn archive_changed_thread(event: &AppEvent) -> Option<String> {
+fn archive_changed_thread(event: &AppEvent) -> Option<(String, String)> {
     match event {
-        AppEvent::ArchiveChanged { thread_id, .. } => Some(thread_id.clone()),
+        AppEvent::ArchiveChanged {
+            server, thread_id, ..
+        } => Some((server.clone(), thread_id.clone())),
         _ => None,
     }
 }
 
-fn rename_changed_thread(event: &AppEvent) -> Option<String> {
+fn rename_changed_thread(event: &AppEvent) -> Option<(String, String)> {
     match event {
-        AppEvent::RenameChanged { thread_id, .. } => Some(thread_id.clone()),
+        AppEvent::RenameChanged {
+            server, thread_id, ..
+        } => Some((server.clone(), thread_id.clone())),
         _ => None,
     }
 }
 
-fn turn_submitted_thread(event: &AppEvent) -> Option<String> {
+fn turn_submitted_thread(event: &AppEvent) -> Option<(String, String)> {
     match event {
-        AppEvent::TurnQueued { thread_id, .. } => Some(thread_id.clone()),
+        AppEvent::TurnQueued {
+            server, thread_id, ..
+        } => Some((server.clone(), thread_id.clone())),
         _ => None,
     }
 }
 
-fn loaded_thread(event: &AppEvent) -> Option<String> {
+fn loaded_thread(event: &AppEvent) -> Option<(String, String)> {
     match event {
-        AppEvent::ThreadLoaded { thread_id, .. } => Some(thread_id.clone()),
+        AppEvent::ThreadLoaded {
+            server, thread_id, ..
+        } => Some((server.clone(), thread_id.clone())),
         _ => None,
     }
 }
@@ -3179,7 +3497,8 @@ fn detail_from_resume_snapshot(
     let status_output = active_turn_id
         .as_ref()
         .map(|turn_id| json!({"activeTurnId": turn_id}));
-    Some(detail_state(
+    Some(detail_state_for_server(
+        current.server.clone(),
         output,
         status_output,
         thread_id.to_string(),
@@ -3223,18 +3542,20 @@ fn seed_stream_from_resume_snapshot(
 fn stream_terminal_event_applies(
     state: &TuiState,
     stream_id: Option<u64>,
+    server: &str,
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> bool {
     let Some(stream) = &state.stream else {
-        return stream_id.is_none() && stream_event_matches_visible_thread(state, thread_id);
+        return stream_id.is_none()
+            && stream_event_matches_visible_thread(state, server, thread_id);
     };
     if let Some(stream_id) = stream_id
         && stream.id != stream_id
     {
         return false;
     }
-    if stream.thread_id != thread_id {
+    if stream.server != server || stream.thread_id != thread_id {
         return false;
     }
     if let (Some(expected), Some(actual)) = (stream.turn_id.as_deref(), turn_id) {
@@ -3254,29 +3575,37 @@ fn stream_is_running_status(stream: &StreamState) -> bool {
     )
 }
 
-fn stream_is_visible_in_browser(state: &TuiState, thread_id: &str) -> bool {
-    state.selected_thread_id() == Some(thread_id)
+fn stream_is_visible_in_browser(state: &TuiState, server: &str, thread_id: &str) -> bool {
+    state
+        .selected_thread_key()
+        .as_ref()
+        .is_some_and(|(selected_server, selected_thread)| {
+            selected_server == server && selected_thread == thread_id
+        })
         || state
             .browser
             .preview
             .thread_id
             .as_deref()
-            .is_some_and(|preview_thread_id| preview_thread_id == thread_id)
+            .is_some_and(|preview_thread_id| {
+                state.browser.preview.server.as_deref() == Some(server)
+                    && preview_thread_id == thread_id
+            })
         || (state.selected_thread_id().is_none()
             && state.browser.preview.thread_id.is_none()
             && state
                 .detail
                 .as_ref()
-                .is_some_and(|detail| detail.thread_id == thread_id))
+                .is_some_and(|detail| detail.server == server && detail.thread_id == thread_id))
 }
 
-fn stream_event_matches_visible_thread(state: &TuiState, thread_id: &str) -> bool {
+fn stream_event_matches_visible_thread(state: &TuiState, server: &str, thread_id: &str) -> bool {
     match state.mode {
-        Mode::Browser => stream_is_visible_in_browser(state, thread_id),
+        Mode::Browser => stream_is_visible_in_browser(state, server, thread_id),
         _ => state
             .detail
             .as_ref()
-            .is_some_and(|detail| detail.thread_id == thread_id),
+            .is_some_and(|detail| detail.server == server && detail.thread_id == thread_id),
     }
 }
 
@@ -3298,32 +3627,37 @@ fn detach_stream(state: &mut TuiState) {
 
 fn detach_stream_if_browser_selection_changed(
     state: &mut TuiState,
-    previous_selection: Option<String>,
+    previous_selection: Option<(String, String)>,
 ) {
     if !matches!(state.mode, Mode::Browser) {
         return;
     }
-    let current_selection = state.selected_thread_id().map(str::to_string);
+    let current_selection = state.selected_thread_key();
     if previous_selection == current_selection {
         return;
     }
-    let Some(stream_thread_id) = state.stream.as_ref().map(|stream| stream.thread_id.clone())
+    let Some((stream_server, stream_thread_id)) = state
+        .stream
+        .as_ref()
+        .map(|stream| (stream.server.clone(), stream.thread_id.clone()))
     else {
         return;
     };
-    if current_selection.as_deref() != Some(stream_thread_id.as_str()) {
+    if current_selection != Some((stream_server, stream_thread_id)) {
         detach_stream(state);
         state.stream = None;
     }
 }
 
 fn unlink_detail_session(state: &mut TuiState) {
-    let detail_thread_id = state.detail.as_ref().map(|detail| detail.thread_id.clone());
-    if let Some(detail_thread_id) = detail_thread_id
-        && state
-            .stream
-            .as_ref()
-            .is_some_and(|stream| stream.thread_id == detail_thread_id)
+    let detail_key = state
+        .detail
+        .as_ref()
+        .map(|detail| (detail.server.clone(), detail.thread_id.clone()));
+    if let Some((detail_server, detail_thread_id)) = detail_key
+        && state.stream.as_ref().is_some_and(|stream| {
+            stream.server == detail_server && stream.thread_id == detail_thread_id
+        })
     {
         detach_stream(state);
         state.stream = None;
@@ -3341,7 +3675,7 @@ fn initial_browser_load_needs_auto_attach(event: &AppEvent, state: &TuiState) ->
 
 fn auto_attach_selected_browser_thread_if_active(
     state: &mut TuiState,
-    target: Target,
+    targets: TuiTargets,
     yolo: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
@@ -3354,10 +3688,15 @@ fn auto_attach_selected_browser_thread_if_active(
     if !row.is_running() {
         return;
     }
+    let server = row.server.clone();
     let thread_id = row.id.clone();
+    let Ok(target) = targets.get(&server).cloned() else {
+        return;
+    };
     let stream_id = state.allocate_stream_id();
-    state.stream = Some(StreamState::new_with_id(
+    state.stream = Some(StreamState::new_for_server_with_id(
         stream_id,
+        server,
         thread_id.clone(),
         None,
         StreamStatus::Starting,
@@ -3370,7 +3709,7 @@ fn auto_attach_selected_browser_thread_if_active(
 
 fn auto_attach_open_detail_thread_if_active(
     state: &mut TuiState,
-    target: Target,
+    targets: TuiTargets,
     yolo: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
@@ -3386,19 +3725,19 @@ fn auto_attach_open_detail_thread_if_active(
     let Some(turn_id) = detail.active_turn_id.clone() else {
         return;
     };
+    let server = detail.server.clone();
     let thread_id = detail.thread_id.clone();
-    if state
-        .stream
-        .as_ref()
-        .is_some_and(|stream| stream.thread_id == thread_id && stream_is_running_status(stream))
-    {
+    if state.stream.as_ref().is_some_and(|stream| {
+        stream.server == server && stream.thread_id == thread_id && stream_is_running_status(stream)
+    }) {
         return;
     }
     detach_stream(state);
     state.stream = None;
     let stream_id = state.allocate_stream_id();
-    state.stream = Some(StreamState::new_with_id(
+    state.stream = Some(StreamState::new_for_server_with_id(
         stream_id,
+        server.clone(),
         thread_id.clone(),
         Some(turn_id.clone()),
         StreamStatus::Running,
@@ -3406,27 +3745,31 @@ fn auto_attach_open_detail_thread_if_active(
     ));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     state.stream_control = Some(control_tx);
+    let Ok(target) = targets.get(&server).cloned() else {
+        return;
+    };
     spawn_attach_task(
         target, thread_id, turn_id, yolo, control_rx, stream_id, app_tx,
     );
 }
 
-fn stream_finish_detail_thread(event: &AppEvent, state: &TuiState) -> Option<String> {
+fn stream_finish_detail_thread(event: &AppEvent, state: &TuiState) -> Option<(String, String)> {
     if !matches!(event, AppEvent::StreamFinished { .. }) {
         return None;
     }
     let detail = state.detail.as_ref()?;
     let stream = state.stream.as_ref()?;
-    if detail.thread_id == stream.thread_id {
-        Some(detail.thread_id.clone())
+    if detail.server == stream.server && detail.thread_id == stream.thread_id {
+        Some((detail.server.clone(), detail.thread_id.clone()))
     } else {
         None
     }
 }
 
-fn stream_finish_follow_thread(event: &AppEvent, state: &TuiState) -> Option<String> {
+fn stream_finish_follow_thread(event: &AppEvent, state: &TuiState) -> Option<(String, String)> {
     let AppEvent::StreamFinished {
         stream_id,
+        server,
         thread_id,
         status,
         ..
@@ -3438,28 +3781,33 @@ fn stream_finish_follow_thread(event: &AppEvent, state: &TuiState) -> Option<Str
         return None;
     }
     let stream = state.stream.as_ref()?;
-    if stream.id != *stream_id || stream.thread_id != *thread_id {
+    if stream.id != *stream_id || stream.server != *server || stream.thread_id != *thread_id {
         return None;
     }
-    if !stream_event_matches_visible_thread(state, thread_id) {
+    if !stream_event_matches_visible_thread(state, server, thread_id) {
         return None;
     }
-    Some(thread_id.clone())
+    Some((server.clone(), thread_id.clone()))
 }
 
 fn follow_thread_stream_if_active(
     state: &mut TuiState,
-    target: Target,
+    targets: TuiTargets,
     yolo: bool,
+    server: String,
     thread_id: String,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    if !stream_event_matches_visible_thread(state, &thread_id) {
+    if !stream_event_matches_visible_thread(state, &server, &thread_id) {
         return;
     }
+    let Ok(target) = targets.get(&server).cloned() else {
+        return;
+    };
     let stream_id = state.allocate_stream_id();
-    state.stream = Some(StreamState::new_with_id(
+    state.stream = Some(StreamState::new_for_server_with_id(
         stream_id,
+        server,
         thread_id.clone(),
         None,
         StreamStatus::Starting,
@@ -3470,7 +3818,7 @@ fn follow_thread_stream_if_active(
     spawn_thread_follow_task(target, thread_id, yolo, control_rx, stream_id, app_tx);
 }
 
-fn detail_follow_refresh_thread(state: &TuiState) -> Option<String> {
+fn detail_follow_refresh_thread(state: &TuiState) -> Option<(String, String)> {
     if !matches!(state.mode, Mode::Detail) || stream_is_running(state) {
         return None;
     }
@@ -3482,7 +3830,7 @@ fn detail_follow_refresh_thread(state: &TuiState) -> Option<String> {
         .last_refresh_at
         .is_none_or(|last| last.elapsed() >= Duration::from_secs(DETAIL_FOLLOW_REFRESH_SECS))
     {
-        Some(detail.thread_id.clone())
+        Some((detail.server.clone(), detail.thread_id.clone()))
     } else {
         None
     }
@@ -3512,13 +3860,22 @@ fn append_detail_message(
     }
 }
 
-fn preview_matches_thread(state: &TuiState, thread_id: &str) -> bool {
-    state.browser.preview.thread_id.as_deref() == Some(thread_id)
-        || (matches!(state.mode, Mode::Browser) && state.selected_thread_id() == Some(thread_id))
+fn preview_matches_thread(state: &TuiState, server: &str, thread_id: &str) -> bool {
+    (state.browser.preview.server.as_deref() == Some(server)
+        && state.browser.preview.thread_id.as_deref() == Some(thread_id))
+        || (matches!(state.mode, Mode::Browser)
+            && state.selected_thread_key().as_ref().is_some_and(
+                |(selected_server, selected_thread)| {
+                    selected_server == server && selected_thread == thread_id
+                },
+            ))
 }
 
-fn ensure_preview_thread(state: &mut TuiState, thread_id: &str) {
-    if state.browser.preview.thread_id.as_deref() != Some(thread_id) {
+fn ensure_preview_thread(state: &mut TuiState, server: &str, thread_id: &str) {
+    if state.browser.preview.server.as_deref() != Some(server)
+        || state.browser.preview.thread_id.as_deref() != Some(thread_id)
+    {
+        state.browser.preview.server = Some(server.to_string());
         state.browser.preview.thread_id = Some(thread_id.to_string());
         state.browser.preview.loading = false;
         state.browser.preview.messages.clear();
@@ -3528,16 +3885,17 @@ fn ensure_preview_thread(state: &mut TuiState, thread_id: &str) {
 
 fn append_preview_message(
     state: &mut TuiState,
+    server: &str,
     thread_id: &str,
     turn_id: Option<String>,
     role: &str,
     timestamp: Option<String>,
     text: &str,
 ) {
-    if !preview_matches_thread(state, thread_id) {
+    if !preview_matches_thread(state, server, thread_id) {
         return;
     }
-    ensure_preview_thread(state, thread_id);
+    ensure_preview_thread(state, server, thread_id);
     state
         .browser
         .preview
@@ -3545,10 +3903,13 @@ fn append_preview_message(
         .push(message_block(turn_id, None, role, timestamp, text, 100));
 }
 
-fn fill_pending_turn_id(state: &mut TuiState, turn_id: &str, prompt: Option<&str>) {
+fn fill_pending_turn_id(state: &mut TuiState, server: &str, turn_id: &str, prompt: Option<&str>) {
     let Some(detail) = &mut state.detail else {
         return;
     };
+    if detail.server != server {
+        return;
+    }
     for message in &mut detail.messages {
         if pending_message_matches(message, prompt) {
             message.turn_id = Some(turn_id.to_string());
@@ -3557,7 +3918,15 @@ fn fill_pending_turn_id(state: &mut TuiState, turn_id: &str, prompt: Option<&str
     }
 }
 
-fn fill_preview_pending_turn_id(state: &mut TuiState, turn_id: &str, prompt: Option<&str>) {
+fn fill_preview_pending_turn_id(
+    state: &mut TuiState,
+    server: &str,
+    turn_id: &str,
+    prompt: Option<&str>,
+) {
+    if state.browser.preview.server.as_deref() != Some(server) {
+        return;
+    }
     for message in &mut state.browser.preview.messages {
         if pending_message_matches(message, prompt) {
             message.turn_id = Some(turn_id.to_string());
@@ -3592,7 +3961,13 @@ fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
     let Some(thread_id) = thread["id"].as_str().or_else(|| event["threadId"].as_str()) else {
         return;
     };
-    if !preview_matches_thread(state, thread_id) || thread["turns"].as_array().is_none() {
+    let server = event["server"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| state.stream.as_ref().map(|stream| stream.server.clone()))
+        .or_else(|| active_server_for_thread(state, thread_id))
+        .unwrap_or_default();
+    if !preview_matches_thread(state, &server, thread_id) || thread["turns"].as_array().is_none() {
         return;
     }
     let output = json!({
@@ -3606,8 +3981,15 @@ fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
     let status_output = event["turnId"]
         .as_str()
         .map(|turn_id| json!({"activeTurnId": turn_id}));
-    let detail = detail_state(output, status_output, thread_id.to_string(), 0, None);
-    ensure_preview_thread(state, thread_id);
+    let detail = detail_state_for_server(
+        server.clone(),
+        output,
+        status_output,
+        thread_id.to_string(),
+        0,
+        None,
+    );
+    ensure_preview_thread(state, &server, thread_id);
     state.browser.preview.messages = detail.messages;
 }
 
@@ -3878,7 +4260,7 @@ fn upsert_streaming_assistant_message(
     let Some(detail) = &mut state.detail else {
         return;
     };
-    if detail.thread_id != stream.thread_id {
+    if detail.server != stream.server || detail.thread_id != stream.thread_id {
         return;
     }
     let was_at_bottom = detail.is_at_bottom();
@@ -3928,11 +4310,12 @@ fn upsert_preview_assistant_message(
     let Some(stream) = &state.stream else {
         return;
     };
-    if !preview_matches_thread(state, &stream.thread_id) {
+    if !preview_matches_thread(state, &stream.server, &stream.thread_id) {
         return;
     }
+    let server = stream.server.clone();
     let thread_id = stream.thread_id.clone();
-    ensure_preview_thread(state, &thread_id);
+    ensure_preview_thread(state, &server, &thread_id);
     let messages = &mut state.browser.preview.messages;
     let (message_index, display_text) =
         streaming_message_update_target(messages, turn_id.as_deref(), item_id.as_deref(), text);
@@ -4065,26 +4448,34 @@ fn active_thread_id(state: &TuiState) -> Option<String> {
     }
 }
 
-fn active_thread_cwd(state: &TuiState, thread_id: &str) -> Option<String> {
+fn active_thread_key(state: &TuiState) -> Option<(String, String)> {
+    match state.mode {
+        Mode::Detail => state
+            .detail
+            .as_ref()
+            .map(|detail| (detail.server.clone(), detail.thread_id.clone())),
+        _ => state.selected_thread_key(),
+    }
+}
+
+fn active_thread_cwd(state: &TuiState, server: &str, thread_id: &str) -> Option<String> {
     state
         .browser
         .rows
         .iter()
-        .find(|row| row.id == thread_id)
+        .find(|row| row.server == server && row.id == thread_id)
         .map(|row| row.cwd.clone())
         .filter(|cwd| !cwd.trim().is_empty())
 }
 
-fn selected_thread_is_running(state: &TuiState, thread_id: &str) -> bool {
-    state
-        .stream
-        .as_ref()
-        .is_some_and(|stream| stream.thread_id == thread_id && stream_is_running_status(stream))
-        || state
-            .browser
-            .rows
-            .get(state.browser.selected)
-            .is_some_and(|row| row.id == thread_id && row.is_running())
+fn selected_thread_is_running(state: &TuiState, server: &str, thread_id: &str) -> bool {
+    state.stream.as_ref().is_some_and(|stream| {
+        stream.server == server && stream.thread_id == thread_id && stream_is_running_status(stream)
+    }) || state
+        .browser
+        .rows
+        .get(state.browser.selected)
+        .is_some_and(|row| row.server == server && row.id == thread_id && row.is_running())
 }
 
 fn active_thread_is_archived(state: &TuiState) -> bool {
@@ -4135,14 +4526,14 @@ fn adjust_auto_refresh_interval(state: &mut TuiState, delta_seconds: i64) -> boo
     true
 }
 
-fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
+fn touch_browser_thread_updated(state: &mut TuiState, server: &str, thread_id: &str) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let updated = format_browser_updated_epoch(now, state.prefs.browser.relative_updated);
     for row in &mut state.browser.rows {
-        if row.id == thread_id {
+        if row.server == server && row.id == thread_id {
             row.updated = updated.clone();
             if let Some(raw_thread) = row.raw.get_mut("thread") {
                 raw_thread["updatedAt"] = json!(now);
@@ -4153,20 +4544,21 @@ fn touch_browser_thread_updated(state: &mut TuiState, thread_id: &str) {
     }
 }
 
-fn set_browser_thread_status(state: &mut TuiState, thread_id: &str, status: &str) {
+fn set_browser_thread_status(state: &mut TuiState, server: &str, thread_id: &str, status: &str) {
     for row in &mut state.browser.rows {
-        if row.id == thread_id {
+        if row.server == server && row.id == thread_id {
             row.set_status(status);
         }
     }
     if let Some(detail) = &mut state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
     {
         detail.status = status.to_string();
     }
 }
 
-fn apply_thread_load_status(state: &mut TuiState, thread_id: &str, status: &Value) {
+fn apply_thread_load_status(state: &mut TuiState, server: &str, thread_id: &str, status: &Value) {
     let thread = &status["thread"];
     let lifecycle = thread_status_label(thread);
     let title = thread["name"]
@@ -4178,7 +4570,7 @@ fn apply_thread_load_status(state: &mut TuiState, thread_id: &str, status: &Valu
         format_browser_updated_epoch(updated_at, state.prefs.browser.relative_updated)
     });
     for row in &mut state.browser.rows {
-        if row.id != thread_id {
+        if row.server != server || row.id != thread_id {
             continue;
         }
         if let Some(title) = &title {
@@ -4200,6 +4592,7 @@ fn apply_thread_load_status(state: &mut TuiState, thread_id: &str, status: &Valu
         row.set_status(lifecycle.clone());
     }
     if let Some(detail) = &mut state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
     {
         if let Some(title) = title {
@@ -4210,15 +4603,23 @@ fn apply_thread_load_status(state: &mut TuiState, thread_id: &str, status: &Valu
     }
 }
 
-fn reset_preview_for_thread(state: &mut TuiState, thread_id: &str) {
-    if state.browser.preview.thread_id.as_deref() == Some(thread_id) {
+fn reset_preview_for_thread(state: &mut TuiState, server: &str, thread_id: &str) {
+    if state.browser.preview.server.as_deref() == Some(server)
+        && state.browser.preview.thread_id.as_deref() == Some(thread_id)
+    {
         state.browser.preview = Default::default();
     }
 }
 
-fn set_thread_name_in_state(state: &mut TuiState, thread_id: &str, name: &str, thread: &Value) {
+fn set_thread_name_in_state(
+    state: &mut TuiState,
+    server: &str,
+    thread_id: &str,
+    name: &str,
+    thread: &Value,
+) {
     for row in &mut state.browser.rows {
-        if row.id == thread_id {
+        if row.server == server && row.id == thread_id {
             row.title = name.to_string();
             if !thread.is_null() {
                 if let Some(raw_thread) = row.raw.get_mut("thread") {
@@ -4230,20 +4631,27 @@ fn set_thread_name_in_state(state: &mut TuiState, thread_id: &str, name: &str, t
         }
     }
     if let Some(detail) = &mut state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
     {
         detail.title = name.to_string();
     }
 }
 
-fn apply_archive_change(state: &mut TuiState, thread_id: &str, archived: bool, thread: &Value) {
+fn apply_archive_change(
+    state: &mut TuiState,
+    server: &str,
+    thread_id: &str,
+    archived: bool,
+    thread: &Value,
+) {
     let status = if archived {
         "archived".to_string()
     } else {
         thread_status_label(thread)
     };
     for row in &mut state.browser.rows {
-        if row.id == thread_id {
+        if row.server == server && row.id == thread_id {
             row.status = status.clone();
             if !thread.is_null() {
                 row.raw = thread.clone();
@@ -4251,13 +4659,17 @@ fn apply_archive_change(state: &mut TuiState, thread_id: &str, archived: bool, t
         }
     }
     if state.browser.archived != archived {
-        state.browser.rows.retain(|row| row.id != thread_id);
+        state
+            .browser
+            .rows
+            .retain(|row| !(row.server == server && row.id == thread_id));
         state.browser.selected = state
             .browser
             .selected
             .min(state.browser.rows.len().saturating_sub(1));
     }
     if let Some(detail) = &mut state.detail
+        && detail.server == server
         && detail.thread_id == thread_id
     {
         detail.status = status;
@@ -4318,7 +4730,12 @@ fn normalize_detail_turns_for_display(output: &mut Value) {
     }
 }
 
-fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> ThreadRow {
+fn thread_row(
+    server: String,
+    item: Value,
+    source: BrowserSource,
+    relative_updated: bool,
+) -> ThreadRow {
     let thread = match source {
         BrowserSource::List => &item,
         BrowserSource::Search => item.get("thread").unwrap_or(&item),
@@ -4341,6 +4758,7 @@ fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> Thr
         BrowserSource::List => None,
     };
     ThreadRow {
+        server,
         id,
         title,
         status,
@@ -4352,6 +4770,14 @@ fn thread_row(item: Value, source: BrowserSource, relative_updated: bool) -> Thr
     }
 }
 
+fn thread_row_updated_epoch(row: &ThreadRow) -> i64 {
+    let thread = match row.raw.get("thread") {
+        Some(thread) => thread,
+        None => &row.raw,
+    };
+    thread["updatedAt"].as_i64().unwrap_or(0)
+}
+
 fn thread_status_label(thread: &Value) -> String {
     thread["status"]["type"]
         .as_str()
@@ -4360,7 +4786,8 @@ fn thread_status_label(thread: &Value) -> String {
         .to_string()
 }
 
-fn detail_state(
+fn detail_state_for_server(
+    server: String,
     output: Value,
     status_output: Option<Value>,
     thread_id: String,
@@ -4421,6 +4848,7 @@ fn detail_state(
         }
     }
     DetailState {
+        server,
         thread_id,
         title,
         status,
@@ -4446,6 +4874,24 @@ fn detail_state(
         viewport_width: None,
         last_error: None,
     }
+}
+
+#[cfg(test)]
+fn detail_state(
+    output: Value,
+    status_output: Option<Value>,
+    thread_id: String,
+    epoch: u64,
+    current_cursor: Option<String>,
+) -> DetailState {
+    detail_state_for_server(
+        "work".to_string(),
+        output,
+        status_output,
+        thread_id,
+        epoch,
+        current_cursor,
+    )
 }
 
 fn message_block(
@@ -4823,6 +5269,7 @@ mod tests {
         status: StreamStatus,
     ) -> AppEvent {
         AppEvent::StreamFinished {
+            server: "work".to_string(),
             stream_id,
             thread_id: thread_id.to_string(),
             turn_id: turn_id.map(str::to_string),
@@ -4837,6 +5284,7 @@ mod tests {
         error: &str,
     ) -> AppEvent {
         AppEvent::StreamFailed {
+            server: "work".to_string(),
             stream_id: Some(stream_id),
             thread_id: thread_id.to_string(),
             turn_id: turn_id.map(str::to_string),
@@ -4853,6 +5301,10 @@ mod tests {
             model: None,
             model_reasoning_effort: None,
         }
+    }
+
+    fn test_targets() -> TuiTargets {
+        TuiTargets::new(vec![test_target()]).expect("test targets")
     }
 
     #[test]
@@ -4888,6 +5340,7 @@ mod tests {
         state.set_browser_rows(
             1,
             vec![ThreadRow {
+                server: "work".to_string(),
                 id: "old".to_string(),
                 title: "old".to_string(),
                 status: String::new(),
@@ -4946,6 +5399,7 @@ mod tests {
         state.set_browser_rows(
             1,
             vec![ThreadRow {
+                server: "work".to_string(),
                 id: "current".to_string(),
                 title: "current".to_string(),
                 status: String::new(),
@@ -4977,7 +5431,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
-        set_browser_thread_status(&mut state, "t1", "idle");
+        set_browser_thread_status(&mut state, "work", "t1", "idle");
         state.browser.epoch = 1;
 
         state.set_browser_rows(
@@ -4992,6 +5446,103 @@ mod tests {
         assert_eq!(
             state.browser.rows[0].raw["status"]["type"].as_str(),
             Some("idle")
+        );
+    }
+
+    #[test]
+    fn thread_status_updates_are_isolated_by_server_and_thread_id() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut work = test_thread_row("shared", "idle");
+        work.server = "work".to_string();
+        work.raw = serde_json::json!({"id": "shared", "status": {"type": "idle"}});
+        let mut main = test_thread_row("shared", "idle");
+        main.server = "main".to_string();
+        main.raw = serde_json::json!({"id": "shared", "status": {"type": "idle"}});
+        state.browser.rows = vec![work, main];
+
+        set_browser_thread_status(&mut state, "main", "shared", "active");
+
+        assert_eq!(state.browser.rows[0].status, "idle");
+        assert_eq!(state.browser.rows[1].status, "active");
+        assert_eq!(
+            state.browser.rows[0].raw["status"]["type"].as_str(),
+            Some("idle")
+        );
+        assert_eq!(
+            state.browser.rows[1].raw["status"]["type"].as_str(),
+            Some("active")
+        );
+    }
+
+    #[test]
+    fn browser_refresh_preserves_selection_by_server_and_thread_id() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut work = test_thread_row("shared", "idle");
+        work.server = "work".to_string();
+        let mut main = test_thread_row("shared", "idle");
+        main.server = "main".to_string();
+        state.browser.rows = vec![work.clone(), main.clone()];
+        state.browser.selected = 1;
+        state.browser.epoch = 1;
+
+        state.set_browser_rows(1, vec![work, main], None, None, None);
+
+        assert_eq!(state.browser.rows[state.browser.selected].server, "main");
+        assert_eq!(state.browser.rows[state.browser.selected].id, "shared");
+    }
+
+    #[test]
+    fn browser_mode_server_resolution_prefers_selected_row_over_stale_detail() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut work = test_thread_row("shared", "idle");
+        work.server = "work".to_string();
+        let mut main = test_thread_row("shared", "idle");
+        main.server = "main".to_string();
+        state.browser.rows = vec![work, main];
+        state.browser.selected = 1;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "shared", "name": "Shared", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": []}
+            }),
+            None,
+            "shared".to_string(),
+            1,
+            None,
+        ));
+        state.detail.as_mut().unwrap().server = "work".to_string();
+        state.mode = Mode::Browser;
+
+        assert_eq!(
+            active_server_for_thread(&state, "shared").as_deref(),
+            Some("main")
         );
     }
 
@@ -5241,6 +5792,7 @@ mod tests {
 
         handle_app_event(
             AppEvent::PreviewLoaded {
+                server: "work".to_string(),
                 epoch: 0,
                 thread_id: "t1".to_string(),
                 messages: vec![message_block(None, None, "assistant", None, "stale", 100)],
@@ -5251,6 +5803,7 @@ mod tests {
 
         handle_app_event(
             AppEvent::PreviewLoaded {
+                server: "work".to_string(),
                 epoch: 1,
                 thread_id: "t1".to_string(),
                 messages: vec![message_block(None, None, "assistant", None, "fresh", 100)],
@@ -5532,6 +6085,7 @@ mod tests {
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {
+                    server: "work".to_string(),
                     thread_id: "t1".to_string(),
                 },
                 text: "test 2".to_string(),
@@ -5592,6 +6146,7 @@ mod tests {
             &mut state,
             ComposeState {
                 target: ComposeTarget::Steer {
+                    server: "work".to_string(),
                     thread_id: "t1".to_string(),
                     turn_id: "turn-1".to_string(),
                 },
@@ -5798,8 +6353,8 @@ mod tests {
 
         let finished = stream_finished(7, "t1", Some("turn-1"), StreamStatus::Completed);
         assert_eq!(
-            stream_finish_follow_thread(&finished, &state).as_deref(),
-            Some("t1")
+            stream_finish_follow_thread(&finished, &state),
+            Some(("work".to_string(), "t1".to_string()))
         );
         handle_app_event(finished, &mut state);
         let stream_id = state.allocate_stream_id();
@@ -5817,6 +6372,7 @@ mod tests {
 
         handle_app_event(
             AppEvent::StreamIdle {
+                server: "work".to_string(),
                 stream_id,
                 thread_id: "t1".to_string(),
             },
@@ -6291,7 +6847,10 @@ mod tests {
             &mut state,
         );
         state.move_selection(1);
-        detach_stream_if_browser_selection_changed(&mut state, Some("t1".to_string()));
+        detach_stream_if_browser_selection_changed(
+            &mut state,
+            Some(("work".to_string(), "t1".to_string())),
+        );
         assert!(state.stream.is_none());
 
         state.move_selection(-1);
@@ -6393,7 +6952,10 @@ mod tests {
         state.detail.as_mut().unwrap().last_refresh_at =
             Some(std::time::Instant::now() - Duration::from_secs(DETAIL_FOLLOW_REFRESH_SECS));
 
-        assert_eq!(detail_follow_refresh_thread(&state).as_deref(), Some("t1"));
+        assert_eq!(
+            detail_follow_refresh_thread(&state),
+            Some(("work".to_string(), "t1".to_string()))
+        );
 
         state.stream = Some(StreamState::new(
             "t1".to_string(),
@@ -6451,6 +7013,7 @@ mod tests {
             cursor,
             limit,
             page_direction,
+            ..
         } = request
         else {
             panic!("expected detail request");
@@ -6464,7 +7027,7 @@ mod tests {
 
     #[tokio::test]
     async fn detail_gg_loads_older_pages_before_jumping_to_real_start() {
-        let target = test_target();
+        let _target = test_target();
         let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
         let (app_tx, _app_rx) = mpsc::unbounded_channel();
         let mut state = TuiState::new(TuiInit {
@@ -6496,7 +7059,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -6509,7 +7072,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -6568,7 +7131,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrolling_up_at_detail_top_schedules_older_page() {
-        let target = test_target();
+        let _target = test_target();
         let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
         let (app_tx, _app_rx) = mpsc::unbounded_channel();
         let mut state = TuiState::new(TuiInit {
@@ -6600,7 +7163,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -6626,7 +7189,7 @@ mod tests {
 
     #[tokio::test]
     async fn shifted_lowercase_g_jumps_to_real_end() {
-        let target = test_target();
+        let _target = test_target();
         let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
         let (app_tx, _app_rx) = mpsc::unbounded_channel();
         let mut state = TuiState::new(TuiInit {
@@ -6658,7 +7221,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SHIFT)),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -6736,6 +7299,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "t1".to_string(),
             title: "t1".to_string(),
             status: "loading".to_string(),
@@ -6849,6 +7413,7 @@ mod tests {
         });
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn {
+                server: "work".to_string(),
                 thread_id: "t1".to_string(),
             },
             text: "draft in progress".to_string(),
@@ -6902,6 +7467,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::AnnotationInput {
+            server: "work".to_string(),
             thread_id: "t1".to_string(),
             draft: "annotation draft".to_string(),
             return_to_detail: true,
@@ -6964,7 +7530,7 @@ mod tests {
             None,
         ));
 
-        open_message_action(&mut state, "t1".to_string());
+        open_message_action(&mut state, "work".to_string(), "t1".to_string());
 
         assert!(matches!(
             state.mode,
@@ -6972,6 +7538,7 @@ mod tests {
                 target: ComposeTarget::Steer {
                     ref thread_id,
                     ref turn_id,
+                    ..
                 },
                 send_mode: SendMode::Stream,
                 return_to_detail: true,
@@ -6981,12 +7548,12 @@ mod tests {
 
         state.mode = Mode::Detail;
         state.detail.as_mut().unwrap().active_turn_id = None;
-        open_message_action(&mut state, "t1".to_string());
+        open_message_action(&mut state, "work".to_string(), "t1".to_string());
 
         assert!(matches!(
             state.mode,
             Mode::Compose(ComposeState {
-                target: ComposeTarget::NewTurn { ref thread_id },
+                target: ComposeTarget::NewTurn { ref thread_id, .. },
                 send_mode: SendMode::Stream,
                 return_to_detail: true,
                 ..
@@ -7256,6 +7823,7 @@ mod tests {
             prefs,
         });
         state.browser.rows = vec![test_thread_row("t1", "active")];
+        state.browser.preview.server = Some("work".to_string());
         state.browser.preview.thread_id = Some("t1".to_string());
 
         handle_app_event(
@@ -7367,6 +7935,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows.push(ThreadRow {
+            server: "work".to_string(),
             id: "t1".to_string(),
             title: "Thread".to_string(),
             status: String::new(),
@@ -7387,13 +7956,13 @@ mod tests {
             None,
         ));
 
-        set_annotation_in_state(&mut state, "t1", Some("note".to_string()));
+        set_annotation_in_state(&mut state, "work", "t1", Some("note".to_string()));
         assert_eq!(state.browser.rows[0].annotation.as_deref(), Some("note"));
         assert_eq!(
             state.detail.as_ref().unwrap().annotation.as_deref(),
             Some("note")
         );
-        set_annotation_in_state(&mut state, "t1", None);
+        set_annotation_in_state(&mut state, "work", "t1", None);
         assert!(state.browser.rows[0].annotation.is_none());
         assert!(state.detail.as_ref().unwrap().annotation.is_none());
     }
@@ -7461,6 +8030,7 @@ mod tests {
 
         set_thread_name_in_state(
             &mut state,
+            "work",
             "t1",
             "New name",
             &serde_json::json!({"id": "t1", "name": "New name"}),
@@ -7638,7 +8208,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_shortcut_schedules_selected_browser_thread_load() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -7663,7 +8233,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -7671,7 +8241,7 @@ mod tests {
         .await
         .unwrap();
 
-        let FetchRequest::LoadThread { thread_id } = fetch_rx.recv().await.unwrap() else {
+        let FetchRequest::LoadThread { thread_id, .. } = fetch_rx.recv().await.unwrap() else {
             panic!("expected load thread request");
         };
         assert_eq!(thread_id, "t1");
@@ -7687,7 +8257,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_shortcut_schedules_open_detail_thread_load() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -7722,7 +8292,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -7730,7 +8300,7 @@ mod tests {
         .await
         .unwrap();
 
-        let FetchRequest::LoadThread { thread_id } = fetch_rx.recv().await.unwrap() else {
+        let FetchRequest::LoadThread { thread_id, .. } = fetch_rx.recv().await.unwrap() else {
             panic!("expected load thread request");
         };
         assert_eq!(thread_id, "t1");
@@ -7750,6 +8320,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows = vec![test_thread_row("t1", "notLoaded")];
+        state.browser.preview.server = Some("work".to_string());
         state.browser.preview.thread_id = Some("t1".to_string());
         state.browser.preview.messages = vec![message_block(
             Some("turn-old".to_string()),
@@ -7772,6 +8343,7 @@ mod tests {
 
         handle_app_event(
             AppEvent::ThreadLoaded {
+                server: "work".to_string(),
                 thread_id: "t1".to_string(),
                 status: serde_json::json!({
                     "threadId": "t1",
@@ -7829,6 +8401,7 @@ mod tests {
 
         apply_archive_change(
             &mut state,
+            "work",
             "t1",
             true,
             &serde_json::json!({"id": "t1", "status": {"type": "archived"}}),
@@ -7867,6 +8440,7 @@ mod tests {
 
         apply_archive_change(
             &mut state,
+            "work",
             "t1",
             false,
             &serde_json::json!({"id": "t1", "status": {"type": "idle"}}),
@@ -7876,7 +8450,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_shortcut_opens_confirmation_before_rpc() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -7901,7 +8475,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -7915,6 +8489,7 @@ mod tests {
                 ref thread_id,
                 archived: true,
                 return_to_detail: false,
+                ..
             } if thread_id == "t1"
         ));
         assert!(app_rx.try_recv().is_err());
@@ -7922,7 +8497,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -7936,7 +8511,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_codex_shortcut_opens_confirmation_with_thread_cwd() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -7963,7 +8538,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -7977,6 +8552,7 @@ mod tests {
                 ref thread_id,
                 ref cwd,
                 return_to_detail: false,
+                ..
             } if thread_id == "t1" && cwd == "/tmp/project"
         ));
         assert!(app_rx.try_recv().is_err());
@@ -8065,7 +8641,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_confirmation_preserves_detail_return_mode() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8100,7 +8676,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -8114,13 +8690,14 @@ mod tests {
                 ref thread_id,
                 archived: false,
                 return_to_detail: true,
+                ..
             } if thread_id == "t1"
         ));
     }
 
     #[tokio::test]
     async fn browser_message_action_targets_selected_active_thread_as_steer() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8145,7 +8722,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -8156,7 +8733,7 @@ mod tests {
         assert!(matches!(
             state.mode,
             Mode::Compose(ComposeState {
-                target: ComposeTarget::SteerSelected { ref thread_id },
+                target: ComposeTarget::SteerSelected { ref thread_id, .. },
                 send_mode: SendMode::Stream,
                 return_to_detail: false,
                 ..
@@ -8166,7 +8743,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_compose_tab_switches_between_steer_and_send() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8187,13 +8764,13 @@ mod tests {
         state.browser.rows = vec![test_thread_row("t1", "active")];
         let (app_tx, _app_rx) = mpsc::unbounded_channel();
 
-        open_message_action(&mut state, "t1".to_string());
+        open_message_action(&mut state, "work".to_string(), "t1".to_string());
         let Mode::Compose(compose) = &state.mode else {
             panic!("expected compose mode");
         };
         assert!(matches!(
             compose.target,
-            ComposeTarget::SteerSelected { ref thread_id } if thread_id == "t1"
+            ComposeTarget::SteerSelected { ref thread_id, .. } if thread_id == "t1"
         ));
         let compose = compose.clone();
 
@@ -8201,7 +8778,7 @@ mod tests {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &mut state,
             compose,
-            &target,
+            &test_target(),
             false,
             &app_tx,
         )
@@ -8212,7 +8789,7 @@ mod tests {
         };
         assert!(matches!(
             compose.target,
-            ComposeTarget::NewTurn { ref thread_id } if thread_id == "t1"
+            ComposeTarget::NewTurn { ref thread_id, .. } if thread_id == "t1"
         ));
         let compose = compose.clone();
 
@@ -8220,7 +8797,7 @@ mod tests {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &mut state,
             compose,
-            &target,
+            &test_target(),
             false,
             &app_tx,
         )
@@ -8231,13 +8808,13 @@ mod tests {
         };
         assert!(matches!(
             compose.target,
-            ComposeTarget::SteerSelected { ref thread_id } if thread_id == "t1"
+            ComposeTarget::SteerSelected { ref thread_id, .. } if thread_id == "t1"
         ));
     }
 
     #[tokio::test]
     async fn browser_interrupt_shortcut_returns_to_browser() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8262,7 +8839,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -8276,13 +8853,14 @@ mod tests {
                 ref thread_id,
                 turn_id: None,
                 return_to_detail: false,
+                ..
             } if thread_id == "t1"
         ));
 
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -8295,7 +8873,7 @@ mod tests {
 
     #[tokio::test]
     async fn detail_interrupt_shortcut_returns_to_detail() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8330,7 +8908,7 @@ mod tests {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -8344,13 +8922,14 @@ mod tests {
                 ref thread_id,
                 turn_id: Some(ref turn_id),
                 return_to_detail: true,
+                ..
             } if thread_id == "t1" && turn_id == "turn-1"
         ));
 
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
             &mut state,
-            &target,
+            &test_targets(),
             false,
             &fetch_tx,
             &app_tx,
@@ -8375,6 +8954,7 @@ mod tests {
         });
         for index in 0..5 {
             state.browser.rows.push(ThreadRow {
+                server: "work".to_string(),
                 id: format!("t{index}"),
                 title: format!("Thread {index}"),
                 status: String::new(),
@@ -8418,7 +8998,10 @@ mod tests {
         state.stream_control = Some(control_tx);
 
         state.move_selection(1);
-        detach_stream_if_browser_selection_changed(&mut state, Some("t1".to_string()));
+        detach_stream_if_browser_selection_changed(
+            &mut state,
+            Some(("work".to_string(), "t1".to_string())),
+        );
 
         assert!(state.stream.is_none());
         assert!(matches!(control_rx.try_recv(), Ok(TurnControl::Detach)));
@@ -8472,6 +9055,7 @@ mod tests {
         });
         for index in 0..4 {
             state.browser.rows.push(ThreadRow {
+                server: "work".to_string(),
                 id: format!("t{index}"),
                 title: format!("Thread {index}"),
                 status: String::new(),
@@ -8537,7 +9121,7 @@ mod tests {
 
     #[tokio::test]
     async fn compose_enter_submits_and_ctrl_j_inserts_newline() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8562,13 +9146,14 @@ mod tests {
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {
+                    server: "work".to_string(),
                     thread_id: "t1".to_string(),
                 },
                 text: "hello".to_string(),
                 send_mode: SendMode::NoWait,
                 return_to_detail: false,
             },
-            &target,
+            &test_target(),
             true,
             &app_tx,
         )
@@ -8584,13 +9169,14 @@ mod tests {
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {
+                    server: "work".to_string(),
                     thread_id: "t1".to_string(),
                 },
                 text: "send me".to_string(),
                 send_mode: SendMode::NoWait,
                 return_to_detail: false,
             },
-            &target,
+            &test_target(),
             true,
             &app_tx,
         )
@@ -8602,7 +9188,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_compose_origin_ignores_loaded_detail() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8638,13 +9224,14 @@ mod tests {
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {
+                    server: "work".to_string(),
                     thread_id: "new".to_string(),
                 },
                 text: "send me".to_string(),
                 send_mode: SendMode::NoWait,
                 return_to_detail: false,
             },
-            &target,
+            &test_target(),
             true,
             &app_tx,
         )
@@ -8657,7 +9244,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_stream_compose_sets_stream_and_preview_draft() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8684,13 +9271,14 @@ mod tests {
             &mut state,
             ComposeState {
                 target: ComposeTarget::NewTurn {
+                    server: "work".to_string(),
                     thread_id: "t1".to_string(),
                 },
                 text: "send me".to_string(),
                 send_mode: SendMode::Stream,
                 return_to_detail: false,
             },
-            &target,
+            &test_target(),
             true,
             &app_tx,
         )
@@ -8712,7 +9300,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_compose_defaults_stream_and_tab_toggles_no_wait() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8732,7 +9320,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
 
-        open_message_action(&mut state, "t1".to_string());
+        open_message_action(&mut state, "work".to_string(), "t1".to_string());
 
         let Mode::Compose(compose) = &state.mode else {
             panic!("expected compose mode");
@@ -8745,7 +9333,7 @@ mod tests {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &mut state,
             compose,
-            &target,
+            &test_target(),
             true,
             &app_tx,
         )
@@ -8775,6 +9363,7 @@ mod tests {
             rows: vec![test_thread_row("active-thread", "active")],
             next_cursor: None,
             backwards_cursor: None,
+            warning: None,
         };
         assert!(initial_browser_load_needs_auto_attach(&event, &state));
 
@@ -8785,7 +9374,7 @@ mod tests {
 
     #[tokio::test]
     async fn initial_active_browser_selection_auto_attaches() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8806,7 +9395,7 @@ mod tests {
         });
         state.browser.rows = vec![test_thread_row("active-thread", "active")];
 
-        auto_attach_selected_browser_thread_if_active(&mut state, target, true, app_tx);
+        auto_attach_selected_browser_thread_if_active(&mut state, test_targets(), true, app_tx);
 
         let stream = state.stream.as_ref().expect("stream");
         assert_eq!(stream.thread_id, "active-thread");
@@ -8817,7 +9406,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_active_detail_auto_attaches() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8848,7 +9437,7 @@ mod tests {
             None,
         ));
 
-        auto_attach_open_detail_thread_if_active(&mut state, target, true, app_tx);
+        auto_attach_open_detail_thread_if_active(&mut state, test_targets(), true, app_tx);
 
         let stream = state.stream.as_ref().expect("stream");
         assert_eq!(stream.thread_id, "active-thread");
@@ -8860,7 +9449,7 @@ mod tests {
 
     #[test]
     fn opening_idle_detail_does_not_auto_attach() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8891,7 +9480,7 @@ mod tests {
             None,
         ));
 
-        auto_attach_open_detail_thread_if_active(&mut state, target, true, app_tx);
+        auto_attach_open_detail_thread_if_active(&mut state, test_targets(), true, app_tx);
 
         assert!(state.stream.is_none());
         assert!(state.stream_control.is_none());
@@ -8910,6 +9499,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows = vec![ThreadRow {
+            server: "work".to_string(),
             id: "t1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -8920,7 +9510,7 @@ mod tests {
             raw: serde_json::json!({"id": "t1", "updatedAt": 1}),
         }];
 
-        touch_browser_thread_updated(&mut state, "t1");
+        touch_browser_thread_updated(&mut state, "work", "t1");
 
         assert_ne!(state.browser.rows[0].updated, "old");
         assert!(
@@ -8933,7 +9523,7 @@ mod tests {
 
     #[tokio::test]
     async fn detail_compose_can_toggle_stream_mode() {
-        let target = Target {
+        let _target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
                 path: "/tmp/missing.sock".into(),
@@ -8964,7 +9554,7 @@ mod tests {
             None,
         ));
 
-        open_message_action(&mut state, "t1".to_string());
+        open_message_action(&mut state, "work".to_string(), "t1".to_string());
 
         let Mode::Compose(compose) = &state.mode else {
             panic!("expected compose mode");
@@ -8977,7 +9567,7 @@ mod tests {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &mut state,
             compose,
-            &target,
+            &test_target(),
             true,
             &app_tx,
         )
@@ -9018,6 +9608,7 @@ mod tests {
 
     fn test_thread_row(id: &str, status: &str) -> ThreadRow {
         ThreadRow {
+            server: "work".to_string(),
             id: id.to_string(),
             title: id.to_string(),
             status: status.to_string(),

@@ -202,6 +202,11 @@ codex-threads tui --since 24h --cwd "$PWD"
 codex-threads tui --query "release process" --limit 20
 ```
 
+By default, `codex-threads tui` opens all configured servers and shows a
+`SERVER` column when more than one target is visible. Use `--server ALIAS` or
+`CODEX_THREADS_SERVER` to narrow the TUI to one server. `--connect` remains a
+single direct target.
+
 Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `?` for keyboard help, `/` to search threads or loaded transcript messages,
@@ -280,6 +285,12 @@ Server target precedence for commands that target one app-server:
 `server` value in JSON output. It is mutually exclusive with `--server` and
 `CODEX_THREADS_SERVER`.
 
+The TUI is the exception to single-target defaulting: without `--server`,
+`CODEX_THREADS_SERVER`, or `--connect`, it opens every configured server and
+uses the server column to disambiguate rows. Browser paging cursors remain
+per-server, so the merged all-server browser starts with one page from each
+server; narrow with `--server` when you need cursor paging on one target.
+
 Configured servers use a single endpoint string:
 
 ```toml
@@ -357,7 +368,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
-| `tui` | Launch the interactive browser with `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
+| `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |

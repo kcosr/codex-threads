@@ -21,26 +21,31 @@ pub enum Mode {
     SortMenu,
     ColumnsMenu,
     ConfirmInterrupt {
+        server: String,
         thread_id: String,
         turn_id: Option<String>,
         return_to_detail: bool,
     },
     ConfirmArchive {
+        server: String,
         thread_id: String,
         archived: bool,
         return_to_detail: bool,
     },
     ConfirmOpenCodex {
+        server: String,
         thread_id: String,
         cwd: String,
         return_to_detail: bool,
     },
     AnnotationInput {
+        server: String,
         thread_id: String,
         draft: String,
         return_to_detail: bool,
     },
     RenameInput {
+        server: String,
         thread_id: String,
         draft: String,
         return_to_detail: bool,
@@ -57,6 +62,7 @@ pub enum BrowserSource {
 
 #[derive(Debug, Clone)]
 pub struct BrowserState {
+    pub multi_server: bool,
     pub source: BrowserSource,
     pub query: String,
     pub rows: Vec<ThreadRow>,
@@ -82,6 +88,7 @@ pub struct BrowserState {
 #[derive(Debug, Clone, Default)]
 pub struct BrowserPreviewState {
     pub epoch: u64,
+    pub server: Option<String>,
     pub thread_id: Option<String>,
     pub loading: bool,
     pub messages: Vec<MessageBlock>,
@@ -90,6 +97,7 @@ pub struct BrowserPreviewState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRow {
+    pub server: String,
     pub id: String,
     pub title: String,
     pub status: String,
@@ -102,6 +110,7 @@ pub struct ThreadRow {
 
 #[derive(Debug, Clone)]
 pub struct DetailState {
+    pub server: String,
     pub thread_id: String,
     pub title: String,
     pub status: String,
@@ -172,9 +181,19 @@ pub struct ComposeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeTarget {
-    NewTurn { thread_id: String },
-    Steer { thread_id: String, turn_id: String },
-    SteerSelected { thread_id: String },
+    NewTurn {
+        server: String,
+        thread_id: String,
+    },
+    Steer {
+        server: String,
+        thread_id: String,
+        turn_id: String,
+    },
+    SteerSelected {
+        server: String,
+        thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +205,7 @@ pub enum SendMode {
 #[derive(Debug, Clone)]
 pub struct StreamState {
     pub id: u64,
+    pub server: String,
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub status: StreamStatus,
@@ -216,6 +236,7 @@ impl StreamState {
         Self::new_with_id(0, thread_id, turn_id, status, attached)
     }
 
+    #[cfg(test)]
     pub fn new_with_id(
         id: u64,
         thread_id: String,
@@ -223,8 +244,20 @@ impl StreamState {
         status: StreamStatus,
         attached: bool,
     ) -> Self {
+        Self::new_for_server_with_id(id, "work".to_string(), thread_id, turn_id, status, attached)
+    }
+
+    pub fn new_for_server_with_id(
+        id: u64,
+        server: String,
+        thread_id: String,
+        turn_id: Option<String>,
+        status: StreamStatus,
+        attached: bool,
+    ) -> Self {
         Self {
             id,
+            server,
             thread_id,
             turn_id,
             status,
@@ -301,6 +334,7 @@ impl TuiState {
         Self {
             mode: Mode::Browser,
             browser: BrowserState {
+                multi_server: false,
                 source,
                 query,
                 rows: Vec::new(),
@@ -368,6 +402,13 @@ impl TuiState {
             .map(|row| row.id.as_str())
     }
 
+    pub fn selected_thread_key(&self) -> Option<(String, String)> {
+        self.browser
+            .rows
+            .get(self.browser.selected)
+            .map(|row| (row.server.clone(), row.id.clone()))
+    }
+
     pub fn selected_thread_annotation(&self) -> Option<&str> {
         self.browser
             .rows
@@ -386,8 +427,9 @@ impl TuiState {
         self.browser.selected = next as usize;
     }
 
-    pub fn set_preview_loading(&mut self, thread_id: String) -> u64 {
+    pub fn set_preview_loading(&mut self, server: String, thread_id: String) -> u64 {
         self.browser.preview.epoch += 1;
+        self.browser.preview.server = Some(server);
         self.browser.preview.thread_id = Some(thread_id);
         self.browser.preview.loading = true;
         self.browser.preview.messages.clear();
@@ -398,10 +440,12 @@ impl TuiState {
     pub fn set_preview_loaded(
         &mut self,
         epoch: u64,
+        server: String,
         thread_id: String,
         mut messages: Vec<MessageBlock>,
     ) {
         if self.browser.preview.epoch != epoch
+            || self.browser.preview.server.as_deref() != Some(server.as_str())
             || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
         {
             return;
@@ -412,8 +456,15 @@ impl TuiState {
         self.browser.preview.error = None;
     }
 
-    pub fn set_preview_error(&mut self, epoch: u64, thread_id: String, error: String) {
+    pub fn set_preview_error(
+        &mut self,
+        epoch: u64,
+        server: String,
+        thread_id: String,
+        error: String,
+    ) {
         if self.browser.preview.epoch != epoch
+            || self.browser.preview.server.as_deref() != Some(server.as_str())
             || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
         {
             return;
@@ -433,7 +484,7 @@ impl TuiState {
         if epoch != self.browser.epoch {
             return;
         }
-        let previous_id = self.selected_thread_id().map(str::to_string);
+        let previous_key = self.selected_thread_key();
         let previous_rows = self.browser.rows.clone();
         let rows = rows
             .into_iter()
@@ -446,8 +497,13 @@ impl TuiState {
         self.browser.loading = false;
         self.browser.last_refresh_at = Some(Instant::now());
         self.browser.last_error = None;
-        self.browser.selected = previous_id
-            .and_then(|id| self.browser.rows.iter().position(|row| row.id == id))
+        self.browser.selected = previous_key
+            .and_then(|(server, id)| {
+                self.browser
+                    .rows
+                    .iter()
+                    .position(|row| row.server == server && row.id == id)
+            })
             .unwrap_or(0)
             .min(self.browser.rows.len().saturating_sub(1));
     }
@@ -676,7 +732,10 @@ fn preserve_known_status(mut row: ThreadRow, previous_rows: &[ThreadRow]) -> Thr
     if !row.status.eq_ignore_ascii_case("notLoaded") {
         return row;
     }
-    let Some(previous) = previous_rows.iter().find(|previous| previous.id == row.id) else {
+    let Some(previous) = previous_rows
+        .iter()
+        .find(|previous| previous.server == row.server && previous.id == row.id)
+    else {
         return row;
     };
     if previous.status.is_empty() || previous.status.eq_ignore_ascii_case("notLoaded") {

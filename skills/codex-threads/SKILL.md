@@ -85,6 +85,11 @@ codex-threads tui --since 24h --cwd "$PWD"
 codex-threads tui --query "release process" --limit 20
 ```
 
+By default, the TUI opens all configured servers and shows a `SERVER` column
+when more than one target is visible. Use `--server ALIAS` or
+`CODEX_THREADS_SERVER` to narrow the TUI to one server; `--connect` remains a
+single direct target.
+
 The TUI accepts the same initial discovery filters as `list`/`search`: `--query`,
 `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc`.
 Do not use it for machine-readable automation; use the CLI `--json` commands

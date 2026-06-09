@@ -14,6 +14,8 @@ use crate::cli::*;
 use crate::completion::{
     completion_candidates, completion_instructions, completion_script, normalize_shell,
 };
+#[cfg(feature = "tui")]
+use crate::config::resolve_tui_targets;
 use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
     resolve_config_path, resolve_direct_target, resolve_target,
@@ -142,14 +144,14 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         #[cfg(feature = "tui")]
         Command::Tui(command) => {
-            let target = resolve_target_for_command(
+            let targets = resolve_tui_targets_for_command(
                 &config,
                 cli.connect.as_deref(),
                 cli.connect_auth_token_env.as_deref(),
                 cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
             )?;
-            crate::tui::run_tui(target, command, yolo).await
+            crate::tui::run_tui(targets, command, yolo).await
         }
         Command::Messages(command) => {
             with_client(
@@ -422,6 +424,35 @@ fn resolve_target_for_command(
         ));
     }
     resolve_target(config, server.as_deref())
+}
+
+#[cfg(feature = "tui")]
+fn resolve_tui_targets_for_command(
+    config: &AppConfig,
+    connect: Option<&str>,
+    connect_auth_token_env: Option<&str>,
+    connect_auth_token: Option<&str>,
+    server: Option<String>,
+) -> Result<Vec<Target>> {
+    if let Some(endpoint) = connect {
+        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
+            return Err(usage_error(
+                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+            ));
+        }
+        return Ok(vec![resolve_direct_target(
+            endpoint,
+            connect_auth_token_env,
+            connect_auth_token,
+        )?]);
+    }
+
+    if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+        return Err(usage_error(
+            "--connect-auth-token and --connect-auth-token-env require --connect",
+        ));
+    }
+    resolve_tui_targets(config, server.as_deref())
 }
 
 async fn with_client<F, Fut>(
