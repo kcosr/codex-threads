@@ -1006,6 +1006,60 @@ fn tui_detail_loads_older_history_above_transcript() {
 
 #[test]
 #[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_detail_refresh_reuses_fetch_rpc_client() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"j");
+    tui.write(b"\r");
+    tui.wait_for_all(&["Transcript", "beta opening prompt", "beta opening response"]);
+
+    let initializations = server.method_count("initialize");
+    let before_refreshes = server.method_count("thread/turns/list");
+    tui.write(b"r");
+    server.wait_for_method_count("thread/turns/list", before_refreshes + 1);
+    tui.write(b"r");
+    server.wait_for_method_count("thread/turns/list", before_refreshes + 2);
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("initialize"),
+        initializations,
+        "detail refreshes should reuse the fetch worker RPC client"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_preview_reuses_preview_rpc_client() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task", "Long history"]);
+    let before_previews = server.method_count("thread/turns/list");
+    tui.write(b"j");
+    server.wait_for_method_count("thread/turns/list", before_previews + 1);
+    let initializations = server.method_count("initialize");
+    tui.write(b"j");
+    server.wait_for_method_count("thread/turns/list", before_previews + 2);
+    tui.write(b"k");
+    server.wait_for_method_count("thread/turns/list", before_previews + 3);
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("initialize"),
+        initializations,
+        "preview selection changes should reuse the preview worker RPC client"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
 fn tui_browser_attach_detaches_when_switching_sessions() {
     let server = TuiMockServer::start();
     let state_dir = TempDir::new().expect("state dir");

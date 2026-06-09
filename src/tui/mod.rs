@@ -36,7 +36,7 @@ use crate::annotations::{clear_annotation, set_annotation};
 use crate::cli::{ItemsView, SortKey, TuiCommand};
 use crate::config::{Endpoint, Target};
 use crate::errors::usage_error;
-use crate::rpc::RpcClient;
+use crate::rpc::{RpcClient, RpcRequestError};
 use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStatusRequest, list_threads,
     read_thread_detail, search_threads, set_thread_archived, set_thread_name, thread_status,
@@ -436,10 +436,11 @@ async fn fetch_worker(
     mut fetch_rx: mpsc::Receiver<FetchRequest>,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let mut clients = RpcClientCache::default();
     while let Some(request) = fetch_rx.recv().await {
         match request {
             FetchRequest::Browser { epoch, query } => {
-                let result = fetch_browser_all(&targets, query).await;
+                let result = fetch_browser_all(&targets, &mut clients, query).await;
                 match result {
                     Ok((rows, next_cursor, backwards_cursor, warning)) => {
                         let _ = app_tx.send(AppEvent::BrowserLoaded {
@@ -466,11 +467,15 @@ async fn fetch_worker(
                 limit,
                 page_direction,
             } => {
-                let result = async {
-                    let target = targets.get(&server)?;
-                    let mut client = RpcClient::connect(&target.endpoint).await?;
-                    fetch_detail(target, &mut client, thread_id, cursor, limit, epoch).await
-                }
+                let result = fetch_detail_cached(
+                    &targets,
+                    &mut clients,
+                    server,
+                    thread_id,
+                    cursor,
+                    limit,
+                    epoch,
+                )
                 .await;
                 match result {
                     Ok(detail) => {
@@ -489,21 +494,8 @@ async fn fetch_worker(
                 }
             }
             FetchRequest::LoadThread { server, thread_id } => {
-                let result = async {
-                    let target = targets.get(&server)?;
-                    let mut client = RpcClient::connect(&target.endpoint).await?;
-                    thread_status(
-                        target,
-                        &mut client,
-                        ThreadStatusRequest {
-                            thread_id: thread_id.clone(),
-                            load: true,
-                            turn_scan_limit: TURN_SCAN_LIMIT,
-                        },
-                    )
-                    .await
-                }
-                .await;
+                let result =
+                    load_thread_cached(&targets, &mut clients, &server, thread_id.clone()).await;
                 match result {
                     Ok(status) => {
                         let _ = app_tx.send(AppEvent::ThreadLoaded {
@@ -530,15 +522,17 @@ async fn preview_worker(
     mut preview_rx: mpsc::Receiver<PreviewRequest>,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let mut clients = RpcClientCache::default();
     while let Some(mut request) = preview_rx.recv().await {
         while let Ok(newer) = preview_rx.try_recv() {
             request = newer;
         }
-        let result = async {
-            let target = targets.get(&request.server)?;
-            let mut client = RpcClient::connect(&target.endpoint).await?;
-            fetch_preview(target, &mut client, request.thread_id.clone()).await
-        }
+        let result = fetch_preview_cached(
+            &targets,
+            &mut clients,
+            &request.server,
+            request.thread_id.clone(),
+        )
         .await;
         match result {
             Ok(text) => {
@@ -559,6 +553,25 @@ async fn preview_worker(
             }
         }
     }
+}
+
+#[derive(Default)]
+struct RpcClientCache {
+    clients: BTreeMap<String, RpcClient>,
+}
+
+impl RpcClientCache {
+    fn take(&mut self, server: &str) -> Option<RpcClient> {
+        self.clients.remove(server)
+    }
+
+    fn insert(&mut self, server: String, client: RpcClient) {
+        self.clients.insert(server, client);
+    }
+}
+
+fn keep_client_after_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RpcRequestError>().is_some()
 }
 
 async fn fetch_browser(
@@ -626,23 +639,176 @@ async fn fetch_browser(
 
 async fn fetch_browser_all(
     targets: &TuiTargets,
+    clients: &mut RpcClientCache,
     query: BrowserQuery,
 ) -> Result<BrowserMergeResult> {
     let fetches = targets.all().map(|target| {
         let target = target.clone();
         let query = query.clone();
+        let cached = clients.take(&target.server);
         async move {
             let server = target.server.clone();
-            let rows = async {
-                let mut client = RpcClient::connect(&target.endpoint).await?;
-                fetch_browser(&target, &mut client, query).await
-            }
-            .await
-            .map_err(|err| err.to_string());
-            BrowserFetchOutcome { server, rows }
+            let (rows, client) = fetch_browser_with_client(target, cached, query).await;
+            (BrowserFetchOutcome { server, rows }, client)
         }
     });
-    merge_browser_fetch_outcomes(join_all(fetches).await, targets.is_multi())
+    let mut outcomes = Vec::new();
+    for (outcome, client) in join_all(fetches).await {
+        if let Some(client) = client {
+            clients.insert(outcome.server.clone(), client);
+        }
+        outcomes.push(outcome);
+    }
+    merge_browser_fetch_outcomes(outcomes, targets.is_multi())
+}
+
+async fn fetch_browser_with_client(
+    target: Target,
+    cached: Option<RpcClient>,
+    query: BrowserQuery,
+) -> (
+    std::result::Result<BrowserPageRows, String>,
+    Option<RpcClient>,
+) {
+    let mut client = match cached {
+        Some(client) => client,
+        None => match RpcClient::connect(&target.endpoint).await {
+            Ok(client) => client,
+            Err(err) => return (Err(err.to_string()), None),
+        },
+    };
+    match fetch_browser(&target, &mut client, query).await {
+        Ok(rows) => (Ok(rows), Some(client)),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            (Err(err.to_string()), keep.then_some(client))
+        }
+    }
+}
+
+async fn fetch_detail_cached(
+    targets: &TuiTargets,
+    clients: &mut RpcClientCache,
+    server: String,
+    thread_id: String,
+    cursor: Option<String>,
+    limit: u32,
+    epoch: u64,
+) -> Result<DetailState> {
+    let target = targets.get(&server)?.clone();
+    let cached = clients.take(&server);
+    let (result, client) =
+        fetch_detail_with_client(target, cached, thread_id, cursor, limit, epoch).await;
+    if let Some(client) = client {
+        clients.insert(server, client);
+    }
+    result
+}
+
+async fn fetch_detail_with_client(
+    target: Target,
+    cached: Option<RpcClient>,
+    thread_id: String,
+    cursor: Option<String>,
+    limit: u32,
+    epoch: u64,
+) -> (Result<DetailState>, Option<RpcClient>) {
+    let mut client = match cached {
+        Some(client) => client,
+        None => match RpcClient::connect(&target.endpoint).await {
+            Ok(client) => client,
+            Err(err) => return (Err(err), None),
+        },
+    };
+    match fetch_detail(&target, &mut client, thread_id, cursor, limit, epoch).await {
+        Ok(detail) => (Ok(detail), Some(client)),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            (Err(err), keep.then_some(client))
+        }
+    }
+}
+
+async fn load_thread_cached(
+    targets: &TuiTargets,
+    clients: &mut RpcClientCache,
+    server: &str,
+    thread_id: String,
+) -> Result<Value> {
+    let target = targets.get(server)?.clone();
+    let cached = clients.take(server);
+    let (result, client) = load_thread_with_client(target, cached, thread_id).await;
+    if let Some(client) = client {
+        clients.insert(server.to_string(), client);
+    }
+    result
+}
+
+async fn load_thread_with_client(
+    target: Target,
+    cached: Option<RpcClient>,
+    thread_id: String,
+) -> (Result<Value>, Option<RpcClient>) {
+    let mut client = match cached {
+        Some(client) => client,
+        None => match RpcClient::connect(&target.endpoint).await {
+            Ok(client) => client,
+            Err(err) => return (Err(err), None),
+        },
+    };
+    let result = thread_status(
+        &target,
+        &mut client,
+        ThreadStatusRequest {
+            thread_id,
+            load: true,
+            turn_scan_limit: TURN_SCAN_LIMIT,
+        },
+    )
+    .await;
+    match result {
+        Ok(status) => (Ok(status), Some(client)),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            (Err(err), keep.then_some(client))
+        }
+    }
+}
+
+async fn fetch_preview_cached(
+    targets: &TuiTargets,
+    clients: &mut RpcClientCache,
+    server: &str,
+    thread_id: String,
+) -> Result<Vec<MessageBlock>> {
+    let target = targets.get(server)?.clone();
+    let cached = clients.take(server);
+    let (result, client) = fetch_preview_with_client(target, cached, thread_id).await;
+    if let Some(client) = client {
+        clients.insert(server.to_string(), client);
+    }
+    result
+}
+
+async fn fetch_preview_with_client(
+    target: Target,
+    cached: Option<RpcClient>,
+    thread_id: String,
+) -> (Result<Vec<MessageBlock>>, Option<RpcClient>) {
+    let mut client = match cached {
+        Some(client) => client,
+        None => match RpcClient::connect(&target.endpoint).await {
+            Ok(client) => client,
+            Err(err) => return (Err(err), None),
+        },
+    };
+    match fetch_preview(&target, &mut client, thread_id).await {
+        Ok(messages) => (Ok(messages), Some(client)),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            (Err(err), keep.then_some(client))
+        }
+    }
 }
 
 #[derive(Debug)]
