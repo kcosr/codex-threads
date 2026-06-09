@@ -26,5 +26,19 @@ pub fn parse_since(since: &str) -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    Ok(now - seconds * multiplier)
+    let offset = seconds
+        .checked_mul(multiplier)
+        .ok_or_else(|| usage_error(format!("invalid --since value `{since}`")))?;
+    now.checked_sub(offset)
+        .ok_or_else(|| usage_error(format!("invalid --since value `{since}`")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_since;
+
+    #[test]
+    fn rejects_overflowing_relative_since() {
+        assert!(parse_since("9223372036854775807d").is_err());
+    }
 }

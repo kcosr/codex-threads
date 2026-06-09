@@ -668,10 +668,15 @@ async fn schedule_thread_load(
     thread_id: String,
 ) -> Result<()> {
     state.set_notice(format!("loading {thread_id}..."));
-    fetch_tx
-        .send(FetchRequest::LoadThread { thread_id })
-        .await
-        .context("failed to schedule thread load")
+    match fetch_tx.try_send(FetchRequest::LoadThread {
+        thread_id: thread_id.clone(),
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            state.set_notice(format!("failed to schedule load {thread_id}: {err}"));
+            Ok(())
+        }
+    }
 }
 
 async fn schedule_browser_reset(
@@ -702,13 +707,17 @@ async fn schedule_browser_page(
         descending: state.browser.descending,
         relative_updated: state.prefs.browser.relative_updated,
     };
-    fetch_tx
-        .send(FetchRequest::Browser {
-            epoch: state.browser.epoch,
-            query,
-        })
-        .await
-        .context("failed to schedule browser refresh")
+    match fetch_tx.try_send(FetchRequest::Browser {
+        epoch: state.browser.epoch,
+        query,
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            state.browser.loading = false;
+            state.browser.last_error = Some(format!("failed to schedule browser refresh: {err}"));
+            Ok(())
+        }
+    }
 }
 
 async fn schedule_detail_load(
@@ -811,16 +820,22 @@ async fn schedule_detail_page_with_limit(
         state.pending_detail_jump = None;
     }
     state.mode = Mode::Detail;
-    fetch_tx
-        .send(FetchRequest::Detail {
-            epoch,
-            thread_id,
-            cursor,
-            limit,
-            page_direction,
-        })
-        .await
-        .context("failed to schedule detail load")
+    match fetch_tx.try_send(FetchRequest::Detail {
+        epoch,
+        thread_id,
+        cursor,
+        limit,
+        page_direction,
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if let Some(detail) = &mut state.detail {
+                detail.loading = false;
+                detail.last_error = Some(format!("failed to schedule detail load: {err}"));
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn schedule_selected_preview_if_needed(
@@ -1040,11 +1055,7 @@ async fn handle_terminal_event(
                 KeyCode::Esc => state.mode = return_mode,
                 KeyCode::Enter => {
                     state.mode = return_mode;
-                    if let (Some(_turn_id), Some(control)) = (&turn_id, &state.stream_control) {
-                        let _ = control.send(TurnControl::Interrupt);
-                    } else {
-                        spawn_interrupt_task(target.clone(), thread_id, turn_id, app_tx.clone());
-                    }
+                    spawn_interrupt_task(target.clone(), thread_id, turn_id, app_tx.clone());
                 }
                 _ => {
                     state.mode = Mode::ConfirmInterrupt {
@@ -2466,7 +2477,6 @@ async fn wait_for_next_active_turn(
                         });
                     }
                     Some(TurnControl::Detach) | None => return Ok(None),
-                    Some(TurnControl::Interrupt) => {}
                 }
             }
             _ = &mut sleep => {}

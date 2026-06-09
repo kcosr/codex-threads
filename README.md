@@ -227,7 +227,6 @@ refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
-operation. In detail, `T` attaches to an active turn, `S` steers it, `i`
 operation. In detail, `T` attaches to an active turn, `i` confirms interrupt,
 `Enter` or `m` composes a message or steer action based on whether the thread is
 active, and `q` quits. Normal send uses Codex app-server's `turn/start` path;

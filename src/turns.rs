@@ -174,7 +174,6 @@ pub enum TurnControl {
     PollNow,
     Submit { prompt: String, yolo: bool },
     Detach,
-    Interrupt,
 }
 
 #[cfg(feature = "tui")]
@@ -374,15 +373,6 @@ where
                             thread_id: started.thread_id.clone(),
                             turn_id: wait.turn_id.clone(),
                         });
-                    }
-                    Some(TurnControl::Interrupt) => {
-                        let _ = client
-                            .request(
-                                "turn/interrupt",
-                                json!({"threadId": started.thread_id, "turnId": &wait.turn_id}),
-                                |_| {},
-                            )
-                            .await?;
                     }
                 }
             }
