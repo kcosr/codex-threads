@@ -1931,3 +1931,97 @@ fn classify_error(err: &anyhow::Error) -> i32 {
         2
     }
 }
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::config::{AppConfig, ServerConfig};
+
+    use super::resolve_tui_targets_for_command;
+
+    fn test_config() -> AppConfig {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "main".to_string(),
+            ServerConfig {
+                endpoint: Some("unix:///tmp/codex-main.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
+                model: None,
+                model_reasoning_effort: None,
+            },
+        );
+        servers.insert(
+            "work".to_string(),
+            ServerConfig {
+                endpoint: Some("unix:///tmp/codex-work.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
+                model: None,
+                model_reasoning_effort: None,
+            },
+        );
+        AppConfig {
+            model: None,
+            model_reasoning_effort: None,
+            servers,
+        }
+    }
+
+    #[test]
+    fn tui_targets_default_to_all_configured_servers() {
+        let targets =
+            resolve_tui_targets_for_command(&test_config(), None, None, None, None).unwrap();
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.server.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main", "work"]
+        );
+    }
+
+    #[test]
+    fn tui_targets_honor_server_override() {
+        let targets = resolve_tui_targets_for_command(
+            &test_config(),
+            None,
+            None,
+            None,
+            Some("work".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].server, "work");
+    }
+
+    #[test]
+    fn tui_connect_is_mutually_exclusive_with_server_override() {
+        let error = resolve_tui_targets_for_command(
+            &test_config(),
+            Some("unix:///tmp/direct.sock"),
+            None,
+            None,
+            Some("main".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn tui_connect_auth_requires_connect() {
+        let error =
+            resolve_tui_targets_for_command(&test_config(), None, Some("TOKEN_ENV"), None, None)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("require --connect"));
+    }
+}

@@ -25,7 +25,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all};
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -627,35 +627,62 @@ async fn fetch_browser(
 async fn fetch_browser_all(
     targets: &TuiTargets,
     query: BrowserQuery,
-) -> Result<(
+) -> Result<BrowserMergeResult> {
+    let fetches = targets.all().map(|target| {
+        let target = target.clone();
+        let query = query.clone();
+        async move {
+            let server = target.server.clone();
+            let rows = async {
+                let mut client = RpcClient::connect(&target.endpoint).await?;
+                fetch_browser(&target, &mut client, query).await
+            }
+            .await
+            .map_err(|err| err.to_string());
+            BrowserFetchOutcome { server, rows }
+        }
+    });
+    merge_browser_fetch_outcomes(join_all(fetches).await, targets.is_multi())
+}
+
+#[derive(Debug)]
+struct BrowserFetchOutcome {
+    server: String,
+    rows: std::result::Result<BrowserPageRows, String>,
+}
+
+type BrowserPageRows = (Vec<ThreadRow>, Option<String>, Option<String>);
+type BrowserMergeResult = (
     Vec<ThreadRow>,
     Option<String>,
     Option<String>,
     Option<String>,
-)> {
+);
+
+fn merge_browser_fetch_outcomes(
+    outcomes: Vec<BrowserFetchOutcome>,
+    is_multi: bool,
+) -> Result<BrowserMergeResult> {
     let mut rows = Vec::new();
     let mut next_cursor = None;
     let mut backwards_cursor = None;
     let mut errors = Vec::new();
-    for target in targets.all() {
-        let result = async {
-            let mut client = RpcClient::connect(&target.endpoint).await?;
-            fetch_browser(target, &mut client, query.clone()).await
-        }
-        .await;
-        match result {
+    let mut successes = 0usize;
+    for outcome in outcomes {
+        match outcome.rows {
             Ok((mut target_rows, target_next, target_backwards)) => {
+                successes += 1;
                 rows.append(&mut target_rows);
-                if !targets.is_multi() {
+                if !is_multi {
                     next_cursor = target_next;
                     backwards_cursor = target_backwards;
                 }
             }
-            Err(err) if targets.is_multi() => errors.push(format!("{}: {err}", target.server)),
-            Err(err) => return Err(err),
+            Err(err) if is_multi => errors.push(format!("{}: {err}", outcome.server)),
+            Err(err) => return Err(anyhow::anyhow!(err)),
         }
     }
-    if rows.is_empty() && !errors.is_empty() {
+    if successes == 0 && !errors.is_empty() {
         return Err(anyhow::anyhow!(errors.join("; ")));
     }
     rows.sort_by(|left, right| {
@@ -747,12 +774,9 @@ async fn schedule_browser_refresh(
 async fn schedule_thread_load(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
+    server: String,
     thread_id: String,
 ) -> Result<()> {
-    let Some(server) = active_server_for_thread(state, &thread_id) else {
-        state.set_notice(format!("failed to load {thread_id}: no server selected"));
-        return Ok(());
-    };
     state.set_notice(format!("loading {thread_id}..."));
     match fetch_tx.try_send(FetchRequest::LoadThread {
         server,
@@ -810,12 +834,9 @@ async fn schedule_browser_page(
 async fn schedule_detail_load(
     state: &mut TuiState,
     fetch_tx: &mpsc::Sender<FetchRequest>,
+    server: String,
     thread_id: String,
 ) -> Result<()> {
-    let Some(server) = active_server_for_thread(state, &thread_id) else {
-        state.set_notice(format!("failed to open {thread_id}: no server selected"));
-        return Ok(());
-    };
     schedule_detail_page(
         state,
         fetch_tx,
@@ -825,17 +846,6 @@ async fn schedule_detail_load(
         DetailPageDirection::Replace,
     )
     .await
-}
-
-async fn schedule_detail_refresh(
-    state: &mut TuiState,
-    fetch_tx: &mpsc::Sender<FetchRequest>,
-    thread_id: String,
-) -> Result<()> {
-    let Some(server) = active_server_for_thread(state, &thread_id) else {
-        return Ok(());
-    };
-    schedule_detail_refresh_for_server(state, fetch_tx, server, thread_id).await
 }
 
 async fn schedule_detail_refresh_for_server(
@@ -970,6 +980,18 @@ fn active_server_for_thread(state: &TuiState, thread_id: &str) -> Option<String>
         .iter()
         .find(|row| row.id == thread_id)
         .map(|row| row.server.clone())
+}
+
+fn resolve_event_server(
+    state: &TuiState,
+    event: &Value,
+    thread_id: Option<&str>,
+) -> Option<String> {
+    event["server"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| state.stream.as_ref().map(|stream| stream.server.clone()))
+        .or_else(|| thread_id.and_then(|thread_id| active_server_for_thread(state, thread_id)))
 }
 
 async fn schedule_selected_preview_if_needed(
@@ -1328,20 +1350,24 @@ async fn handle_terminal_event(
                 }
             }
             Mode::Detail => {
-                if let Some(thread_id) =
-                    state.detail.as_ref().map(|detail| detail.thread_id.clone())
+                if let Some((server, thread_id)) = state
+                    .detail
+                    .as_ref()
+                    .map(|detail| (detail.server.clone(), detail.thread_id.clone()))
                 {
-                    schedule_detail_refresh(state, fetch_tx, thread_id).await?;
+                    schedule_detail_refresh_for_server(state, fetch_tx, server, thread_id).await?;
                 }
             }
             _ => schedule_browser_refresh(state, fetch_tx).await?,
         },
         KeyCode::Char('R') => match state.mode {
             Mode::Detail => {
-                if let Some(thread_id) =
-                    state.detail.as_ref().map(|detail| detail.thread_id.clone())
+                if let Some((server, thread_id)) = state
+                    .detail
+                    .as_ref()
+                    .map(|detail| (detail.server.clone(), detail.thread_id.clone()))
                 {
-                    schedule_detail_load(state, fetch_tx, thread_id).await?;
+                    schedule_detail_load(state, fetch_tx, server, thread_id).await?;
                 }
             }
             _ => schedule_browser_reset(state, fetch_tx).await?,
@@ -1447,8 +1473,8 @@ async fn handle_terminal_event(
             }
         }
         KeyCode::Char('l') => {
-            if let Some(thread_id) = active_thread_id(state) {
-                schedule_thread_load(state, fetch_tx, thread_id).await?;
+            if let Some((server, thread_id)) = active_thread_key(state) {
+                schedule_thread_load(state, fetch_tx, server, thread_id).await?;
             }
         }
         KeyCode::Char('T') => {
@@ -1566,8 +1592,8 @@ async fn handle_terminal_event(
         },
         KeyCode::Enter => match state.mode {
             Mode::Browser => {
-                if let Some(thread_id) = state.selected_thread_id().map(str::to_string) {
-                    schedule_detail_load(state, fetch_tx, thread_id).await?;
+                if let Some((server, thread_id)) = state.selected_thread_key() {
+                    schedule_detail_load(state, fetch_tx, server, thread_id).await?;
                 }
             }
             Mode::Detail => {
@@ -3111,14 +3137,9 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         AppEvent::StreamEvent { stream_id, event } => {
             log_stream_event(&event);
             let event_thread_id = event["threadId"].as_str();
-            let event_server = event["server"]
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| state.stream.as_ref().map(|stream| stream.server.clone()))
-                .or_else(|| {
-                    event_thread_id.and_then(|thread_id| active_server_for_thread(state, thread_id))
-                })
-                .unwrap_or_default();
+            let Some(event_server) = resolve_event_server(state, &event, event_thread_id) else {
+                return;
+            };
             let event_server = event_server.as_str();
             let event_type = event["type"].as_str();
             if let Some(current_stream) = &state.stream {
@@ -3961,12 +3982,9 @@ fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
     let Some(thread_id) = thread["id"].as_str().or_else(|| event["threadId"].as_str()) else {
         return;
     };
-    let server = event["server"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| state.stream.as_ref().map(|stream| stream.server.clone()))
-        .or_else(|| active_server_for_thread(state, thread_id))
-        .unwrap_or_default();
+    let Some(server) = resolve_event_server(state, event, Some(thread_id)) else {
+        return;
+    };
     if !preview_matches_thread(state, &server, thread_id) || thread["turns"].as_array().is_none() {
         return;
     }
@@ -5547,6 +5565,29 @@ mod tests {
     }
 
     #[test]
+    fn event_server_resolution_returns_none_when_event_has_no_server_context() {
+        let state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+
+        assert_eq!(
+            resolve_event_server(
+                &state,
+                &serde_json::json!({"type": "delta"}),
+                Some("missing")
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn browser_updated_time_is_toggleable_and_relative_for_all_past_times() {
         let now = 1_700_000_000;
 
@@ -6996,9 +7037,14 @@ mod tests {
         state.detail.as_mut().unwrap().scroll = 4;
         let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
 
-        schedule_detail_refresh(&mut state, &fetch_tx, "t1".to_string())
-            .await
-            .unwrap();
+        schedule_detail_refresh_for_server(
+            &mut state,
+            &fetch_tx,
+            "work".to_string(),
+            "t1".to_string(),
+        )
+        .await
+        .unwrap();
 
         let detail = state.detail.as_ref().expect("detail");
         assert!(detail.loading);
@@ -7023,6 +7069,106 @@ mod tests {
         assert_eq!(cursor.as_deref(), Some("current"));
         assert_eq!(limit, DETAIL_TURN_LIMIT);
         assert_eq!(page_direction, DetailPageDirection::Replace);
+    }
+
+    #[test]
+    fn merge_browser_fetch_outcomes_sorts_all_server_rows_by_updated_then_server() {
+        let mut old_main = test_thread_row_with_updated("old", "main", 10);
+        let mut new_work = test_thread_row_with_updated("new", "work", 30);
+        let mut new_main = test_thread_row_with_updated("new", "main", 30);
+        old_main.title = "old main".to_string();
+        new_work.title = "new work".to_string();
+        new_main.title = "new main".to_string();
+
+        let (rows, next, backwards, warning) = merge_browser_fetch_outcomes(
+            vec![
+                BrowserFetchOutcome {
+                    server: "work".to_string(),
+                    rows: Ok((vec![old_main, new_work], Some("ignored".to_string()), None)),
+                },
+                BrowserFetchOutcome {
+                    server: "main".to_string(),
+                    rows: Ok((vec![new_main], Some("also-ignored".to_string()), None)),
+                },
+            ],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| format!("{}/{}", row.server, row.id))
+                .collect::<Vec<_>>(),
+            vec!["main/new", "work/new", "main/old"]
+        );
+        assert_eq!(next, None);
+        assert_eq!(backwards, None);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn merge_browser_fetch_outcomes_keeps_empty_success_with_partial_failure() {
+        let (rows, _, _, warning) = merge_browser_fetch_outcomes(
+            vec![
+                BrowserFetchOutcome {
+                    server: "main".to_string(),
+                    rows: Ok((Vec::new(), None, None)),
+                },
+                BrowserFetchOutcome {
+                    server: "slow".to_string(),
+                    rows: Err("timeout".to_string()),
+                },
+            ],
+            true,
+        )
+        .unwrap();
+
+        assert!(rows.is_empty());
+        assert_eq!(
+            warning.as_deref(),
+            Some("some servers failed: slow: timeout")
+        );
+    }
+
+    #[test]
+    fn merge_browser_fetch_outcomes_errors_when_every_server_fails() {
+        let error = merge_browser_fetch_outcomes(
+            vec![
+                BrowserFetchOutcome {
+                    server: "main".to_string(),
+                    rows: Err("down".to_string()),
+                },
+                BrowserFetchOutcome {
+                    server: "work".to_string(),
+                    rows: Err("timeout".to_string()),
+                },
+            ],
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "main: down; work: timeout");
+    }
+
+    #[test]
+    fn merge_browser_fetch_outcomes_preserves_single_server_cursors() {
+        let (rows, next, backwards, warning) = merge_browser_fetch_outcomes(
+            vec![BrowserFetchOutcome {
+                server: "main".to_string(),
+                rows: Ok((
+                    vec![test_thread_row_with_updated("t1", "main", 10)],
+                    Some("older".to_string()),
+                    Some("newer".to_string()),
+                )),
+            }],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(next.as_deref(), Some("older"));
+        assert_eq!(backwards.as_deref(), Some("newer"));
+        assert_eq!(warning, None);
     }
 
     #[tokio::test]
@@ -9618,5 +9764,16 @@ mod tests {
             snippet: None,
             raw: serde_json::json!({}),
         }
+    }
+
+    fn test_thread_row_with_updated(id: &str, server: &str, updated_at: i64) -> ThreadRow {
+        let mut row = test_thread_row(id, "idle");
+        row.server = server.to_string();
+        row.raw = serde_json::json!({
+            "id": id,
+            "updatedAt": updated_at,
+            "status": {"type": "idle"}
+        });
+        row
     }
 }
