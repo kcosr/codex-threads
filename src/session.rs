@@ -4,6 +4,7 @@ use serde_json::{Map, Value, json};
 use crate::annotations::{load_annotation, namespace_annotations};
 use crate::cli::{ItemsView, MessageRole, SortKey};
 use crate::config::Target;
+use crate::errors::app_server_error;
 use crate::rpc::{Notification, RpcClient, RpcRequestError};
 
 #[derive(Debug, Clone, Copy)]
@@ -544,6 +545,47 @@ pub fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
     // Thread start/resume use the legacy SandboxMode string shape.
     map.insert("approvalPolicy".to_string(), json!("never"));
     map.insert("sandbox".to_string(), json!("danger-full-access"));
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ThreadStartOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub yolo: bool,
+}
+
+/// Creates a new thread via `thread/start` and returns the raw response.
+pub async fn start_thread(
+    client: &mut RpcClient,
+    cwd: &std::path::Path,
+    options: ThreadStartOptions,
+) -> Result<Value> {
+    let mut params = Map::new();
+    params.insert("cwd".to_string(), json!(cwd));
+    if options.yolo {
+        insert_thread_yolo_permissions(&mut params);
+    }
+    insert_opt(&mut params, "model", options.model);
+    if let Some(tier) = &options.service_tier {
+        params.insert("serviceTier".to_string(), json!(tier));
+    }
+    if let Some(effort) = &options.effort {
+        params.insert(
+            "config".to_string(),
+            json!({"model_reasoning_effort": effort}),
+        );
+    }
+    client
+        .request("thread/start", Value::Object(params), |_| {})
+        .await
+}
+
+pub fn thread_id_from_start(start: &Value) -> Result<String> {
+    start["thread"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| app_server_error("thread/start response missing thread.id"))
 }
 
 fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {

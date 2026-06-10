@@ -108,11 +108,31 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         Mode::ConfirmOpenCodex { thread_id, cwd, .. } => {
             draw_confirm_open_codex(frame, area, thread_id, cwd);
         }
+        Mode::NewSessionServerMenu {
+            servers, selected, ..
+        } => {
+            draw_new_session_server_menu(frame, area, servers, *selected);
+        }
+        Mode::NewSessionCwdInput { draft } => draw_prompt(
+            frame,
+            area,
+            "New session cwd",
+            &draft.cwd,
+            "Enter continue, Ctrl-D clear, Esc cancel",
+        ),
+        Mode::NewSessionTitleInput { draft } => draw_prompt(
+            frame,
+            area,
+            "New session name (optional)",
+            &draft.title,
+            "Enter continue, Ctrl-D clear, Esc cancel",
+        ),
         Mode::Compose(compose) => {
             let label = match compose.target {
                 ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
                     "Steer active turn"
                 }
+                ComposeTarget::NewThread { .. } => "New session first message",
                 ComposeTarget::NewTurn { .. } => match compose.send_mode {
                     SendMode::Stream if compose_new_turn_can_steer(state, compose) => {
                         "Send new turn"
@@ -124,6 +144,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             let footer = match compose.target {
                 ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
                     "Enter steer, Ctrl-J newline, Tab send, Esc cancel"
+                }
+                ComposeTarget::NewThread { .. } => {
+                    "Enter create session + send, Ctrl-J newline, Esc cancel"
                 }
                 ComposeTarget::NewTurn { .. } if compose_new_turn_can_steer(state, compose) => {
                     "Enter send, Ctrl-J newline, Tab steer, Esc cancel"
@@ -905,6 +928,27 @@ fn draw_sort_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
+fn draw_new_session_server_menu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    servers: &[String],
+    selected: usize,
+) {
+    let mut lines: Vec<String> = servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| {
+            if index == selected {
+                format!("> {server}")
+            } else {
+                format!("  {server}")
+            }
+        })
+        .collect();
+    lines.push("j/k move  Enter select  Esc cancel".to_string());
+    draw_static_modal(frame, area, "New session server", &lines);
+}
+
 fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let columns = state.visible_columns();
     draw_static_modal(
@@ -1007,7 +1051,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "",
         "Browser",
         "  Enter open detail  m compose message or steer active turn  o open in Codex TUI",
-        "  / search threads",
+        "  n new session (server, cwd, optional name, first message)  / search threads",
         "  l load selected thread  T attach/watch active turn",
         "  i interrupt selected active turn",
         "  a annotate  e rename  A confirm archive/unarchive",

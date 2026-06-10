@@ -20,13 +20,14 @@ use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
     resolve_config_path, resolve_direct_target, resolve_target,
 };
-use crate::errors::{ExitError, app_server_error, usage_error};
+use crate::errors::{ExitError, usage_error};
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
-    ShowThreadRequest, ThreadProjection, ThreadStatusRequest, insert_thread_yolo_permissions,
+    ShowThreadRequest, ThreadProjection, ThreadStartOptions, ThreadStatusRequest,
     is_thread_not_found_error, list_threads, load_messages, loaded_status, read_thread_detail,
-    request_with_resume_retry, resume_thread_for_inspection, search_threads, thread_status,
+    request_with_resume_retry, resume_thread_for_inspection, search_threads, start_thread,
+    thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::turns::{
@@ -715,34 +716,26 @@ async fn new_command(
             "new without PROMPT cannot use --no-wait or --stream",
         ));
     }
-    let mut params = Map::new();
-    params.insert("cwd".to_string(), json!(command.cwd));
-    if yolo {
-        insert_thread_yolo_permissions(&mut params);
-    }
     let thread_model = command.model.clone().or_else(|| target.model.clone());
     let thread_effort = command
         .effort
         .clone()
         .or_else(|| target.model_reasoning_effort.clone());
-    insert_opt(&mut params, "model", thread_model);
-    if let Some(tier) = &command.service_tier {
-        params.insert("serviceTier".to_string(), json!(tier));
-    }
     if let Some(effort) = thread_effort.as_deref() {
         validate_effort(effort)?;
-        params.insert(
-            "config".to_string(),
-            json!({"model_reasoning_effort": effort}),
-        );
     }
-    let start = client
-        .request("thread/start", Value::Object(params), |_| {})
-        .await?;
-    let thread_id = start["thread"]["id"]
-        .as_str()
-        .ok_or_else(|| app_server_error("thread/start response missing thread.id"))?
-        .to_string();
+    let start = start_thread(
+        &mut client,
+        &command.cwd,
+        ThreadStartOptions {
+            model: thread_model,
+            effort: thread_effort,
+            service_tier: command.service_tier.clone(),
+            yolo,
+        },
+    )
+    .await?;
+    let thread_id = thread_id_from_start(&start)?;
     if let Some(name) = &command.name {
         client
             .request(

@@ -50,8 +50,26 @@ pub enum Mode {
         draft: String,
         return_to_detail: bool,
     },
+    NewSessionServerMenu {
+        draft: NewSessionDraft,
+        servers: Vec<String>,
+        selected: usize,
+    },
+    NewSessionCwdInput {
+        draft: NewSessionDraft,
+    },
+    NewSessionTitleInput {
+        draft: NewSessionDraft,
+    },
     Compose(ComposeState),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSessionDraft {
+    pub server: String,
+    pub cwd: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +227,11 @@ pub enum ComposeTarget {
     NewTurn {
         server: String,
         thread_id: String,
+    },
+    NewThread {
+        server: String,
+        cwd: String,
+        title: Option<String>,
     },
     Steer {
         server: String,

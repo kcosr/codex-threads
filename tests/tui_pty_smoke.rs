@@ -141,6 +141,16 @@ impl TuiMockServer {
             .count()
     }
 
+    fn requests_for(&self, method: &str) -> Vec<Value> {
+        self.received
+            .lock()
+            .expect("received")
+            .iter()
+            .filter(|request| request["method"].as_str() == Some(method))
+            .cloned()
+            .collect()
+    }
+
     fn wait_for_method_count(&self, method: &str, min: usize) {
         let started = Instant::now();
         while started.elapsed() < WAIT_TIMEOUT {
@@ -384,6 +394,25 @@ impl ServerState {
             "activeTurnId": active_turn_id,
             "truncated": false
         })
+    }
+
+    fn add_thread(&mut self, cwd: &str) -> String {
+        let id = format!("thread_created_{}", self.next_turn);
+        self.threads.insert(
+            id.clone(),
+            ThreadRecord {
+                id: id.clone(),
+                name: String::new(),
+                preview: String::new(),
+                cwd: cwd.to_string(),
+                status: "idle".to_string(),
+                updated_at: 1_700_000_300,
+                active_turn_id: None,
+                turns: Vec::new(),
+            },
+        );
+        self.order.insert(0, id.clone());
+        id
     }
 
     fn start_turn(&mut self, thread_id: &str, prompt: &str) -> StartedMockTurn {
@@ -716,8 +745,18 @@ async fn send_delta<S>(
 }
 
 fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -> Value {
-    let state = state.lock().expect("state");
+    let mut state = state.lock().expect("state");
     match method {
+        "thread/start" => {
+            let cwd = request["params"]["cwd"].as_str().unwrap_or("");
+            let id = state.add_thread(cwd);
+            json!({
+                "thread": state.thread_json(&id),
+                "model": "gpt-5.1-codex",
+                "reasoningEffort": "medium",
+                "serviceTier": Value::Null
+            })
+        }
         "initialize" => json!({
             "userAgent": "mock-codex",
             "codexHome": "/tmp/mock-codex",
@@ -759,7 +798,15 @@ fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -
         "turn/start" => json!({"turn": {"id": "turn_2", "status": "inProgress", "items": []}}),
         "turn/steer" => json!({"turnId": request["params"]["expectedTurnId"].clone()}),
         "turn/interrupt" => json!({}),
-        "thread/name/set" => json!({"thread": state.thread_json(thread_id(request))}),
+        "thread/name/set" => {
+            let id = thread_id(request).to_string();
+            if let Some(name) = request["params"]["name"].as_str()
+                && let Some(thread) = state.threads.get_mut(&id)
+            {
+                thread.name = name.to_string();
+            }
+            json!({"thread": state.thread_json(&id)})
+        }
         "thread/archive" => json!({"thread": state.thread_json(thread_id(request))}),
         "thread/unarchive" => json!({"thread": state.thread_json(thread_id(request))}),
         other => panic!("unexpected method {other}"),
@@ -1164,6 +1211,52 @@ fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
         server.method_count("turn/steer"),
         0,
         "normal browser send should not use explicit steer"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_new_session_flow_creates_named_thread_and_streams() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"n");
+    tui.wait_for("New session cwd");
+    // The prompt is prefilled with the selected row's cwd; accept it.
+    tui.wait_for("/tmp/tui-active");
+    tui.write(b"\r");
+    tui.wait_for("New session name");
+    tui.type_text("Fresh session");
+    tui.write(b"\r");
+    tui.wait_for("New session first message");
+    tui.type_text("hello fresh session");
+    tui.write(b"\r");
+
+    server.wait_for_method_count("thread/start", 1);
+    server.wait_for_method_count("thread/name/set", 1);
+    server.wait_for_method_count("turn/start", 1);
+    tui.wait_for("Fresh session");
+    tui.wait_for("stream reply for hello fresh session");
+    tui.quit();
+
+    let starts = server.requests_for("thread/start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0]["params"]["cwd"].as_str(),
+        Some("/tmp/tui-active"),
+        "cwd should be prefilled from the selected row"
+    );
+    let names = server.requests_for("thread/name/set");
+    assert_eq!(names[0]["params"]["name"].as_str(), Some("Fresh session"));
+    let turn_starts = server.requests_for("turn/start");
+    assert!(
+        turn_starts[0]["params"]["threadId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("thread_created_")),
+        "first turn should target the created thread"
     );
 }
 

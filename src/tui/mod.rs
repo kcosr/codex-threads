@@ -38,8 +38,9 @@ use crate::config::{Endpoint, Target};
 use crate::errors::usage_error;
 use crate::rpc::{RpcClient, RpcRequestError};
 use crate::session::{
-    ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStatusRequest, list_threads,
-    read_thread_detail, search_threads, set_thread_archived, set_thread_name, thread_status,
+    ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStartOptions,
+    ThreadStatusRequest, list_threads, read_thread_detail, search_threads, set_thread_archived,
+    set_thread_name, start_thread, thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::tui::events::{
@@ -49,8 +50,8 @@ use crate::tui::input::{InputAction, ModeKind};
 use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
     BrowserSource, ComposeState, ComposeTarget, DetailJump, DetailState, MessageBlock, MessageLine,
-    MessageLineKind, MessageSpan, Mode, SendMode, StreamAssistantItem, StreamState, StreamStatus,
-    ThreadRow, TuiInit, TuiState,
+    MessageLineKind, MessageSpan, Mode, NewSessionDraft, SendMode, StreamAssistantItem,
+    StreamState, StreamStatus, ThreadRow, TuiInit, TuiState,
 };
 use crate::turns::{
     AttachTurnOptions, ControlledTurnWaitOptions, StartedTurn, TurnControl, TurnStartOptions,
@@ -1359,6 +1360,53 @@ async fn handle_terminal_event(
             )
             .map(|()| TerminalEventOutcome::none());
         }
+        Mode::NewSessionServerMenu {
+            mut draft,
+            servers,
+            mut selected,
+        } => {
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Browser,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(servers.len().saturating_sub(1));
+                    state.mode = Mode::NewSessionServerMenu {
+                        draft,
+                        servers,
+                        selected,
+                    };
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                    state.mode = Mode::NewSessionServerMenu {
+                        draft,
+                        servers,
+                        selected,
+                    };
+                }
+                KeyCode::Enter => {
+                    if let Some(server) = servers.get(selected) {
+                        draft.server = server.clone();
+                    }
+                    state.mode = Mode::NewSessionCwdInput { draft };
+                }
+                _ => {
+                    state.mode = Mode::NewSessionServerMenu {
+                        draft,
+                        servers,
+                        selected,
+                    };
+                }
+            }
+            return Ok(TerminalEventOutcome::none());
+        }
+        Mode::NewSessionCwdInput { draft } => {
+            handle_new_session_cwd_input(key, state, draft);
+            return Ok(TerminalEventOutcome::none());
+        }
+        Mode::NewSessionTitleInput { draft } => {
+            handle_new_session_title_input(key, state, draft);
+            return Ok(TerminalEventOutcome::none());
+        }
         Mode::Compose(compose) => {
             let target = targets.get(compose_target_server(&compose.target))?;
             return handle_compose_input(key, state, compose.clone(), target, yolo, app_tx)
@@ -1632,6 +1680,9 @@ async fn handle_terminal_event(
         },
         KeyCode::Char('n') if matches!(state.mode, Mode::Detail) => {
             state.next_message_match();
+        }
+        KeyCode::Char('n') if matches!(state.mode, Mode::Browser) => {
+            start_new_session_flow(state, targets);
         }
         KeyCode::Char('N') if matches!(state.mode, Mode::Detail) => {
             state.previous_message_match();
@@ -1968,6 +2019,106 @@ fn jump_to_bottom(state: &mut TuiState) {
     }
 }
 
+fn start_new_session_flow(state: &mut TuiState, targets: &TuiTargets) {
+    let server = state
+        .selected_thread_key()
+        .map(|(server, _)| server)
+        .or_else(|| targets.all().next().map(|target| target.server.clone()))
+        .unwrap_or_default();
+    let cwd = state
+        .browser
+        .rows
+        .get(state.browser.selected)
+        .map(|row| row.cwd.clone())
+        .filter(|cwd| !cwd.is_empty())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|dir| dir.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let draft = NewSessionDraft {
+        server,
+        cwd,
+        title: String::new(),
+    };
+    if targets.is_multi() {
+        let servers: Vec<String> = targets.all().map(|target| target.server.clone()).collect();
+        let selected = servers
+            .iter()
+            .position(|name| *name == draft.server)
+            .unwrap_or(0);
+        state.mode = Mode::NewSessionServerMenu {
+            draft,
+            servers,
+            selected,
+        };
+    } else {
+        state.mode = Mode::NewSessionCwdInput { draft };
+    }
+}
+
+fn handle_new_session_cwd_input(key: KeyEvent, state: &mut TuiState, mut draft: NewSessionDraft) {
+    match key.code {
+        KeyCode::Esc => state.mode = Mode::Browser,
+        KeyCode::Enter => {
+            let cwd = draft.cwd.trim().to_string();
+            if cwd.is_empty() {
+                state.set_notice("cwd cannot be empty");
+                state.mode = Mode::NewSessionCwdInput { draft };
+            } else {
+                draft.cwd = cwd;
+                state.mode = Mode::NewSessionTitleInput { draft };
+            }
+        }
+        KeyCode::Backspace => {
+            draft.cwd.pop();
+            state.mode = Mode::NewSessionCwdInput { draft };
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.cwd.clear();
+            state.mode = Mode::NewSessionCwdInput { draft };
+        }
+        KeyCode::Char(ch) => {
+            draft.cwd.push(ch);
+            state.mode = Mode::NewSessionCwdInput { draft };
+        }
+        _ => state.mode = Mode::NewSessionCwdInput { draft },
+    }
+}
+
+fn handle_new_session_title_input(key: KeyEvent, state: &mut TuiState, mut draft: NewSessionDraft) {
+    match key.code {
+        KeyCode::Esc => state.mode = Mode::Browser,
+        KeyCode::Enter => {
+            let title = draft.title.trim().to_string();
+            state.mode = Mode::Compose(ComposeState {
+                target: ComposeTarget::NewThread {
+                    server: draft.server,
+                    cwd: draft.cwd,
+                    title: (!title.is_empty()).then_some(title),
+                },
+                text: String::new(),
+                send_mode: SendMode::Stream,
+                return_to_detail: false,
+            });
+        }
+        KeyCode::Backspace => {
+            draft.title.pop();
+            state.mode = Mode::NewSessionTitleInput { draft };
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            draft.title.clear();
+            state.mode = Mode::NewSessionTitleInput { draft };
+        }
+        KeyCode::Char(ch) => {
+            draft.title.push(ch);
+            state.mode = Mode::NewSessionTitleInput { draft };
+        }
+        _ => state.mode = Mode::NewSessionTitleInput { draft },
+    }
+}
+
 fn open_message_action(state: &mut TuiState, server: String, thread_id: String) {
     let return_to_detail = matches!(state.mode, Mode::Detail);
     let (target, send_mode) = default_compose_target(state, server, thread_id, return_to_detail);
@@ -2020,6 +2171,7 @@ fn toggle_compose_target_or_mode(state: &TuiState, mut compose: ComposeState) ->
                 };
             }
         }
+        ComposeTarget::NewThread { .. } => {}
     }
     compose
 }
@@ -2138,6 +2290,9 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
         | Mode::SortMenu
         | Mode::ColumnsMenu
         | Mode::Help
+        | Mode::NewSessionServerMenu { .. }
+        | Mode::NewSessionCwdInput { .. }
+        | Mode::NewSessionTitleInput { .. }
         | Mode::ConfirmArchive {
             return_to_detail: false,
             ..
@@ -2543,6 +2698,28 @@ fn submit_compose(
                 }
             }
         }
+        ComposeTarget::NewThread { server, cwd, title } => {
+            debug_assert_eq!(server, target.server);
+            detach_stream(state);
+            // Drop the detached stream now: its task's terminal event must
+            // not match state and clear the new session's stream control.
+            state.stream = None;
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            let stream_id = state.allocate_stream_id();
+            state.stream_control = Some(control_tx);
+            state.mode = return_mode;
+            state.set_notice("creating session...");
+            spawn_create_session_task(
+                target.clone(),
+                cwd,
+                title,
+                prompt,
+                yolo,
+                control_rx,
+                stream_id,
+                app_tx.clone(),
+            );
+        }
         ComposeTarget::Steer {
             server,
             thread_id,
@@ -2613,6 +2790,7 @@ fn submit_compose(
 fn compose_target_server(target: &ComposeTarget) -> &str {
     match target {
         ComposeTarget::NewTurn { server, .. }
+        | ComposeTarget::NewThread { server, .. }
         | ComposeTarget::Steer { server, .. }
         | ComposeTarget::SteerSelected { server, .. } => server,
     }
@@ -3303,6 +3481,99 @@ fn spawn_stream_send_task(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_create_session_task(
+    target: Target,
+    cwd: String,
+    title: Option<String>,
+    prompt: String,
+    yolo: bool,
+    control_rx: mpsc::UnboundedReceiver<TurnControl>,
+    stream_id: u64,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let server = target.server.clone();
+        let mut created_thread_id: Option<String> = None;
+        let mut stream_turn_id = None;
+        let result: Result<StreamStatus> = async {
+            let mut client = RpcClient::connect(&target.endpoint).await?;
+            let start = start_thread(
+                &mut client,
+                std::path::Path::new(&cwd),
+                ThreadStartOptions {
+                    model: target.model.clone(),
+                    effort: target.model_reasoning_effort.clone(),
+                    service_tier: None,
+                    yolo,
+                },
+            )
+            .await?;
+            let thread_id = thread_id_from_start(&start)?;
+            created_thread_id = Some(thread_id.clone());
+            if let Some(name) = &title {
+                set_thread_name(&target, &mut client, thread_id.clone(), name.clone()).await?;
+            }
+            let _ = app_tx.send(AppEvent::SessionCreated {
+                stream_id,
+                server: server.clone(),
+                thread_id: thread_id.clone(),
+                cwd: cwd.clone(),
+                title: title.clone(),
+                prompt: prompt.clone(),
+            });
+            let prompt_for_event = prompt.clone();
+            let started = start_turn_request(
+                &target,
+                &mut client,
+                thread_id,
+                prompt,
+                TurnStartOptions {
+                    model: None,
+                    effort: None,
+                    service_tier: None,
+                    yolo,
+                },
+            )
+            .await?;
+            stream_turn_id = Some(started.turn_id.clone());
+            let mut acceptance = started.acceptance.clone();
+            acceptance["prompt"] = json!(prompt_for_event);
+            send_stream_event(&app_tx, stream_id, acceptance);
+            wait_started_turn_stream(
+                &target,
+                &mut client,
+                started,
+                control_rx,
+                stream_id,
+                &app_tx,
+            )
+            .await
+        }
+        .await;
+        match created_thread_id {
+            Some(thread_id) => {
+                report_stream_task_result(
+                    &app_tx,
+                    stream_id,
+                    server,
+                    thread_id,
+                    stream_turn_id,
+                    result,
+                );
+            }
+            None => {
+                if let Err(error) = result {
+                    let _ = app_tx.send(AppEvent::SessionCreateFailed {
+                        server,
+                        error: format!("{error:#}"),
+                    });
+                }
+            }
+        }
+    });
+}
+
 fn handle_app_event(event: AppEvent, state: &mut TuiState) {
     match event {
         AppEvent::BrowserLoaded {
@@ -3356,6 +3627,65 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             error,
         } => {
             state.set_notice(format!("failed to load {server}/{thread_id}: {error}"));
+        }
+        AppEvent::SessionCreated {
+            stream_id,
+            server,
+            thread_id,
+            cwd,
+            title,
+            prompt,
+        } => {
+            let sent_at = format_current_epoch();
+            let row_title = title.unwrap_or_else(|| {
+                prompt
+                    .lines()
+                    .next()
+                    .unwrap_or(thread_id.as_str())
+                    .to_string()
+            });
+            state.browser.rows.insert(
+                0,
+                ThreadRow {
+                    server: server.clone(),
+                    id: thread_id.clone(),
+                    title: row_title,
+                    status: "active".to_string(),
+                    updated: sent_at.clone(),
+                    cwd,
+                    annotation: None,
+                    snippet: None,
+                    raw: json!({}),
+                },
+            );
+            state.browser.selected = 0;
+            state.browser.row_offset = 0;
+            state.stream = Some(StreamState::new_for_server_with_id(
+                stream_id,
+                server.clone(),
+                thread_id.clone(),
+                None,
+                StreamStatus::Starting,
+                false,
+            ));
+            state.browser.preview.epoch += 1;
+            state.browser.preview.server = Some(server);
+            state.browser.preview.thread_id = Some(thread_id);
+            state.browser.preview.loading = false;
+            state.browser.preview.error = None;
+            state.browser.preview.messages = vec![message_block(
+                None,
+                None,
+                "user",
+                Some(sent_at),
+                &prompt,
+                100,
+            )];
+            state.set_notice("session created");
+        }
+        AppEvent::SessionCreateFailed { server, error } => {
+            state.stream_control = None;
+            state.set_notice(format!("create session on {server} failed: {error}"));
         }
         AppEvent::StreamEvent { stream_id, event } => {
             log_stream_event(&event);
@@ -10019,6 +10349,202 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::empty(),
         }
+    }
+
+    fn test_targets_named(servers: &[&str]) -> TuiTargets {
+        TuiTargets::new(
+            servers
+                .iter()
+                .map(|server| Target {
+                    server: server.to_string(),
+                    endpoint: crate::config::Endpoint::Unix {
+                        path: std::path::PathBuf::from(format!("/tmp/{server}.sock")),
+                    },
+                    model: None,
+                    model_reasoning_effort: None,
+                })
+                .collect(),
+        )
+        .expect("targets")
+    }
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn new_session_flow_prefills_from_selected_row_and_opens_compose() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut row = test_thread_row("t1", "idle");
+        row.cwd = "/repos/project".to_string();
+        state.browser.rows = vec![row];
+        state.browser.selected = 0;
+
+        start_new_session_flow(&mut state, &test_targets_named(&["work"]));
+        let Mode::NewSessionCwdInput { draft } = &state.mode else {
+            panic!("expected cwd input, got {:?}", state.mode);
+        };
+        assert_eq!(draft.server, "work");
+        assert_eq!(draft.cwd, "/repos/project");
+
+        // Accept the prefilled cwd, then provide a title.
+        let Mode::NewSessionCwdInput { draft } = std::mem::replace(&mut state.mode, Mode::Browser)
+        else {
+            unreachable!();
+        };
+        handle_new_session_cwd_input(plain_key(KeyCode::Enter), &mut state, draft);
+        let Mode::NewSessionTitleInput { mut draft } =
+            std::mem::replace(&mut state.mode, Mode::Browser)
+        else {
+            panic!("expected title input");
+        };
+        draft.title.push_str("My session");
+        handle_new_session_title_input(plain_key(KeyCode::Enter), &mut state, draft);
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose, got {:?}", state.mode);
+        };
+        assert_eq!(
+            compose.target,
+            ComposeTarget::NewThread {
+                server: "work".to_string(),
+                cwd: "/repos/project".to_string(),
+                title: Some("My session".to_string()),
+            }
+        );
+        assert!(!compose.return_to_detail);
+    }
+
+    #[test]
+    fn new_session_flow_rejects_empty_cwd_and_allows_empty_title() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let draft = NewSessionDraft {
+            server: "work".to_string(),
+            cwd: "   ".to_string(),
+            title: String::new(),
+        };
+        handle_new_session_cwd_input(plain_key(KeyCode::Enter), &mut state, draft);
+        assert!(
+            matches!(state.mode, Mode::NewSessionCwdInput { .. }),
+            "empty cwd must stay on the cwd prompt"
+        );
+
+        let draft = NewSessionDraft {
+            server: "work".to_string(),
+            cwd: "/repos/project".to_string(),
+            title: String::new(),
+        };
+        handle_new_session_title_input(plain_key(KeyCode::Enter), &mut state, draft);
+        let Mode::Compose(compose) = &state.mode else {
+            panic!("expected compose");
+        };
+        assert_eq!(
+            compose.target,
+            ComposeTarget::NewThread {
+                server: "work".to_string(),
+                cwd: "/repos/project".to_string(),
+                title: None,
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_flow_offers_server_menu_for_multi_server() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        let mut row = test_thread_row("t1", "idle");
+        row.server = "second".to_string();
+        row.cwd = "/repos/project".to_string();
+        state.browser.rows = vec![row];
+        state.browser.selected = 0;
+
+        start_new_session_flow(&mut state, &test_targets_named(&["first", "second"]));
+        let Mode::NewSessionServerMenu {
+            draft,
+            servers,
+            selected,
+        } = &state.mode
+        else {
+            panic!("expected server menu, got {:?}", state.mode);
+        };
+        assert_eq!(servers, &["first".to_string(), "second".to_string()]);
+        assert_eq!(
+            *selected, 1,
+            "selection defaults to the selected row's server"
+        );
+        assert_eq!(draft.server, "second");
+    }
+
+    #[test]
+    fn session_created_inserts_row_seeds_stream_and_preview() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("existing", "idle")];
+        state.browser.selected = 0;
+
+        handle_app_event(
+            AppEvent::SessionCreated {
+                stream_id: 9,
+                server: "work".to_string(),
+                thread_id: "thread_new".to_string(),
+                cwd: "/repos/project".to_string(),
+                title: Some("Fresh session".to_string()),
+                prompt: "hello there".to_string(),
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.browser.rows.len(), 2);
+        assert_eq!(state.browser.rows[0].id, "thread_new");
+        assert_eq!(state.browser.rows[0].title, "Fresh session");
+        assert_eq!(state.browser.rows[0].cwd, "/repos/project");
+        assert_eq!(state.browser.selected, 0);
+        let stream = state.stream.as_ref().expect("stream");
+        assert_eq!(stream.id, 9);
+        assert_eq!(stream.thread_id, "thread_new");
+        assert_eq!(
+            state.browser.preview.thread_id.as_deref(),
+            Some("thread_new")
+        );
+        assert_eq!(state.browser.preview.messages.len(), 1);
+        assert_eq!(state.browser.preview.messages[0].role, "user");
+        assert_eq!(
+            message_text(&state.browser.preview.messages[0]),
+            "hello there"
+        );
     }
 
     fn test_thread_row(id: &str, status: &str) -> ThreadRow {

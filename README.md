@@ -51,7 +51,7 @@ CLI as a safety boundary.
   single configured server.
 - Thread list, search, detail, status, and flattened message history commands.
 - Interactive TUI browser for listing, searching, viewing, annotating,
-  refreshing, sending, steering, and interrupting threads.
+  refreshing, sending, steering, interrupting, and creating threads.
 - Local thread annotations projected into list, search, and detail output.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
@@ -230,6 +230,13 @@ with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
 `m` to compose. Use
 `l` to explicitly load the selected or open thread, matching
 `status THREAD_ID --load`, then refresh visible metadata and history.
+In the browser, `n` creates a new session: pick the server when more than one
+is configured, confirm the working directory (prefilled from the selected
+thread, falling back to the TUI's launch directory), optionally name the
+session up front, then type the first message. The thread is created when the
+message is sent — `Esc` at any step cancels without creating anything — and
+the new row appears selected at the top while the first turn streams into the
+preview.
 Compose uses `Enter` to submit and `Ctrl-J` to insert a newline. On active
 threads, compose defaults to steering the active turn; `Tab` switches to a
 normal new-turn send, and `Tab` switches back to steer while the thread remains

@@ -89,6 +89,18 @@ pub(crate) enum AppEvent {
         thread_id: String,
         error: String,
     },
+    SessionCreated {
+        stream_id: u64,
+        server: String,
+        thread_id: String,
+        cwd: String,
+        title: Option<String>,
+        prompt: String,
+    },
+    SessionCreateFailed {
+        server: String,
+        error: String,
+    },
     StreamEvent {
         stream_id: Option<u64>,
         event: Value,
