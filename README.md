@@ -3,6 +3,17 @@
 `codex-threads` is a companion CLI for inspecting and controlling Codex
 app-server threads from a terminal or another agent.
 
+> [!IMPORTANT]
+> `codex-threads` only sees threads on the Codex app-server instance it
+> connects to. This tool is built around running a shared, long-lived
+> `codex app-server --listen <socket>` (Unix domain socket or WebSocket),
+> pointing `codex-threads` at that socket, and starting interactive Codex TUI
+> sessions against the same socket with `codex --remote <socket>`. Codex
+> sessions started without `--remote` are not on that shared server, so
+> `codex-threads` cannot list, inspect, or control them — an empty thread list
+> usually means this setup is missing, not that something is broken. See
+> [Quickstart](#quickstart) for the full setup.
+
 It exists for workflows the Codex CLI does not currently cover well: asking
 what threads were active recently, what happened in a repo, whether a thread is
 still running, and sending a follow-up to an existing session. The Codex desktop
