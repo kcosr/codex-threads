@@ -237,7 +237,9 @@ operation. In detail, `T` attaches to an active turn, `i` confirms interrupt,
 active, and `q` quits. Normal send uses Codex app-server's `turn/start` path;
 steer uses `turn/steer` when the thread is active and the composer is in steer
 mode. Attaching resumes the thread with turns included so the active-turn
-snapshot appears before new stream notifications.
+snapshot appears before new stream notifications; deltas that arrive while the
+snapshot is being fetched are trimmed against it, so attached transcripts
+continue from the snapshot without replaying text it already contains.
 Opening a thread loads a small recent turn window, orders it chronologically,
 and starts at the bottom of the transcript. Scrolling up at the top loads the
 next older chunk above the current transcript and preserves the current view. In

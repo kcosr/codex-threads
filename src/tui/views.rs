@@ -1116,6 +1116,7 @@ mod tests {
                 item_id: Some("user-1".to_string()),
                 role: "user".to_string(),
                 timestamp: Some("2026-06-05 09:29".to_string()),
+                raw_text: "recent user message".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "recent user message".to_string(),
@@ -1128,6 +1129,7 @@ mod tests {
                 item_id: Some("assistant-1".to_string()),
                 role: "assistant".to_string(),
                 timestamp: Some("2026-06-05 09:30".to_string()),
+                raw_text: "recent assistant message".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "recent assistant message".to_string(),
@@ -1311,6 +1313,7 @@ mod tests {
                 item_id: Some("item-1".to_string()),
                 role: "assistant".to_string(),
                 timestamp: None,
+                raw_text: String::new(),
                 lines: (0..10)
                     .map(|index| MessageLine {
                         kind: MessageLineKind::Text,
@@ -1653,6 +1656,7 @@ mod tests {
                     item_id: Some("item-1".to_string()),
                     role: "user".to_string(),
                     timestamp: Some("2026-06-05 09:00".to_string()),
+                    raw_text: "Please inspect this".to_string(),
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Please inspect this".to_string(),
@@ -1665,6 +1669,7 @@ mod tests {
                     item_id: Some("item-2".to_string()),
                     role: "assistant".to_string(),
                     timestamp: Some("2026-06-05 09:01".to_string()),
+                    raw_text: "First response line\nContinuation line".to_string(),
                     lines: vec![
                         MessageLine {
                             kind: MessageLineKind::Text,
@@ -1684,6 +1689,7 @@ mod tests {
                     item_id: Some("item-2b".to_string()),
                     role: "assistant".to_string(),
                     timestamp: Some("2026-06-05 09:01".to_string()),
+                    raw_text: "Second assistant item".to_string(),
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Second assistant item".to_string(),
@@ -1696,6 +1702,7 @@ mod tests {
                     item_id: Some("item-3".to_string()),
                     role: "user".to_string(),
                     timestamp: Some("2026-06-05 09:02".to_string()),
+                    raw_text: "Next turn".to_string(),
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Next turn".to_string(),
@@ -1766,6 +1773,7 @@ mod tests {
                 item_id: Some("item-1".to_string()),
                 role: "user".to_string(),
                 timestamp: None,
+                raw_text: "transcript content".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "transcript content".to_string(),
@@ -1828,6 +1836,7 @@ mod tests {
                 item_id: Some("item-1".to_string()),
                 role: "user".to_string(),
                 timestamp: None,
+                raw_text: "detail stays visible".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "detail stays visible".to_string(),

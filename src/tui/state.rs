@@ -138,6 +138,9 @@ pub struct MessageBlock {
     pub item_id: Option<String>,
     pub role: String,
     pub timestamp: Option<String>,
+    /// Unrendered message text. `lines` is the wrapped markdown rendering and
+    /// cannot be used to recover the original text for prefix comparisons.
+    pub raw_text: String,
     pub lines: Vec<MessageLine>,
     pub is_match: bool,
 }
@@ -221,8 +224,6 @@ pub struct StreamAssistantItem {
     pub turn_id: Option<String>,
     pub item_id: Option<String>,
     pub text: String,
-    pub from_snapshot: bool,
-    pub replay_prefix_len: Option<usize>,
 }
 
 impl StreamState {

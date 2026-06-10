@@ -4190,12 +4190,7 @@ fn pending_message_matches(message: &MessageBlock, prompt: Option<&str>) -> bool
 }
 
 fn message_text(message: &MessageBlock) -> String {
-    message
-        .lines
-        .iter()
-        .map(|line| line.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    message.raw_text.clone()
 }
 
 fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
@@ -4240,8 +4235,11 @@ fn append_stream_assistant_delta(
     item_id: Option<String>,
     delta: &str,
 ) -> StreamAssistantItem {
+    // Deltas are exact continuations of the text streamed so far: the turn
+    // wait layer trims any replayed content against the attach snapshot
+    // before emitting (see reconcile_replayed_deltas in turns.rs).
     let item = stream_assistant_item_mut_for_delta(stream, turn_id, item_id);
-    merge_stream_delta(item, delta);
+    item.text.push_str(delta);
     item.clone()
 }
 
@@ -4251,9 +4249,8 @@ fn set_stream_assistant_text(
     item_id: Option<String>,
     text: &str,
 ) -> StreamAssistantItem {
-    let item = stream_assistant_item_mut_for_text(stream, turn_id, item_id, text);
+    let item = stream_assistant_item_mut_for_text(stream, turn_id, item_id);
     item.text = text.to_string();
-    item.replay_prefix_len = None;
     item.clone()
 }
 
@@ -4265,8 +4262,6 @@ fn set_stream_assistant_snapshot_text(
 ) {
     let item = stream_assistant_item_mut(stream, turn_id, item_id);
     item.text = text.to_string();
-    item.from_snapshot = true;
-    item.replay_prefix_len = None;
 }
 
 fn stream_assistant_item_mut_for_delta(
@@ -4296,14 +4291,6 @@ fn stream_assistant_item_mut_for_delta(
         }
         return item;
     }
-    if item_id.is_some()
-        && let Some(index) = stream
-            .assistant_items
-            .iter()
-            .rposition(|item| assistant_item_snapshot_match(item, incoming_turn_id))
-    {
-        return &mut stream.assistant_items[index];
-    }
     if item_id.is_none()
         && let Some(index) = stream
             .assistant_items
@@ -4319,12 +4306,11 @@ fn stream_assistant_item_mut_for_delta(
     push_stream_assistant_item(stream, turn_id, item_id)
 }
 
-fn stream_assistant_item_mut_for_text<'a>(
-    stream: &'a mut StreamState,
+fn stream_assistant_item_mut_for_text(
+    stream: &mut StreamState,
     turn_id: Option<String>,
     item_id: Option<String>,
-    text: &str,
-) -> &'a mut StreamAssistantItem {
+) -> &mut StreamAssistantItem {
     let incoming_item_id = item_id.as_deref();
     let incoming_turn_id = turn_id.as_deref();
     if let Some(index) = stream
@@ -4346,14 +4332,6 @@ fn stream_assistant_item_mut_for_text<'a>(
             item.turn_id = turn_id;
         }
         return item;
-    }
-    if item_id.is_some()
-        && let Some(index) = stream.assistant_items.iter().rposition(|item| {
-            assistant_item_snapshot_match(item, incoming_turn_id)
-                && stream_texts_related(&item.text, text)
-        })
-    {
-        return &mut stream.assistant_items[index];
     }
     push_stream_assistant_item(stream, turn_id, item_id)
 }
@@ -4407,55 +4385,11 @@ fn push_stream_assistant_item(
         turn_id,
         item_id,
         text: String::new(),
-        from_snapshot: false,
-        replay_prefix_len: None,
     });
     stream
         .assistant_items
         .last_mut()
         .expect("stream assistant item just pushed")
-}
-
-fn merge_stream_delta(item: &mut StreamAssistantItem, delta: &str) {
-    if delta.is_empty() {
-        return;
-    }
-    if let Some(prefix_len) = item.replay_prefix_len
-        && let Some(remaining) = item.text.get(prefix_len..)
-        && remaining.starts_with(delta)
-    {
-        item.replay_prefix_len = Some(prefix_len + delta.len());
-        return;
-    }
-    if item.from_snapshot && item.text.starts_with(delta) {
-        item.replay_prefix_len = Some(delta.len());
-        return;
-    }
-    let overlap = append_overlap_len(&item.text, delta);
-    item.text.push_str(&delta[overlap..]);
-    item.replay_prefix_len = None;
-}
-
-fn append_overlap_len(existing: &str, fragment: &str) -> usize {
-    let max = existing.len().min(fragment.len());
-    let mut candidates = fragment
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(fragment.len()))
-        .filter(|length| *length <= max)
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|left, right| right.cmp(left));
-    candidates
-        .into_iter()
-        .find(|length| existing.ends_with(&fragment[..*length]))
-        .unwrap_or(0)
-}
-
-fn stream_texts_related(existing: &str, incoming: &str) -> bool {
-    existing == incoming
-        || existing.starts_with(incoming)
-        || incoming.starts_with(existing)
-        || append_overlap_len(existing, incoming) > 0
 }
 
 fn assistant_item_exact_match(
@@ -4475,10 +4409,6 @@ fn assistant_item_provisional_match(item: &StreamAssistantItem, turn_id: Option<
     item.item_id.is_none()
         && turn_id.is_some()
         && turns_compatible(item.turn_id.as_deref(), turn_id)
-}
-
-fn assistant_item_snapshot_match(item: &StreamAssistantItem, turn_id: Option<&str>) -> bool {
-    item.from_snapshot && turns_compatible(item.turn_id.as_deref(), turn_id)
 }
 
 fn turns_compatible(existing: Option<&str>, incoming: Option<&str>) -> bool {
@@ -4516,6 +4446,7 @@ fn upsert_streaming_assistant_message(
     }
     if let Some(message) = message_index.and_then(|index| detail.messages.get_mut(index)) {
         message.lines = markdown_lines(&display_text, 100);
+        message.raw_text = display_text;
         if message.turn_id.is_none() {
             message.turn_id = turn_id.clone();
         }
@@ -4565,6 +4496,7 @@ fn upsert_preview_assistant_message(
     }
     if let Some(message) = message_index.and_then(|index| messages.get_mut(index)) {
         message.lines = markdown_lines(&display_text, 100);
+        message.raw_text = display_text;
         if message.turn_id.is_none() {
             message.turn_id = turn_id.clone();
         }
@@ -5148,6 +5080,7 @@ fn message_block(
         item_id,
         role: role.to_string(),
         timestamp,
+        raw_text: text.to_string(),
         lines: markdown_lines(text, width),
         is_match: false,
     }
@@ -6703,8 +6636,6 @@ mod tests {
                 turn_id: Some("turn-1".to_string()),
                 item_id: Some("assistant-1".to_string()),
                 text: "old text".to_string(),
-                from_snapshot: false,
-                replay_prefix_len: None,
             });
 
         handle_app_event(
@@ -6776,8 +6707,6 @@ mod tests {
                 turn_id: Some("turn-1".to_string()),
                 item_id: Some("assistant-1".to_string()),
                 text: "before steer".to_string(),
-                from_snapshot: true,
-                replay_prefix_len: None,
             });
 
         handle_app_event(
@@ -8087,7 +8016,7 @@ mod tests {
     }
 
     #[test]
-    fn replayed_deltas_after_snapshot_do_not_duplicate_assistant_message() {
+    fn post_attach_new_item_deltas_create_separate_message() {
         let mut state = TuiState::new(TuiInit {
             query: None,
             since: None,
@@ -8127,9 +8056,9 @@ mod tests {
                             "startedAt": 1_700_000_000,
                             "items": [
                                 {
-                                    "id": "snapshot-assistant",
+                                    "id": "assistant-1",
                                     "type": "agentMessage",
-                                    "text": "The full paragraph"
+                                    "text": "First paragraph"
                                 }
                             ],
                             "itemsView": "full"
@@ -8140,13 +8069,15 @@ mod tests {
             &mut state,
         );
 
-        for delta in ["The full", " paragraph", " with live suffix"] {
+        // An item that starts streaming after the attach snapshot must render
+        // as its own message instead of merging into the snapshot item.
+        for delta in ["Second", " paragraph"] {
             handle_app_event(
                 stream_event(serde_json::json!({
                     "type": "progress",
                     "threadId": "t1",
                     "turnId": "turn-1",
-                    "itemId": "live-assistant",
+                    "itemId": "assistant-2",
                     "delta": delta
                 })),
                 &mut state,
@@ -8157,23 +8088,138 @@ mod tests {
                 "type": "assistantMessage",
                 "threadId": "t1",
                 "turnId": "turn-1",
-                "itemId": "live-assistant",
-                "text": "The full paragraph with live suffix"
+                "itemId": "assistant-2",
+                "text": "Second paragraph"
             })),
             &mut state,
         );
 
         let detail = state.detail.as_ref().expect("detail");
-        assert_eq!(detail.messages.len(), 1);
-        assert_eq!(
-            detail.messages[0].lines[0].text,
-            "The full paragraph with live suffix"
-        );
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(message_text(&detail.messages[0]), "First paragraph");
+        assert_eq!(detail.messages[1].item_id.as_deref(), Some("assistant-2"));
+        assert_eq!(message_text(&detail.messages[1]), "Second paragraph");
         let stream = state.stream.as_ref().expect("stream");
-        assert_eq!(stream.assistant_items.len(), 1);
+        assert_eq!(stream.assistant_items.len(), 2);
+        assert_eq!(stream.assistant_items[0].text, "First paragraph");
+        assert_eq!(stream.assistant_items[1].text, "Second paragraph");
+    }
+
+    #[test]
+    fn poll_full_text_for_wrapped_presteer_item_does_not_duplicate() {
+        let long_paragraph = "This assistant paragraph is deliberately much longer than one \
+            hundred columns so that the markdown renderer wraps it across multiple lines in \
+            the transcript view.";
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "u1", "type": "userMessage", "content": [{"text": "start"}]},
+                        {"id": "assistant-1", "type": "agentMessage", "text": long_paragraph}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        append_detail_message(
+            &mut state,
+            "t1",
+            Some("turn-1".to_string()),
+            "user",
+            None,
+            "steer here",
+        );
+        assert!(
+            state.detail.as_ref().expect("detail").messages[1]
+                .lines
+                .len()
+                > 1,
+            "fixture paragraph must wrap"
+        );
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        // A poll re-emits the pre-steer item's full text unchanged: nothing
+        // new to display.
+        handle_app_event(
+            stream_event_for(
+                7,
+                serde_json::json!({
+                    "type": "progress",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-1",
+                    "text": long_paragraph,
+                    "source": "poll"
+                }),
+            ),
+            &mut state,
+        );
+
+        let rendered = |state: &TuiState| {
+            state
+                .detail
+                .as_ref()
+                .expect("detail")
+                .messages
+                .iter()
+                .map(|message| format!("{}:{}", message.role, message_text(message)))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            stream.assistant_items[0].text,
-            "The full paragraph with live suffix"
+            rendered(&state),
+            vec![
+                "user:start".to_string(),
+                format!("assistant:{long_paragraph}"),
+                "user:steer here".to_string(),
+            ]
+        );
+
+        // When the item later grows, only the continuation renders below the
+        // steer message.
+        handle_app_event(
+            stream_event_for(
+                7,
+                serde_json::json!({
+                    "type": "progress",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-1",
+                    "text": format!("{long_paragraph} Continued after steer."),
+                    "source": "poll"
+                }),
+            ),
+            &mut state,
+        );
+        assert_eq!(
+            rendered(&state),
+            vec![
+                "user:start".to_string(),
+                format!("assistant:{long_paragraph}"),
+                "user:steer here".to_string(),
+                "assistant:Continued after steer.".to_string(),
+            ]
         );
     }
 

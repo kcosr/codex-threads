@@ -29,6 +29,7 @@ pub struct StartedTurn {
     prompt: Option<String>,
     started_after_epoch: Option<i64>,
     early_notifications: Vec<Notification>,
+    assistant_seed: AssistantResponses,
 }
 
 impl StartedTurn {
@@ -159,6 +160,126 @@ impl AssistantResponses {
     }
 }
 
+/// Builds the assistant accumulator state implied by a `thread/resume`
+/// snapshot, so that turn waiting starts from the same view of the turn the
+/// snapshot describes instead of an empty one. Without this, the first poll
+/// re-emits the full text of every item already present in the snapshot.
+#[cfg(feature = "tui")]
+fn assistant_seed_from_thread_snapshot(thread: &Value, turn_id: &str) -> AssistantResponses {
+    let mut assistant = AssistantResponses::default();
+    for turn in thread["turns"].as_array().unwrap_or(&Vec::new()) {
+        if turn["id"].as_str() != Some(turn_id) {
+            continue;
+        }
+        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
+            if item["type"].as_str() != Some("agentMessage") {
+                continue;
+            }
+            let Some(text) = item["text"].as_str() else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            assistant.set_text(item["id"].as_str(), text);
+        }
+    }
+    assistant
+}
+
+/// Drops or trims agent-message deltas that were buffered while the
+/// `thread/resume` request was in flight and whose content the resume
+/// snapshot already includes. The server generates the snapshot after sending
+/// those deltas, so replaying them verbatim duplicates text downstream.
+///
+/// Within one item the buffered deltas are contiguous, so their concatenation
+/// overlaps the snapshot text's tail by exactly the already-included portion.
+/// After this pass, every delta that flows downstream is an exact, new
+/// continuation of the text emitted so far.
+#[cfg(feature = "tui")]
+fn reconcile_replayed_deltas(
+    assistant: &AssistantResponses,
+    thread_id: &str,
+    turn_id: &str,
+    notifications: Vec<Notification>,
+) -> Vec<Notification> {
+    let is_replayed_delta = |notification: &Notification| {
+        notification.method == "item/agentMessage/delta"
+            && notification.params["threadId"] == thread_id
+            && notification.params["turnId"] == turn_id
+    };
+    let mut replayed: Vec<(Option<String>, String, usize)> = Vec::new();
+    for notification in notifications.iter().filter(|n| is_replayed_delta(n)) {
+        let item_id = notification.params["itemId"].as_str();
+        let delta = notification.params["delta"].as_str().unwrap_or("");
+        match replayed
+            .iter_mut()
+            .find(|(id, _, _)| id.as_deref() == item_id)
+        {
+            Some((_, text, _)) => text.push_str(delta),
+            None => replayed.push((item_id.map(str::to_string), delta.to_string(), 0)),
+        }
+    }
+    for (item_id, text, skip) in &mut replayed {
+        let known = assistant.text_for_item(item_id.as_deref()).unwrap_or("");
+        *skip = replayed_prefix_len(known, text);
+    }
+
+    let mut consumed: Vec<(Option<String>, usize)> = Vec::new();
+    let mut out = Vec::with_capacity(notifications.len());
+    for mut notification in notifications {
+        if !is_replayed_delta(&notification) {
+            out.push(notification);
+            continue;
+        }
+        let item_id = notification.params["itemId"].as_str().map(str::to_string);
+        let delta_len = notification.params["delta"].as_str().unwrap_or("").len();
+        let skip = replayed
+            .iter()
+            .find(|(id, _, _)| *id == item_id)
+            .map(|(_, _, skip)| *skip)
+            .unwrap_or(0);
+        let start = match consumed.iter_mut().find(|(id, _)| *id == item_id) {
+            Some((_, position)) => {
+                let start = *position;
+                *position += delta_len;
+                start
+            }
+            None => {
+                consumed.push((item_id, delta_len));
+                0
+            }
+        };
+        if start + delta_len <= skip {
+            continue;
+        }
+        if start < skip {
+            let trimmed = notification.params["delta"]
+                .as_str()
+                .map(|delta| delta[skip - start..].to_string())
+                .unwrap_or_default();
+            notification.params["delta"] = json!(trimmed);
+        }
+        out.push(notification);
+    }
+    out
+}
+
+/// Longest prefix of `replayed` that is also a suffix of `existing`, measured
+/// in bytes at a char boundary of `replayed`.
+#[cfg(feature = "tui")]
+fn replayed_prefix_len(existing: &str, replayed: &str) -> usize {
+    let max = existing.len().min(replayed.len());
+    replayed
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(replayed.len()))
+        .filter(|length| *length <= max)
+        .rev()
+        .find(|length| existing.ends_with(&replayed[..*length]))
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "tui")]
 pub struct AttachTurnOptions {
     pub thread_id: String,
@@ -249,6 +370,13 @@ where
         |notification| early_notifications.push(notification),
     )
     .await?;
+    let assistant_seed = assistant_seed_from_thread_snapshot(&resume["thread"], &options.turn_id);
+    let early_notifications = reconcile_replayed_deltas(
+        &assistant_seed,
+        &options.thread_id,
+        &options.turn_id,
+        early_notifications,
+    );
     let attached = json!({
         "type": "attached",
         "server": target.server,
@@ -268,6 +396,7 @@ where
             prompt: None,
             started_after_epoch: None,
             early_notifications,
+            assistant_seed,
         },
         ControlledTurnWaitOptions {
             poll_limit: options.poll_limit,
@@ -296,7 +425,7 @@ where
     G: FnMut(&str) -> Result<()>,
 {
     let mut events = vec![started.acceptance];
-    let mut assistant = AssistantResponses::default();
+    let mut assistant = started.assistant_seed;
     let mut wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
@@ -481,6 +610,7 @@ pub async fn start_turn(
             .lock()
             .expect("early notification buffer poisoned")
             .clone(),
+        assistant_seed: AssistantResponses::default(),
     })
 }
 
@@ -498,7 +628,7 @@ where
     G: FnMut(&str) -> Result<()>,
 {
     let mut events = vec![started.acceptance];
-    let mut assistant = AssistantResponses::default();
+    let mut assistant = started.assistant_seed;
     let mut wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
@@ -839,6 +969,207 @@ mod tests {
 
     use super::*;
     use crate::config::Endpoint;
+
+    #[cfg(feature = "tui")]
+    fn delta_notification(item_id: &str, delta: &str) -> Notification {
+        Notification {
+            method: "item/agentMessage/delta".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": item_id,
+                "delta": delta
+            }),
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    fn replayed_delta_texts(notifications: &[Notification]) -> Vec<String> {
+        notifications
+            .iter()
+            .map(|notification| {
+                notification.params["delta"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_replayed_deltas_drops_content_already_in_snapshot() {
+        // The item streamed as "The full" + " paragraph" + " with live" +
+        // " suffix". The resume snapshot was generated after the third delta;
+        // the deltas in flight during the resume RPC are buffered and would
+        // otherwise replay content the snapshot already includes.
+        let mut assistant = AssistantResponses::default();
+        assistant.set_text(Some("assistant-1"), "The full paragraph with live");
+
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![
+                delta_notification("assistant-1", " paragraph"),
+                delta_notification("assistant-1", " with live"),
+                delta_notification("assistant-1", " suffix"),
+            ],
+        );
+
+        assert_eq!(replayed_delta_texts(&reconciled), vec![" suffix"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_replayed_deltas_drops_replay_from_item_start() {
+        let mut assistant = AssistantResponses::default();
+        assistant.set_text(Some("assistant-1"), "Hello");
+
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![
+                delta_notification("assistant-1", "Hel"),
+                delta_notification("assistant-1", "lo"),
+                delta_notification("assistant-1", " world"),
+            ],
+        );
+
+        assert_eq!(replayed_delta_texts(&reconciled), vec![" world"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_replayed_deltas_trims_delta_spanning_snapshot_boundary() {
+        let mut assistant = AssistantResponses::default();
+        assistant.set_text(Some("assistant-1"), "AB");
+
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![
+                delta_notification("assistant-1", "A"),
+                delta_notification("assistant-1", "BC"),
+            ],
+        );
+
+        assert_eq!(replayed_delta_texts(&reconciled), vec!["C"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_replayed_deltas_trims_at_multibyte_boundaries() {
+        let mut assistant = AssistantResponses::default();
+        assistant.set_text(Some("assistant-1"), "héllo wö");
+
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![
+                delta_notification("assistant-1", "héllo"),
+                delta_notification("assistant-1", " wörld"),
+            ],
+        );
+
+        assert_eq!(replayed_delta_texts(&reconciled), vec!["rld"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_replayed_deltas_keeps_unknown_items_and_other_threads() {
+        let mut assistant = AssistantResponses::default();
+        assistant.set_text(Some("assistant-1"), "known text");
+
+        let other_thread = Notification {
+            method: "item/agentMessage/delta".to_string(),
+            params: json!({
+                "threadId": "thread-2",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": "known text"
+            }),
+        };
+        let completed = Notification {
+            method: "item/completed".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": "assistant-1", "type": "agentMessage", "text": "known text"}
+            }),
+        };
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![
+                delta_notification("assistant-2", "new item text"),
+                other_thread,
+                completed,
+            ],
+        );
+
+        assert_eq!(reconciled.len(), 3);
+        assert_eq!(reconciled[0].params["delta"], "new item text");
+        assert_eq!(reconciled[1].params["threadId"], "thread-2");
+        assert_eq!(reconciled[1].params["delta"], "known text");
+        assert_eq!(reconciled[2].method, "item/completed");
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn assistant_seed_from_snapshot_suppresses_poll_rebroadcast() {
+        let thread = json!({
+            "turns": [
+                {
+                    "id": "turn-1",
+                    "items": [
+                        {"id": "user-1", "type": "userMessage", "content": [{"text": "go"}]},
+                        {"id": "assistant-1", "type": "agentMessage", "text": "First paragraph"},
+                        {"id": "assistant-2", "type": "agentMessage", "text": "Second part"}
+                    ]
+                },
+                {
+                    "id": "turn-0",
+                    "items": [
+                        {"id": "assistant-0", "type": "agentMessage", "text": "Older turn"}
+                    ]
+                }
+            ]
+        });
+        let mut assistant = assistant_seed_from_thread_snapshot(&thread, "turn-1");
+        assert_eq!(
+            assistant.text_for_item(Some("assistant-1")),
+            Some("First paragraph")
+        );
+        assert_eq!(assistant.text_for_item(Some("assistant-0")), None);
+
+        // Polling the same state right after attaching must not re-emit the
+        // items the snapshot already delivered.
+        let unchanged = json!({
+            "id": "turn-1",
+            "items": [
+                {"id": "assistant-1", "type": "agentMessage", "text": "First paragraph"},
+                {"id": "assistant-2", "type": "agentMessage", "text": "Second part"}
+            ]
+        });
+        assert!(assistant.sync_from_turn(&unchanged).is_empty());
+
+        let advanced = json!({
+            "id": "turn-1",
+            "items": [
+                {"id": "assistant-1", "type": "agentMessage", "text": "First paragraph"},
+                {"id": "assistant-2", "type": "agentMessage", "text": "Second part grew"}
+            ]
+        });
+        let updates = assistant.sync_from_turn(&advanced);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].item_id.as_deref(), Some("assistant-2"));
+        assert_eq!(updates[0].text, "Second part grew");
+    }
 
     #[test]
     fn turn_terminal_preserves_multiple_assistant_item_responses() {
