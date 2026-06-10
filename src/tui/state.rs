@@ -67,6 +67,9 @@ pub struct BrowserState {
     pub query: String,
     pub rows: Vec<ThreadRow>,
     pub selected: usize,
+    /// First row rendered in the browser table; kept in sync with `selected`
+    /// each frame so the selection stays inside the visible window.
+    pub row_offset: usize,
     pub next_cursor: Option<String>,
     pub backwards_cursor: Option<String>,
     pub current_cursor: Option<String>,
@@ -83,6 +86,25 @@ pub struct BrowserState {
     pub preview: BrowserPreviewState,
     pub last_refresh_at: Option<Instant>,
     pub last_error: Option<String>,
+}
+
+impl BrowserState {
+    /// Clamps `row_offset` so the selected row stays within the
+    /// `visible_rows`-tall window the browser table can actually render.
+    pub fn clamp_row_offset(&mut self, visible_rows: usize) {
+        if self.rows.is_empty() || visible_rows == 0 {
+            self.row_offset = 0;
+            return;
+        }
+        self.row_offset = self
+            .row_offset
+            .min(self.rows.len().saturating_sub(visible_rows));
+        if self.selected < self.row_offset {
+            self.row_offset = self.selected;
+        } else if self.selected >= self.row_offset + visible_rows {
+            self.row_offset = self.selected + 1 - visible_rows;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -340,6 +362,7 @@ impl TuiState {
                 query,
                 rows: Vec::new(),
                 selected: 0,
+                row_offset: 0,
                 next_cursor: None,
                 backwards_cursor: None,
                 current_cursor: None,

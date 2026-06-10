@@ -157,10 +157,14 @@ fn compose_new_turn_can_steer(state: &TuiState, compose: &ComposeState) -> bool 
 }
 
 pub fn sync_viewport_state(state: &mut TuiState, area: Rect) {
+    let chunks = root_chunks(area);
+    let (table_area, _) = browser_areas(state, chunks[0]);
+    state
+        .browser
+        .clamp_row_offset(browser_visible_rows(table_area));
     if state.detail.is_none() {
         return;
     }
-    let chunks = root_chunks(area);
     let detail_chunks = detail_chunks(chunks[0]);
     if let Some(detail) = &mut state.detail {
         detail.set_viewport_size(
@@ -188,8 +192,8 @@ fn detail_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let (table_area, preview_area) = if state.prefs.browser.preview_pane && area.height >= 16 {
+fn browser_areas(state: &TuiState, area: Rect) -> (Rect, Option<Rect>) {
+    if state.prefs.browser.preview_pane && area.height >= 16 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -197,7 +201,17 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         (chunks[0], Some(chunks[1]))
     } else {
         (area, None)
-    };
+    }
+}
+
+/// Data rows that fit in the browser table: the area minus its two border
+/// rows and the header row.
+fn browser_visible_rows(table_area: Rect) -> usize {
+    table_area.height.saturating_sub(3) as usize
+}
+
+fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let (table_area, preview_area) = browser_areas(state, area);
     let visible = state.visible_columns();
     let mut header = vec![Cell::from("THREAD")];
     if state.browser.multi_server {
@@ -217,43 +231,50 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
     let widths = browser_column_widths(table_area.width, visible, state.browser.multi_server);
 
-    let rows = state.browser.rows.iter().enumerate().map(|(index, row)| {
-        let title = if let Some(snippet) = &row.snippet {
-            format!("{}  {}", row.title, snippet)
-        } else {
-            row.title.clone()
-        };
-        let mut cells = vec![Cell::from(title)];
-        if state.browser.multi_server {
-            cells.push(Cell::from(row.server.clone()));
-        }
-        if visible.status {
-            cells.push(Cell::from(browser_row_status(
-                state,
-                &row.server,
-                &row.id,
-                &row.status,
-            )));
-        }
-        if visible.updated {
-            cells.push(Cell::from(row.updated.clone()));
-        }
-        if visible.cwd {
-            cells.push(Cell::from(compact_home_path(&row.cwd)));
-        }
-        if visible.annotation {
-            cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
-        }
-        let style = if index == state.browser.selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Row::new(cells).style(style)
-    });
+    let rows = state
+        .browser
+        .rows
+        .iter()
+        .enumerate()
+        .skip(state.browser.row_offset)
+        .take(browser_visible_rows(table_area))
+        .map(|(index, row)| {
+            let title = if let Some(snippet) = &row.snippet {
+                format!("{}  {}", row.title, snippet)
+            } else {
+                row.title.clone()
+            };
+            let mut cells = vec![Cell::from(title)];
+            if state.browser.multi_server {
+                cells.push(Cell::from(row.server.clone()));
+            }
+            if visible.status {
+                cells.push(Cell::from(browser_row_status(
+                    state,
+                    &row.server,
+                    &row.id,
+                    &row.status,
+                )));
+            }
+            if visible.updated {
+                cells.push(Cell::from(row.updated.clone()));
+            }
+            if visible.cwd {
+                cells.push(Cell::from(compact_home_path(&row.cwd)));
+            }
+            if visible.annotation {
+                cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
+            }
+            let style = if index == state.browser.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Row::new(cells).style(style)
+        });
 
     let title = match state.browser.source {
         BrowserSource::List => " Threads ",
@@ -1081,6 +1102,104 @@ mod tests {
     };
 
     use super::*;
+
+    fn numbered_thread_row(index: usize) -> ThreadRow {
+        ThreadRow {
+            server: "work".to_string(),
+            id: format!("thread-{index:02}"),
+            title: format!("Thread {index:02}"),
+            status: "idle".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "/home/kevin/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn browser_selection_stays_visible_when_preview_pane_shrinks_table() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = (0..12).map(numbered_thread_row).collect();
+        state.browser.selected = 9;
+
+        // 18-row terminal: 16 rows for the browser, split 8/8 with the
+        // preview pane, leaving 5 visible table rows after borders + header.
+        let area = Rect::new(0, 0, 100, 18);
+        sync_viewport_state(&mut state, area);
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("Thread 09"), "selected row must stay visible");
+        assert!(text.contains("Thread 05"));
+        assert!(
+            !text.contains("Thread 04"),
+            "rows above window are scrolled out"
+        );
+        assert!(!text.contains("Thread 10"), "rows below window stay hidden");
+
+        // Moving back above the window scrolls it up again.
+        state.browser.selected = 2;
+        sync_viewport_state(&mut state, area);
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("Thread 02"));
+        assert!(!text.contains("Thread 09"));
+    }
+
+    #[test]
+    fn clamp_row_offset_tracks_selection_and_row_count() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = (0..12).map(numbered_thread_row).collect();
+
+        state.browser.selected = 9;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 5);
+
+        // Scrolling within the window keeps the offset stable.
+        state.browser.selected = 6;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 5);
+
+        state.browser.selected = 1;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 1);
+
+        // Shrinking the row list clamps a stale offset.
+        state.browser.selected = 0;
+        state.browser.row_offset = 10;
+        state.browser.rows.truncate(6);
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 0);
+
+        state.browser.rows.clear();
+        state.browser.row_offset = 3;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 0);
+    }
 
     #[test]
     fn browser_render_includes_rows_and_annotation_column() {
