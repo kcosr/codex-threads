@@ -3758,26 +3758,21 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     .or_else(|| stream.turn_id.clone());
                 seed_stream_from_resume_snapshot(stream, event_turn_id.as_deref(), &event);
                 if let Some(delta) = event["delta"].as_str() {
-                    let item_id = event["itemId"].as_str().map(str::to_string);
-                    let item = append_stream_assistant_delta(
-                        stream,
-                        event_turn_id.clone(),
-                        item_id.clone(),
-                        delta,
-                    );
+                    let ids = EventItemIds::from_value(&event);
+                    let item =
+                        append_stream_assistant_delta(stream, event_turn_id.clone(), &ids, delta);
                     assistant_updates.push((
                         item.turn_id.clone(),
-                        item.item_id.clone(),
+                        ids.with_resolved(item.item_id.as_deref()),
                         item.text.clone(),
                         false,
                     ));
                 } else if let Some(text) = event["text"].as_str() {
-                    let item_id = event["itemId"].as_str().map(str::to_string);
-                    let item =
-                        set_stream_assistant_text(stream, event_turn_id.clone(), item_id, text);
+                    let ids = EventItemIds::from_value(&event);
+                    let item = set_stream_assistant_text(stream, event_turn_id.clone(), &ids, text);
                     assistant_updates.push((
                         item.turn_id.clone(),
-                        item.item_id.clone(),
+                        ids.with_resolved(item.item_id.as_deref()),
                         item.text.clone(),
                         true,
                     ));
@@ -3786,12 +3781,12 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                         let Some(text) = response["text"].as_str() else {
                             continue;
                         };
-                        let item_id = response["itemId"].as_str().map(str::to_string);
+                        let ids = EventItemIds::from_value(response);
                         let item =
-                            set_stream_assistant_text(stream, event_turn_id.clone(), item_id, text);
+                            set_stream_assistant_text(stream, event_turn_id.clone(), &ids, text);
                         assistant_updates.push((
                             item.turn_id.clone(),
-                            item.item_id.clone(),
+                            ids.with_resolved(item.item_id.as_deref()),
                             item.text.clone(),
                             true,
                         ));
@@ -3800,10 +3795,11 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     && !text.is_empty()
                     && stream.assistant_items.is_empty()
                 {
-                    let item = set_stream_assistant_text(stream, event_turn_id.clone(), None, text);
+                    let ids = EventItemIds::default();
+                    let item = set_stream_assistant_text(stream, event_turn_id.clone(), &ids, text);
                     assistant_updates.push((
                         item.turn_id.clone(),
-                        item.item_id.clone(),
+                        ids.with_resolved(item.item_id.as_deref()),
                         item.text.clone(),
                         true,
                     ));
@@ -3831,15 +3827,9 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 state.replace_detail(detail.epoch, detail);
             }
             seed_preview_from_resume_snapshot(state, &event);
-            for (turn_id, item_id, text, finalized) in assistant_updates {
-                upsert_preview_assistant_message(
-                    state,
-                    turn_id.clone(),
-                    item_id.clone(),
-                    &text,
-                    finalized,
-                );
-                upsert_streaming_assistant_message(state, turn_id, item_id, &text, finalized);
+            for (turn_id, ids, text, finalized) in assistant_updates {
+                upsert_preview_assistant_message(state, turn_id.clone(), &ids, &text, finalized);
+                upsert_streaming_assistant_message(state, turn_id, &ids, &text, finalized);
             }
         }
         AppEvent::StreamFailed {
@@ -4559,16 +4549,66 @@ fn seed_preview_from_resume_snapshot(state: &mut TuiState, event: &Value) {
     state.browser.preview.messages = detail.messages;
 }
 
+/// Item identity attached to a stream event: the canonical id plus every
+/// alias the turn wait layer knows for the same item. Codex app-server names
+/// one item differently per surface (live `msg_<hash>` vs persisted
+/// `item-N`), so matching must accept any known alias.
+#[derive(Debug, Clone, Default)]
+struct EventItemIds {
+    item_id: Option<String>,
+    aliases: Vec<String>,
+}
+
+impl EventItemIds {
+    fn from_value(value: &Value) -> Self {
+        let item_id = value["itemId"].as_str().map(str::to_string);
+        let mut aliases: Vec<String> = value["itemAliases"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(item_id) = &item_id
+            && !aliases.contains(item_id)
+        {
+            aliases.insert(0, item_id.clone());
+        }
+        Self { item_id, aliases }
+    }
+
+    fn is_identified(&self) -> bool {
+        self.item_id.is_some()
+    }
+
+    fn matches_id(&self, candidate: Option<&str>) -> bool {
+        candidate.is_some_and(|candidate| self.aliases.iter().any(|alias| alias == candidate))
+    }
+
+    fn with_resolved(&self, resolved: Option<&str>) -> Self {
+        let mut ids = self.clone();
+        if let Some(resolved) = resolved {
+            if !ids.aliases.iter().any(|alias| alias == resolved) {
+                ids.aliases.push(resolved.to_string());
+            }
+            ids.item_id = Some(resolved.to_string());
+        }
+        ids
+    }
+}
+
 fn append_stream_assistant_delta(
     stream: &mut StreamState,
     turn_id: Option<String>,
-    item_id: Option<String>,
+    ids: &EventItemIds,
     delta: &str,
 ) -> StreamAssistantItem {
     // Deltas are exact continuations of the text streamed so far: the turn
     // wait layer trims any replayed content against the attach snapshot
     // before emitting (see reconcile_replayed_deltas in turns.rs).
-    let item = stream_assistant_item_mut_for_delta(stream, turn_id, item_id);
+    let item = stream_assistant_item_mut_for_delta(stream, turn_id, ids);
     item.text.push_str(delta);
     item.clone()
 }
@@ -4576,10 +4616,10 @@ fn append_stream_assistant_delta(
 fn set_stream_assistant_text(
     stream: &mut StreamState,
     turn_id: Option<String>,
-    item_id: Option<String>,
+    ids: &EventItemIds,
     text: &str,
 ) -> StreamAssistantItem {
-    let item = stream_assistant_item_mut_for_text(stream, turn_id, item_id);
+    let item = stream_assistant_item_mut_for_text(stream, turn_id, ids);
     item.text = text.to_string();
     item.clone()
 }
@@ -4594,34 +4634,33 @@ fn set_stream_assistant_snapshot_text(
     item.text = text.to_string();
 }
 
-fn stream_assistant_item_mut_for_delta(
-    stream: &mut StreamState,
+fn stream_assistant_item_mut_for_delta<'a>(
+    stream: &'a mut StreamState,
     turn_id: Option<String>,
-    item_id: Option<String>,
-) -> &mut StreamAssistantItem {
-    let incoming_item_id = item_id.as_deref();
+    ids: &EventItemIds,
+) -> &'a mut StreamAssistantItem {
     let incoming_turn_id = turn_id.as_deref();
     if let Some(index) = stream
         .assistant_items
         .iter()
-        .position(|item| assistant_item_exact_match(item, incoming_turn_id, incoming_item_id))
+        .position(|item| assistant_item_exact_match(item, incoming_turn_id, ids))
     {
         return &mut stream.assistant_items[index];
     }
-    if item_id.is_some()
+    if ids.is_identified()
         && let Some(index) = stream
             .assistant_items
             .iter()
             .position(|item| assistant_item_provisional_match(item, incoming_turn_id))
     {
         let item = &mut stream.assistant_items[index];
-        item.item_id = item_id;
+        item.item_id = ids.item_id.clone();
         if item.turn_id.is_none() {
             item.turn_id = turn_id;
         }
         return item;
     }
-    if item_id.is_none()
+    if !ids.is_identified()
         && let Some(index) = stream
             .assistant_items
             .iter()
@@ -4633,37 +4672,36 @@ fn stream_assistant_item_mut_for_delta(
         }
         return item;
     }
-    push_stream_assistant_item(stream, turn_id, item_id)
+    push_stream_assistant_item(stream, turn_id, ids.item_id.clone())
 }
 
-fn stream_assistant_item_mut_for_text(
-    stream: &mut StreamState,
+fn stream_assistant_item_mut_for_text<'a>(
+    stream: &'a mut StreamState,
     turn_id: Option<String>,
-    item_id: Option<String>,
-) -> &mut StreamAssistantItem {
-    let incoming_item_id = item_id.as_deref();
+    ids: &EventItemIds,
+) -> &'a mut StreamAssistantItem {
     let incoming_turn_id = turn_id.as_deref();
     if let Some(index) = stream
         .assistant_items
         .iter()
-        .position(|item| assistant_item_exact_match(item, incoming_turn_id, incoming_item_id))
+        .position(|item| assistant_item_exact_match(item, incoming_turn_id, ids))
     {
         return &mut stream.assistant_items[index];
     }
-    if item_id.is_some()
+    if ids.is_identified()
         && let Some(index) = stream
             .assistant_items
             .iter()
             .position(|item| assistant_item_provisional_match(item, incoming_turn_id))
     {
         let item = &mut stream.assistant_items[index];
-        item.item_id = item_id;
+        item.item_id = ids.item_id.clone();
         if item.turn_id.is_none() {
             item.turn_id = turn_id;
         }
         return item;
     }
-    push_stream_assistant_item(stream, turn_id, item_id)
+    push_stream_assistant_item(stream, turn_id, ids.item_id.clone())
 }
 
 fn stream_assistant_item_mut(
@@ -4671,10 +4709,14 @@ fn stream_assistant_item_mut(
     turn_id: Option<String>,
     item_id: Option<String>,
 ) -> &mut StreamAssistantItem {
+    let ids = EventItemIds {
+        item_id: item_id.clone(),
+        aliases: item_id.iter().cloned().collect(),
+    };
     if let Some(index) = stream
         .assistant_items
         .iter()
-        .position(|item| assistant_item_exact_match(item, turn_id.as_deref(), item_id.as_deref()))
+        .position(|item| assistant_item_exact_match(item, turn_id.as_deref(), &ids))
     {
         return &mut stream.assistant_items[index];
     }
@@ -4725,10 +4767,10 @@ fn push_stream_assistant_item(
 fn assistant_item_exact_match(
     item: &StreamAssistantItem,
     turn_id: Option<&str>,
-    item_id: Option<&str>,
+    ids: &EventItemIds,
 ) -> bool {
-    if let Some(item_id) = item_id {
-        item.item_id.as_deref() == Some(item_id)
+    if ids.is_identified() {
+        ids.matches_id(item.item_id.as_deref())
             && turns_compatible(item.turn_id.as_deref(), turn_id)
     } else {
         item.item_id.is_none() && item.turn_id.as_deref() == turn_id
@@ -4751,7 +4793,7 @@ fn turns_compatible(existing: Option<&str>, incoming: Option<&str>) -> bool {
 fn upsert_streaming_assistant_message(
     state: &mut TuiState,
     turn_id: Option<String>,
-    item_id: Option<String>,
+    ids: &EventItemIds,
     text: &str,
     _finalized: bool,
 ) {
@@ -4765,12 +4807,8 @@ fn upsert_streaming_assistant_message(
         return;
     }
     let was_at_bottom = detail.is_at_bottom();
-    let (message_index, display_text) = streaming_message_update_target(
-        &detail.messages,
-        turn_id.as_deref(),
-        item_id.as_deref(),
-        text,
-    );
+    let (message_index, display_text) =
+        streaming_message_update_target(&detail.messages, turn_id.as_deref(), ids, text);
     if display_text.is_empty() {
         return;
     }
@@ -4781,12 +4819,12 @@ fn upsert_streaming_assistant_message(
             message.turn_id = turn_id.clone();
         }
         if message.item_id.is_none() {
-            message.item_id = item_id.clone();
+            message.item_id = ids.item_id.clone();
         }
     } else {
         detail.messages.push(message_block(
             turn_id,
-            item_id,
+            ids.item_id.clone(),
             "assistant",
             None,
             &display_text,
@@ -4805,7 +4843,7 @@ fn upsert_streaming_assistant_message(
 fn upsert_preview_assistant_message(
     state: &mut TuiState,
     turn_id: Option<String>,
-    item_id: Option<String>,
+    ids: &EventItemIds,
     text: &str,
     _finalized: bool,
 ) {
@@ -4820,7 +4858,7 @@ fn upsert_preview_assistant_message(
     ensure_preview_thread(state, &server, &thread_id);
     let messages = &mut state.browser.preview.messages;
     let (message_index, display_text) =
-        streaming_message_update_target(messages, turn_id.as_deref(), item_id.as_deref(), text);
+        streaming_message_update_target(messages, turn_id.as_deref(), ids, text);
     if display_text.is_empty() {
         return;
     }
@@ -4831,12 +4869,12 @@ fn upsert_preview_assistant_message(
             message.turn_id = turn_id.clone();
         }
         if message.item_id.is_none() {
-            message.item_id = item_id.clone();
+            message.item_id = ids.item_id.clone();
         }
     } else {
         messages.push(message_block(
             turn_id,
-            item_id,
+            ids.item_id.clone(),
             "assistant",
             None,
             &display_text,
@@ -4848,22 +4886,21 @@ fn upsert_preview_assistant_message(
 fn streaming_message_update_target(
     messages: &[MessageBlock],
     turn_id: Option<&str>,
-    item_id: Option<&str>,
+    ids: &EventItemIds,
     text: &str,
 ) -> (Option<usize>, String) {
     if let Some(user_index) = latest_user_index_for_turn(messages, turn_id)
-        && let Some(prior_index) =
-            latest_assistant_match_before(messages, user_index, turn_id, item_id)
+        && let Some(prior_index) = latest_assistant_match_before(messages, user_index, turn_id, ids)
     {
         let display_text = suffix_after_message_text(&messages[prior_index], text);
-        let match_index = latest_assistant_match_after(messages, user_index, turn_id, item_id);
+        let match_index = latest_assistant_match_after(messages, user_index, turn_id, ids);
         return (match_index, display_text);
     }
 
     let match_index = messages
         .iter()
-        .rposition(|message| streaming_message_exact_match(message, turn_id, item_id));
-    let provisional_index = if item_id.is_some() && match_index.is_none() {
+        .rposition(|message| streaming_message_exact_match(message, turn_id, ids));
+    let provisional_index = if ids.is_identified() && match_index.is_none() {
         messages
             .iter()
             .rposition(|message| streaming_message_provisional_match(message, turn_id))
@@ -4884,24 +4921,24 @@ fn latest_assistant_match_before(
     messages: &[MessageBlock],
     before_index: usize,
     turn_id: Option<&str>,
-    item_id: Option<&str>,
+    ids: &EventItemIds,
 ) -> Option<usize> {
     messages[..before_index]
         .iter()
-        .rposition(|message| streaming_message_exact_match(message, turn_id, item_id))
+        .rposition(|message| streaming_message_exact_match(message, turn_id, ids))
 }
 
 fn latest_assistant_match_after(
     messages: &[MessageBlock],
     after_index: usize,
     turn_id: Option<&str>,
-    item_id: Option<&str>,
+    ids: &EventItemIds,
 ) -> Option<usize> {
     messages
         .iter()
         .enumerate()
         .skip(after_index + 1)
-        .filter(|(_, message)| streaming_message_exact_match(message, turn_id, item_id))
+        .filter(|(_, message)| streaming_message_exact_match(message, turn_id, ids))
         .map(|(index, _)| index)
         .next_back()
 }
@@ -4924,13 +4961,13 @@ fn trim_stream_segment_boundary(text: &str) -> &str {
 fn streaming_message_exact_match(
     message: &MessageBlock,
     turn_id: Option<&str>,
-    item_id: Option<&str>,
+    ids: &EventItemIds,
 ) -> bool {
     if message.role != "assistant" {
         return false;
     }
-    if let Some(item_id) = item_id {
-        message.item_id.as_deref() == Some(item_id)
+    if ids.is_identified() {
+        ids.matches_id(message.item_id.as_deref())
             && turns_compatible(message.turn_id.as_deref(), turn_id)
     } else {
         message.item_id.is_none() && message.turn_id.as_deref() == turn_id
@@ -8343,6 +8380,132 @@ mod tests {
             detail.messages[0].lines[0].text,
             "Already streamed plus anonymous"
         );
+    }
+
+    #[test]
+    fn poll_text_with_alias_updates_live_streamed_message() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item-1", "type": "userMessage", "content": [{"text": "go"}]}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.stream = Some(StreamState::new_with_id(
+            3,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        // The item streams live under its notification id.
+        for delta in ["Hello", " world"] {
+            handle_app_event(
+                stream_event_for(
+                    3,
+                    serde_json::json!({
+                        "type": "progress",
+                        "threadId": "t1",
+                        "turnId": "turn-1",
+                        "itemId": "msg_a",
+                        "delta": delta
+                    }),
+                ),
+                &mut state,
+            );
+        }
+        // The poll re-reads the turn, which lists the item under its
+        // persisted id; the turn wait layer emits it under the canonical
+        // live id plus aliases.
+        handle_app_event(
+            stream_event_for(
+                3,
+                serde_json::json!({
+                    "type": "progress",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "msg_a",
+                    "itemAliases": ["msg_a", "item-2"],
+                    "text": "Hello world",
+                    "source": "poll"
+                }),
+            ),
+            &mut state,
+        );
+
+        let detail = state.detail.as_ref().expect("detail");
+        let assistant_messages: Vec<&MessageBlock> = detail
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .collect();
+        assert_eq!(assistant_messages.len(), 1, "poll text must not duplicate");
+        assert_eq!(message_text(assistant_messages[0]), "Hello world");
+
+        // After a detail reload rebuilds blocks under persisted ids, further
+        // updates with aliases still land on the same block.
+        let reloaded = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item-1", "type": "userMessage", "content": [{"text": "go"}]},
+                        {"id": "item-2", "type": "agentMessage", "text": "Hello world"}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        );
+        let epoch = reloaded.epoch;
+        state.replace_detail(epoch, reloaded);
+        handle_app_event(
+            stream_event_for(
+                3,
+                serde_json::json!({
+                    "type": "progress",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "msg_a",
+                    "itemAliases": ["msg_a", "item-2"],
+                    "delta": "!"
+                }),
+            ),
+            &mut state,
+        );
+        let detail = state.detail.as_ref().expect("detail");
+        let assistant_messages: Vec<&MessageBlock> = detail
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .collect();
+        assert_eq!(
+            assistant_messages.len(),
+            1,
+            "aliased delta must update the reloaded block"
+        );
+        assert_eq!(message_text(assistant_messages[0]), "Hello world!");
     }
 
     #[test]

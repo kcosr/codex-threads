@@ -603,11 +603,14 @@ async fn handle_websocket<S>(
             }
             .is_some()
             {
+                // Continuation of the snapshot's in-progress item arrives
+                // under an undeclared live id (no item/started), like the
+                // real app-server's `msg_<hash>` ids.
                 send_delta(
                     &mut ws,
                     &thread_id,
                     "turn_active",
-                    "item_active_agent",
+                    "msg_active_agent_live",
                     "attached live update",
                 )
                 .await;
@@ -634,27 +637,35 @@ async fn send_stream_notifications<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // Live notifications identify items in a different namespace than
+    // persisted snapshots (`msg_<hash>` vs `item-N`), mirroring the real
+    // app-server; new items are declared via item/started first.
+    let live_item_id = format!("msg_{turn_id}");
+    let _ = ws
+        .send(Message::Text(
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": live_item_id,
+                        "type": "agentMessage",
+                        "text": ""
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
     let mut parts = reply.splitn(3, ' ');
     let first = parts.next().unwrap_or("");
     let second = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("");
-    send_delta(
-        ws,
-        thread_id,
-        turn_id,
-        "item_agent_stream",
-        &format!("{first} "),
-    )
-    .await;
-    send_delta(
-        ws,
-        thread_id,
-        turn_id,
-        "item_agent_stream",
-        &format!("{second} "),
-    )
-    .await;
-    send_delta(ws, thread_id, turn_id, "item_agent_stream", rest).await;
+    send_delta(ws, thread_id, turn_id, &live_item_id, &format!("{first} ")).await;
+    send_delta(ws, thread_id, turn_id, &live_item_id, &format!("{second} ")).await;
+    send_delta(ws, thread_id, turn_id, &live_item_id, rest).await;
     let _ = ws
         .send(Message::Text(
             json!({
@@ -663,7 +674,7 @@ async fn send_stream_notifications<S>(
                     "threadId": thread_id,
                     "turnId": turn_id,
                     "item": {
-                        "id": "item_agent_stream",
+                        "id": live_item_id,
                         "type": "agentMessage",
                         "text": reply
                     }

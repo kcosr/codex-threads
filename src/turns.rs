@@ -56,59 +56,250 @@ struct AssistantResponses {
     items: Vec<AssistantResponse>,
 }
 
+/// One agent message of the watched turn.
+///
+/// Codex app-server identifies the same item differently per surface: live
+/// notifications use opaque ids (`msg_<hash>`), while resume snapshots and
+/// `thread/turns/list` renumber items (`item-N`). Entries therefore track
+/// every id observed for the item and all emitted events carry the canonical
+/// (first-seen) id, so downstream consumers never see one item under two ids.
 #[derive(Debug, Clone)]
 struct AssistantResponse {
+    /// Canonical id used in emitted events: the id this item was first seen
+    /// under (snapshot id when seeded, live id otherwise).
     item_id: Option<String>,
+    /// Live notification id, when it differs from `item_id`.
+    live_id: Option<String>,
+    /// Persisted snapshot/poll id, when it differs from `item_id`.
+    poll_id: Option<String>,
     text: String,
+    /// While `Some`, a live delta stream may still be replaying the seeded
+    /// snapshot text from the item start; tracks how many bytes matched.
+    replay_cursor: Option<usize>,
+}
+
+impl AssistantResponse {
+    fn new(item_id: Option<String>) -> Self {
+        Self {
+            item_id,
+            live_id: None,
+            poll_id: None,
+            text: String::new(),
+            replay_cursor: None,
+        }
+    }
+
+    fn matches(&self, item_id: Option<&str>) -> bool {
+        match item_id {
+            Some(item_id) => {
+                self.item_id.as_deref() == Some(item_id)
+                    || self.live_id.as_deref() == Some(item_id)
+                    || self.poll_id.as_deref() == Some(item_id)
+            }
+            None => self.item_id.is_none(),
+        }
+    }
+
+    fn alias_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for id in [&self.item_id, &self.live_id, &self.poll_id]
+            .into_iter()
+            .flatten()
+        {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+}
+
+/// The canonical id and full alias set to stamp on an emitted event.
+#[derive(Debug, Clone)]
+struct AssistantItemIds {
+    item_id: Option<String>,
+    alias_ids: Vec<String>,
 }
 
 impl AssistantResponses {
     fn contains_item(&self, item_id: Option<&str>) -> bool {
-        self.items.iter().any(|item| match item_id {
-            Some(item_id) => item.item_id.as_deref() == Some(item_id),
-            None => item.item_id.is_none(),
-        })
+        self.find_index(item_id).is_some()
     }
 
     fn text_for_item(&self, item_id: Option<&str>) -> Option<&str> {
+        self.find_index(item_id)
+            .map(|index| self.items[index].text.as_str())
+    }
+
+    fn find_index(&self, item_id: Option<&str>) -> Option<usize> {
+        self.items.iter().position(|item| item.matches(item_id))
+    }
+
+    /// Records that the live stream declared a new item; deltas for ids that
+    /// were never declared belong to the item already in progress when the
+    /// subscription started (see `resolve_live`).
+    fn note_started(&mut self, item_id: &str) {
+        if self.find_index(Some(item_id)).is_none() {
+            self.items
+                .push(AssistantResponse::new(Some(item_id.to_string())));
+        }
+    }
+
+    /// Finds or creates the entry a live delta/completion with `item_id`
+    /// refers to.
+    fn resolve_live(&mut self, item_id: Option<&str>) -> usize {
+        if let Some(index) = self.find_index(item_id) {
+            return index;
+        }
+        if let Some(item_id) = item_id {
+            // An identified event upgrades a previously anonymous entry.
+            if let Some(index) = self
+                .items
+                .iter()
+                .rposition(|item| item.item_id.is_none() && item.live_id.is_none())
+            {
+                self.items[index].item_id = Some(item_id.to_string());
+                return index;
+            }
+            // A live id that was never declared via item/started continues
+            // the snapshot-seeded item that was in progress at attach time.
+            if let Some(index) = self
+                .items
+                .iter()
+                .rposition(|item| item.live_id.is_none() && item.replay_cursor.is_some())
+            {
+                self.items[index].live_id = Some(item_id.to_string());
+                return index;
+            }
+        }
         self.items
-            .iter()
-            .find(|item| match item_id {
-                Some(item_id) => item.item_id.as_deref() == Some(item_id),
-                None => item.item_id.is_none(),
-            })
-            .map(|item| item.text.as_str())
+            .push(AssistantResponse::new(item_id.map(str::to_string)));
+        self.items.len() - 1
     }
 
-    fn append_delta(&mut self, item_id: Option<&str>, delta: &str) {
-        self.item_mut(item_id).text.push_str(delta);
+    /// Applies a live delta. Returns the event ids and the fragment to emit,
+    /// or `None` when the delta only replayed already-known seeded text.
+    fn apply_live_delta(
+        &mut self,
+        item_id: Option<&str>,
+        delta: &str,
+    ) -> Option<(AssistantItemIds, String)> {
+        let index = self.resolve_live(item_id);
+        let item = &mut self.items[index];
+        let mut fragment = delta;
+        if let Some(cursor) = item.replay_cursor {
+            let remaining = item.text.get(cursor..).unwrap_or("");
+            if !remaining.is_empty() && remaining.starts_with(delta) {
+                let cursor = cursor + delta.len();
+                item.replay_cursor = (cursor < item.text.len()).then_some(cursor);
+                return None;
+            }
+            if !remaining.is_empty() && delta.starts_with(remaining) {
+                fragment = &delta[remaining.len()..];
+            }
+            item.replay_cursor = None;
+        }
+        item.text.push_str(fragment);
+        Some((
+            AssistantItemIds {
+                item_id: item.item_id.clone(),
+                alias_ids: item.alias_ids(),
+            },
+            fragment.to_string(),
+        ))
     }
 
+    /// Applies an item/completed text. Returns the event ids when the
+    /// completion carries content not yet emitted.
+    fn complete_live(&mut self, item_id: Option<&str>, text: &str) -> Option<AssistantItemIds> {
+        let was_known = self.contains_item(item_id);
+        let index = self.resolve_live(item_id);
+        let item = &mut self.items[index];
+        let changed = item.text != text;
+        item.text = text.to_string();
+        item.replay_cursor = None;
+        (!was_known || changed).then(|| AssistantItemIds {
+            item_id: item.item_id.clone(),
+            alias_ids: item.alias_ids(),
+        })
+    }
+
+    #[cfg(test)]
     fn set_text(&mut self, item_id: Option<&str>, text: &str) {
-        self.item_mut(item_id).text = text.to_string();
+        let index = self.resolve_live(item_id);
+        self.items[index].text = text.to_string();
+        self.items[index].replay_cursor = None;
     }
 
-    fn sync_from_turn(&mut self, turn: &Value) -> Vec<AssistantResponse> {
+    /// Seeds one snapshot item during attach; order of calls must follow the
+    /// item order within the turn.
+    fn seed_snapshot_item(&mut self, item_id: Option<&str>, text: &str) {
+        let mut item = AssistantResponse::new(item_id.map(str::to_string));
+        item.text = text.to_string();
+        item.replay_cursor = Some(0);
+        self.items.push(item);
+    }
+
+    /// Reconciles a polled turn snapshot. Poll items are joined to known
+    /// entries by id alias or by position within the turn (both surfaces list
+    /// the turn's agent messages in creation order), so an item streamed live
+    /// as `msg_<hash>` is not re-emitted when the poll lists it as `item-N`.
+    fn sync_from_turn(&mut self, turn: &Value) -> Vec<(AssistantItemIds, String)> {
         let mut updates = Vec::new();
+        let mut position = 0;
         for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
             if item["type"].as_str() != Some("agentMessage") {
                 continue;
             }
-            let Some(text) = item["text"].as_str() else {
-                continue;
-            };
-            if text.is_empty() {
-                continue;
-            }
-            let item_id = item["id"].as_str();
-            if self.text_for_item(item_id) == Some(text) {
-                continue;
-            }
-            self.set_text(item_id, text);
-            updates.push(AssistantResponse {
-                item_id: item_id.map(str::to_string),
-                text: text.to_string(),
+            let poll_id = item["id"].as_str();
+            let text = item["text"].as_str().unwrap_or("");
+            let index = self.find_index(poll_id).or_else(|| {
+                self.items
+                    .get(position)
+                    .filter(|item| match (poll_id, item.poll_id.as_deref()) {
+                        (Some(_), None) => true,
+                        (Some(poll_id), Some(known)) => poll_id == known,
+                        (None, _) => false,
+                    })
+                    .map(|_| position)
             });
+            match index {
+                Some(index) => {
+                    let item = &mut self.items[index];
+                    if let Some(poll_id) = poll_id
+                        && item.item_id.as_deref() != Some(poll_id)
+                        && item.poll_id.is_none()
+                    {
+                        item.poll_id = Some(poll_id.to_string());
+                    }
+                    if !text.is_empty() && item.text != text {
+                        item.text = text.to_string();
+                        if item.replay_cursor.is_some() {
+                            item.replay_cursor = Some(0);
+                        }
+                        updates.push((
+                            AssistantItemIds {
+                                item_id: item.item_id.clone(),
+                                alias_ids: item.alias_ids(),
+                            },
+                            text.to_string(),
+                        ));
+                    }
+                }
+                None => {
+                    let mut entry = AssistantResponse::new(poll_id.map(str::to_string));
+                    entry.text = text.to_string();
+                    let ids = AssistantItemIds {
+                        item_id: entry.item_id.clone(),
+                        alias_ids: entry.alias_ids(),
+                    };
+                    self.items.push(entry);
+                    if !text.is_empty() {
+                        updates.push((ids, text.to_string()));
+                    }
+                }
+            }
+            position += 1;
         }
         updates
     }
@@ -136,28 +327,6 @@ impl AssistantResponses {
             })
             .collect()
     }
-
-    fn item_mut(&mut self, item_id: Option<&str>) -> &mut AssistantResponse {
-        if let Some(index) = self.items.iter().position(|item| match item_id {
-            Some(item_id) => item.item_id.as_deref() == Some(item_id),
-            None => item.item_id.is_none(),
-        }) {
-            return &mut self.items[index];
-        }
-        if let Some(item_id) = item_id
-            && let Some(index) = self.items.iter().rposition(|item| item.item_id.is_none())
-        {
-            self.items[index].item_id = Some(item_id.to_string());
-            return &mut self.items[index];
-        }
-        self.items.push(AssistantResponse {
-            item_id: item_id.map(str::to_string),
-            text: String::new(),
-        });
-        self.items
-            .last_mut()
-            .expect("assistant response just pushed")
-    }
 }
 
 /// Builds the assistant accumulator state implied by a `thread/resume`
@@ -175,13 +344,9 @@ fn assistant_seed_from_thread_snapshot(thread: &Value, turn_id: &str) -> Assista
             if item["type"].as_str() != Some("agentMessage") {
                 continue;
             }
-            let Some(text) = item["text"].as_str() else {
-                continue;
-            };
-            if text.is_empty() {
-                continue;
-            }
-            assistant.set_text(item["id"].as_str(), text);
+            // Empty items are seeded too: positions within the turn align
+            // poll snapshots with live entries, so gaps would mismatch them.
+            assistant.seed_snapshot_item(item["id"].as_str(), item["text"].as_str().unwrap_or(""));
         }
     }
     assistant
@@ -208,16 +373,44 @@ fn reconcile_replayed_deltas(
             && notification.params["threadId"] == thread_id
             && notification.params["turnId"] == turn_id
     };
+    // Live ids that the buffered window itself declares as new items; deltas
+    // for undeclared live ids continue the snapshot's in-progress tail item
+    // under a different id namespace (live `msg_<hash>` vs snapshot `item-N`).
+    let started_in_buffer: Vec<String> = notifications
+        .iter()
+        .filter(|notification| {
+            notification.method == "item/started"
+                && notification.params["threadId"] == thread_id
+                && notification.params["turnId"] == turn_id
+                && notification.params["item"]["type"].as_str() == Some("agentMessage")
+        })
+        .filter_map(|notification| notification.params["item"]["id"].as_str())
+        .map(str::to_string)
+        .collect();
+    let seed_tail_id = assistant
+        .items
+        .last()
+        .filter(|item| item.replay_cursor.is_some())
+        .and_then(|item| item.item_id.clone());
+    let resolve = |item_id: Option<&str>| -> Option<String> {
+        let Some(item_id) = item_id else {
+            return seed_tail_id.clone();
+        };
+        if assistant.contains_item(Some(item_id)) {
+            return Some(item_id.to_string());
+        }
+        if started_in_buffer.iter().any(|id| id == item_id) {
+            return Some(item_id.to_string());
+        }
+        seed_tail_id.clone().or(Some(item_id.to_string()))
+    };
     let mut replayed: Vec<(Option<String>, String, usize)> = Vec::new();
     for notification in notifications.iter().filter(|n| is_replayed_delta(n)) {
-        let item_id = notification.params["itemId"].as_str();
+        let item_id = resolve(notification.params["itemId"].as_str());
         let delta = notification.params["delta"].as_str().unwrap_or("");
-        match replayed
-            .iter_mut()
-            .find(|(id, _, _)| id.as_deref() == item_id)
-        {
+        match replayed.iter_mut().find(|(id, _, _)| *id == item_id) {
             Some((_, text, _)) => text.push_str(delta),
-            None => replayed.push((item_id.map(str::to_string), delta.to_string(), 0)),
+            None => replayed.push((item_id, delta.to_string(), 0)),
         }
     }
     for (item_id, text, skip) in &mut replayed {
@@ -258,7 +451,7 @@ fn reconcile_replayed_deltas(
             out.push(notification);
             continue;
         }
-        let item_id = notification.params["itemId"].as_str().map(str::to_string);
+        let item_id = resolve(notification.params["itemId"].as_str());
         let delta_len = notification.params["delta"].as_str().unwrap_or("").len();
         let skip = replayed
             .iter()
@@ -767,14 +960,14 @@ async fn poll_turn_completion(
     reject_unknown_turn_status(turn)?;
     let status = turn_status(turn);
     let updates = assistant.sync_from_turn(turn);
-    for update in updates {
+    for (ids, text) in updates {
         let mut event = Map::new();
         event.insert("type".to_string(), json!("progress"));
         event.insert("server".to_string(), json!(wait.target.server));
         event.insert("threadId".to_string(), json!(wait.thread_id));
         event.insert("turnId".to_string(), json!(&wait.turn_id));
-        insert_opt(&mut event, "itemId", update.item_id);
-        event.insert("text".to_string(), json!(update.text));
+        insert_item_ids(&mut event, &ids);
+        event.insert("text".to_string(), json!(text));
         event.insert("source".to_string(), json!("poll"));
         events.push(Value::Object(event));
     }
@@ -909,20 +1102,33 @@ fn turn_event(
     assistant: &mut AssistantResponses,
 ) -> Result<Option<Value>> {
     match notification.method.as_str() {
+        "item/started"
+            if notification.params["threadId"] == thread_id
+                && notification.params["turnId"] == turn_id =>
+        {
+            if notification.params["item"]["type"].as_str() == Some("agentMessage")
+                && let Some(item_id) = notification.params["item"]["id"].as_str()
+            {
+                assistant.note_started(item_id);
+            }
+            Ok(None)
+        }
         "item/agentMessage/delta"
             if notification.params["threadId"] == thread_id
                 && notification.params["turnId"] == turn_id =>
         {
             let delta = notification.params["delta"].as_str().unwrap_or("");
             let item_id = notification.params["itemId"].as_str();
-            assistant.append_delta(item_id, delta);
+            let Some((ids, fragment)) = assistant.apply_live_delta(item_id, delta) else {
+                return Ok(None);
+            };
             let mut event = Map::new();
             event.insert("type".to_string(), json!("progress"));
             event.insert("server".to_string(), json!(server));
             event.insert("threadId".to_string(), json!(thread_id));
             event.insert("turnId".to_string(), json!(turn_id));
-            insert_opt(&mut event, "itemId", item_id.map(str::to_string));
-            event.insert("delta".to_string(), json!(delta));
+            insert_item_ids(&mut event, &ids);
+            event.insert("delta".to_string(), json!(fragment));
             Ok(Some(Value::Object(event)))
         }
         "item/completed"
@@ -933,16 +1139,13 @@ fn turn_event(
                 && let Some(text) = notification.params["item"]["text"].as_str()
             {
                 let item_id = notification.params["item"]["id"].as_str();
-                let previous_text = assistant.text_for_item(item_id).map(str::to_string);
-                let was_known = assistant.contains_item(item_id);
-                assistant.set_text(item_id, text);
-                if !was_known || previous_text.as_deref() != Some(text) {
+                if let Some(ids) = assistant.complete_live(item_id, text) {
                     let mut event = Map::new();
                     event.insert("type".to_string(), json!("assistantMessage"));
                     event.insert("server".to_string(), json!(server));
                     event.insert("threadId".to_string(), json!(thread_id));
                     event.insert("turnId".to_string(), json!(turn_id));
-                    insert_opt(&mut event, "itemId", item_id.map(str::to_string));
+                    insert_item_ids(&mut event, &ids);
                     event.insert("text".to_string(), json!(text));
                     return Ok(Some(Value::Object(event)));
                 }
@@ -966,6 +1169,15 @@ fn turn_event(
 fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         map.insert(key.to_string(), json!(value));
+    }
+}
+
+/// Stamps the canonical item id plus, when the item is known under several
+/// server ids, the full alias list consumers can match against.
+fn insert_item_ids(map: &mut Map<String, Value>, ids: &AssistantItemIds) {
+    insert_opt(map, "itemId", ids.item_id.clone());
+    if ids.alias_ids.len() > 1 {
+        map.insert("itemAliases".to_string(), json!(ids.alias_ids));
     }
 }
 
@@ -1038,6 +1250,98 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn poll_snapshot_does_not_reemit_live_streamed_item_under_persisted_id() {
+        // Codex names the same item `msg_<hash>` in live notifications but
+        // `item-N` in thread snapshots; the poll must not re-emit text that
+        // already streamed live under the other id.
+        let mut assistant = AssistantResponses::default();
+        assistant.note_started("msg_a");
+        assert!(
+            assistant
+                .apply_live_delta(Some("msg_a"), "The CLI also ")
+                .is_some()
+        );
+        assert!(
+            assistant
+                .apply_live_delta(Some("msg_a"), "exposes this.")
+                .is_some()
+        );
+        assert!(
+            assistant
+                .complete_live(Some("msg_a"), "The CLI also exposes this.")
+                .is_none()
+        );
+
+        let turn = json!({"items": [
+            {"id": "item-3", "type": "agentMessage", "text": "The CLI also exposes this."}
+        ]});
+        assert!(assistant.sync_from_turn(&turn).is_empty());
+        assert_eq!(
+            assistant.text_for_item(Some("item-3")),
+            Some("The CLI also exposes this.")
+        );
+    }
+
+    #[test]
+    fn undeclared_live_id_continues_seeded_snapshot_item() {
+        let mut assistant = AssistantResponses::default();
+        assistant.seed_snapshot_item(Some("item-7"), "Partial sn");
+
+        // The live stream replays the item from its start under a live id
+        // that was never declared via item/started.
+        assert!(
+            assistant
+                .apply_live_delta(Some("msg_b"), "Partial ")
+                .is_none()
+        );
+        let (ids, fragment) = assistant
+            .apply_live_delta(Some("msg_b"), "snapshot text continues")
+            .expect("boundary delta carries fresh tail");
+        assert_eq!(ids.item_id.as_deref(), Some("item-7"));
+        assert!(ids.alias_ids.contains(&"msg_b".to_string()));
+        assert_eq!(fragment, "apshot text continues");
+        assert_eq!(
+            assistant.text_for_item(Some("item-7")),
+            Some("Partial snapshot text continues")
+        );
+    }
+
+    #[test]
+    fn declared_live_item_stays_separate_from_seeded_tail() {
+        let mut assistant = AssistantResponses::default();
+        assistant.seed_snapshot_item(Some("item-7"), "Earlier paragraph.");
+        assistant.note_started("msg_c");
+        let (ids, fragment) = assistant
+            .apply_live_delta(Some("msg_c"), "New paragraph.")
+            .expect("new item delta emits");
+        assert_eq!(ids.item_id.as_deref(), Some("msg_c"));
+        assert_eq!(fragment, "New paragraph.");
+        assert_eq!(
+            assistant.text_for_item(Some("item-7")),
+            Some("Earlier paragraph.")
+        );
+
+        // The poll lists both items under persisted ids: positional join
+        // registers aliases without re-emitting.
+        let unchanged = json!({"items": [
+            {"id": "item-7", "type": "agentMessage", "text": "Earlier paragraph."},
+            {"id": "item-8", "type": "agentMessage", "text": "New paragraph."}
+        ]});
+        assert!(assistant.sync_from_turn(&unchanged).is_empty());
+
+        // Later growth is emitted once, under the live id plus aliases.
+        let advanced = json!({"items": [
+            {"id": "item-7", "type": "agentMessage", "text": "Earlier paragraph."},
+            {"id": "item-8", "type": "agentMessage", "text": "New paragraph. More."}
+        ]});
+        let updates = assistant.sync_from_turn(&advanced);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0.item_id.as_deref(), Some("msg_c"));
+        assert!(updates[0].0.alias_ids.contains(&"item-8".to_string()));
+        assert_eq!(updates[0].1, "New paragraph. More.");
+    }
+
     #[cfg(feature = "tui")]
     #[test]
     fn reconcile_replayed_deltas_drops_content_already_in_snapshot() {
@@ -1060,6 +1364,53 @@ mod tests {
         );
 
         assert_eq!(replayed_delta_texts(&reconciled), vec![" suffix"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_trims_buffered_deltas_for_undeclared_live_id() {
+        // Buffered deltas arrive under a live id while the snapshot seeded
+        // the same in-progress item under its persisted id.
+        let mut assistant = AssistantResponses::default();
+        assistant.seed_snapshot_item(Some("item-7"), "The full paragraph with live");
+
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![
+                delta_notification("msg_z", " paragraph"),
+                delta_notification("msg_z", " with live"),
+                delta_notification("msg_z", " suffix"),
+            ],
+        );
+
+        assert_eq!(replayed_delta_texts(&reconciled), vec![" suffix"]);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn reconcile_keeps_buffered_deltas_for_declared_new_item() {
+        let mut assistant = AssistantResponses::default();
+        assistant.seed_snapshot_item(Some("item-7"), "Earlier paragraph.");
+
+        let started = Notification {
+            method: "item/started".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": "msg_y", "type": "agentMessage"}
+            }),
+        };
+        let reconciled = reconcile_replayed_deltas(
+            &assistant,
+            "thread-1",
+            "turn-1",
+            vec![started, delta_notification("msg_y", "Earlier paragraph.")],
+        );
+
+        assert_eq!(reconciled.len(), 2);
+        assert_eq!(reconciled[1].params["delta"], "Earlier paragraph.");
     }
 
     #[cfg(feature = "tui")]
@@ -1209,8 +1560,8 @@ mod tests {
         });
         let updates = assistant.sync_from_turn(&advanced);
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].item_id.as_deref(), Some("assistant-2"));
-        assert_eq!(updates[0].text, "Second part grew");
+        assert_eq!(updates[0].0.item_id.as_deref(), Some("assistant-2"));
+        assert_eq!(updates[0].1, "Second part grew");
     }
 
     #[test]
@@ -1391,8 +1742,8 @@ mod tests {
         let updates = assistant.sync_from_turn(&turn);
 
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].item_id.as_deref(), Some("assistant-1"));
-        assert_eq!(updates[0].text, "current active text");
+        assert_eq!(updates[0].0.item_id.as_deref(), Some("assistant-1"));
+        assert_eq!(updates[0].1, "current active text");
         assert_eq!(assistant.final_text(), "current active text");
         assert!(assistant.sync_from_turn(&turn).is_empty());
     }
