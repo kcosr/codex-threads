@@ -277,6 +277,13 @@ timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
 spans when the default-off `tui-syntax-highlighting` Cargo feature is enabled.
 Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to append raw stream
 events while debugging live transcript rendering.
+Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to additionally append every
+JSON-RPC frame exchanged with app-servers — one NDJSON line per frame with a
+millisecond timestamp, per-connection id, and direction (`send`/`recv`) — plus
+attach-time snapshot seeding and replay reconciliation decisions. This is the
+ground-truth capture for diagnosing streaming issues such as duplicated or
+missing transcript text; it can grow large and contains full thread content,
+so enable it only while reproducing a problem.
 
 ## Configuration
 

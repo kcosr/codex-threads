@@ -3,6 +3,7 @@ mod app;
 mod cli;
 mod completion;
 mod config;
+mod debuglog;
 mod errors;
 mod rpc;
 mod session;

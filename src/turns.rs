@@ -224,6 +224,32 @@ fn reconcile_replayed_deltas(
         let known = assistant.text_for_item(item_id.as_deref()).unwrap_or("");
         *skip = replayed_prefix_len(known, text);
     }
+    if crate::debuglog::enabled() {
+        let items = replayed
+            .iter()
+            .map(|(item_id, text, skip)| {
+                json!({
+                    "itemId": item_id,
+                    "knownLen": assistant
+                        .text_for_item(item_id.as_deref())
+                        .map(str::len)
+                        .unwrap_or(0),
+                    "replayedLen": text.len(),
+                    "trimmedLen": skip,
+                })
+            })
+            .collect::<Vec<_>>();
+        crate::debuglog::log(
+            "attach-reconcile",
+            None,
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "bufferedNotifications": notifications.len(),
+                "items": items,
+            }),
+        );
+    }
 
     let mut consumed: Vec<(Option<String>, usize)> = Vec::new();
     let mut out = Vec::with_capacity(notifications.len());
@@ -371,6 +397,22 @@ where
     )
     .await?;
     let assistant_seed = assistant_seed_from_thread_snapshot(&resume["thread"], &options.turn_id);
+    if crate::debuglog::enabled() {
+        let items = assistant_seed
+            .items
+            .iter()
+            .map(|item| json!({"itemId": item.item_id, "textLen": item.text.len()}))
+            .collect::<Vec<_>>();
+        crate::debuglog::log(
+            "attach-seed",
+            None,
+            json!({
+                "threadId": options.thread_id,
+                "turnId": options.turn_id,
+                "items": items,
+            }),
+        );
+    }
     let early_notifications = reconcile_replayed_deltas(
         &assistant_seed,
         &options.thread_id,

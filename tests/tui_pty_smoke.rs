@@ -848,6 +848,10 @@ impl TuiPty {
         command.env("TERM", "xterm-256color");
         command.env("CODEX_THREADS_STATE", state_dir.path());
         command.env("CODEX_THREADS_TUI_STREAM_LOG", stream_log);
+        command.env(
+            "CODEX_THREADS_RPC_LOG",
+            stream_log.with_extension("rpc.ndjson"),
+        );
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -1257,6 +1261,17 @@ fn tui_browser_new_session_flow_creates_named_thread_and_streams() {
             .as_str()
             .is_some_and(|id| id.starts_with("thread_created_")),
         "first turn should target the created thread"
+    );
+
+    let rpc_log = stream_log.with_extension("rpc.ndjson");
+    let rpc_lines = fs::read_to_string(&rpc_log).expect("rpc log");
+    assert!(
+        rpc_lines.contains("\"kind\":\"send\"") && rpc_lines.contains("thread/start"),
+        "rpc log should capture the thread/start exchange"
+    );
+    assert!(
+        rpc_lines.contains("\"kind\":\"recv\""),
+        "rpc log should capture received frames"
     );
 }
 

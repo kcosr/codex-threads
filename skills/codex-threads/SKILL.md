@@ -140,6 +140,9 @@ Useful TUI keys:
 - `q` quits. Local detach leaves remote turns running unless interrupted.
 - Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to capture raw stream
   events for transcript debugging.
+- Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to capture every JSON-RPC
+  frame (with connection ids and millisecond timestamps) plus attach replay
+  reconciliation decisions; use it to diagnose streaming duplication issues.
 
 In TUI search mode, `--cwd` is a local refinement over the loaded search page.
 Sort controls are disabled in search mode until app-server supports server-side
