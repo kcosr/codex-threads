@@ -64,6 +64,7 @@ const DETAIL_TURN_LIMIT: u32 = 10;
 const DETAIL_JUMP_TURN_LIMIT: u32 = 100;
 const PREVIEW_TURN_LIMIT: u32 = 3;
 const DETAIL_FOLLOW_REFRESH_SECS: u64 = 5;
+const LIVE_SPINNER_TICK_MS: u64 = 120;
 const AUTO_REFRESH_MIN_SECS: u64 = 5;
 const AUTO_REFRESH_MAX_SECS: u64 = 300;
 const AUTO_REFRESH_STEP_SECS: u64 = 5;
@@ -154,6 +155,10 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
     let mut events = Some(EventStream::new());
     let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_TICK_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Keeps the live-stream spinner animating through quiet stretches (for
+    // example long tool runs); only enabled while a stream is running.
+    let mut live_animation = tokio::time::interval(Duration::from_millis(LIVE_SPINNER_TICK_MS));
+    live_animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         if state.force_terminal_clear {
@@ -289,6 +294,10 @@ pub async fn run_tui(targets: Vec<Target>, command: TuiCommand, yolo: bool) -> R
                     }
                 }
                 schedule_selected_preview_if_needed(&mut state, &preview_tx).await?;
+            }
+            _ = live_animation.tick(), if stream_is_running(&state) => {
+                // No state change: the loop redraws on every iteration, which
+                // advances the wall-clock-driven spinner frame.
             }
             _ = tick.tick() => {
                 state.clear_expired_notice();

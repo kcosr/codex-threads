@@ -327,6 +327,13 @@ fn browser_row_status(state: &TuiState, server: &str, thread_id: &str, fallback:
         return fallback.to_string();
     }
     match stream.status {
+        StreamStatus::Starting | StreamStatus::Running if !stream.detached => {
+            format!(
+                "{} {}",
+                live_spinner_frame(),
+                format_stream_status(stream.status)
+            )
+        }
         StreamStatus::Starting | StreamStatus::Running => {
             format_stream_status(stream.status).to_string()
         }
@@ -412,6 +419,37 @@ fn allocate_flexible_widths(available: u16, columns: &[(u16, u16, u16)]) -> [u16
     widths
 }
 
+const LIVE_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn live_spinner_frame() -> char {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as usize;
+    LIVE_SPINNER_FRAMES[(millis / 120) % LIVE_SPINNER_FRAMES.len()]
+}
+
+fn live_indicator_span(trailing: &str) -> Span<'static> {
+    Span::styled(
+        format!("{} live{trailing}", live_spinner_frame()),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn stream_is_live_for(state: &TuiState, server: &str, thread_id: &str) -> bool {
+    state.stream.as_ref().is_some_and(|stream| {
+        stream.server == server
+            && stream.thread_id == thread_id
+            && !stream.detached
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+    })
+}
+
 fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let Some(row) = state.browser.rows.get(state.browser.selected) else {
         frame.render_widget(
@@ -441,15 +479,19 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         (vec![Line::from("No message preview available")], 0)
     };
+    let title = if stream_is_live_for(state, &row.server, &row.id) {
+        Line::from(vec![
+            Span::raw(" Recent Messages "),
+            live_indicator_span(" "),
+        ])
+    } else {
+        Line::from(" Recent Messages ")
+    };
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .block(
-                Block::default()
-                    .title(" Recent Messages ")
-                    .borders(Borders::ALL),
-            ),
+            .block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
@@ -464,7 +506,13 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let connection = detail_connection_label(state);
     let inner_width = chunks[0].width.saturating_sub(2) as usize;
     let mut used_width = detail_status.chars().count();
-    let mut metadata_spans = vec![Span::raw(detail_status)];
+    let mut metadata_spans = Vec::new();
+    if detail_has_connected_stream(state) {
+        let live = live_indicator_span("  ");
+        used_width += live.content.chars().count();
+        metadata_spans.push(live);
+    }
+    metadata_spans.push(Span::raw(detail_status));
     if let Some(connection) = connection {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(connection));
@@ -2083,9 +2131,67 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("running  connected"));
+        assert!(
+            text.contains(" live"),
+            "connected running stream shows the animated live indicator"
+        );
         assert!(!text.contains("stream=running"));
         assert!(!text.contains("thread-1"));
         assert!(!text.contains("turn-1"));
         assert!(!text.contains("list rows="));
+    }
+
+    #[test]
+    fn preview_title_shows_live_indicator_for_streaming_selection() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![ThreadRow {
+            server: "work".to_string(),
+            id: "thread-1".to_string(),
+            title: "Streaming thread".to_string(),
+            status: "active".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "/tmp/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }];
+        state.browser.selected = 0;
+        state.browser.preview.server = Some("work".to_string());
+        state.browser.preview.thread_id = Some("thread-1".to_string());
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(
+            !text.contains(" live"),
+            "no live indicator without a running stream"
+        );
+
+        state.stream = Some(StreamState::new(
+            "thread-1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(
+            text.contains("Recent Messages") && text.contains(" live"),
+            "preview title shows the live indicator while streaming"
+        );
     }
 }

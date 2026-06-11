@@ -249,7 +249,9 @@ by the persisted auto-attach toggle (`a` in the `c` menu, on by default): with
 it off, browsing shows content from history fetches only — no live stream is
 opened per selection — and only your own sends stream. While a stream is attached it is the sole content transport: status
 polling backs off entirely while turn notifications are flowing and only
-resumes as a fallback after a few quiet seconds.
+resumes as a fallback after a few quiet seconds. An animated green `live`
+indicator marks the attached stream in the detail header, the preview pane
+title, and the browser STATUS column.
 Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
 refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
