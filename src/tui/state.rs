@@ -500,6 +500,14 @@ impl TuiState {
         {
             return;
         }
+        if !self.browser.preview.messages.is_empty()
+            && self.stream_owns_thread_content(&server, &thread_id)
+        {
+            // The stream owns the preview content; the fetched history lags it.
+            self.browser.preview.loading = false;
+            self.browser.preview.error = None;
+            return;
+        }
         append_unpersisted_messages(&mut messages, &self.browser.preview.messages);
         self.browser.preview.loading = false;
         self.browser.preview.messages = messages;
@@ -566,7 +574,33 @@ impl TuiState {
         self.browser.last_error = Some(error);
     }
 
-    pub fn replace_detail(&mut self, epoch: u64, mut detail: DetailState) {
+    /// Whether a delivering stream owns this thread's content. While it does,
+    /// history fetches must not touch transcript content: the stream seeded
+    /// the history snapshot at attach time and applies all further updates.
+    /// The post-turn follow probe (`Following`) does not own anything.
+    pub fn stream_owns_thread_content(&self, server: &str, thread_id: &str) -> bool {
+        self.stream.as_ref().is_some_and(|stream| {
+            stream.server == server
+                && stream.thread_id == thread_id
+                && !stream.detached
+                && matches!(
+                    stream.status,
+                    StreamStatus::Starting | StreamStatus::Running
+                )
+        })
+    }
+
+    pub fn replace_detail(&mut self, epoch: u64, detail: DetailState) {
+        self.replace_detail_inner(epoch, detail, false);
+    }
+
+    /// Replace driven by the stream itself (the attach history snapshot);
+    /// bypasses the stream content-ownership guard.
+    pub fn replace_detail_from_stream(&mut self, epoch: u64, detail: DetailState) {
+        self.replace_detail_inner(epoch, detail, true);
+    }
+
+    fn replace_detail_inner(&mut self, epoch: u64, mut detail: DetailState, from_stream: bool) {
         let Some(current) = self.detail.as_ref() else {
             return;
         };
@@ -574,6 +608,22 @@ impl TuiState {
             return;
         }
         let same_thread = current.thread_id == detail.thread_id;
+        if !from_stream
+            && same_thread
+            && !current.messages.is_empty()
+            && self.stream_owns_thread_content(&detail.server, &detail.thread_id)
+        {
+            // The stream owns the transcript: adopt refreshed metadata only.
+            let current = self.detail.as_mut().expect("detail checked above");
+            current.title = detail.title;
+            current.status = detail.status;
+            current.annotation = detail.annotation;
+            current.active_turn_id = detail.active_turn_id;
+            current.loading = false;
+            current.last_refresh_at = Some(Instant::now());
+            current.last_error = None;
+            return;
+        }
         let previous_mode = self.mode.clone();
         if current.thread_id == detail.thread_id {
             let was_at_bottom =

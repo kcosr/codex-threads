@@ -3784,7 +3784,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 );
             }
             if let Some(detail) = snapshot_detail {
-                state.replace_detail(detail.epoch, detail);
+                state.replace_detail_from_stream(detail.epoch, detail);
             }
             seed_preview_from_resume_snapshot(state, &event);
             for (turn_id, ids, text, finalized) in assistant_updates {
@@ -4775,6 +4775,11 @@ fn upsert_streaming_assistant_message(
     if detail.server != stream.server || detail.thread_id != stream.thread_id {
         return;
     }
+    if detail.loading && detail.messages.is_empty() {
+        // No history baseline yet: the in-flight load establishes it (and
+        // contains this content); streaming resumes on top afterwards.
+        return;
+    }
     let was_at_bottom = detail.is_at_bottom();
     let (message_index, display_text) =
         streaming_message_update_target(&detail.messages, turn_id.as_deref(), ids, text);
@@ -4820,6 +4825,9 @@ fn upsert_preview_assistant_message(
         return;
     };
     if !preview_matches_thread(state, &stream.server, &stream.thread_id) {
+        return;
+    }
+    if state.browser.preview.loading && state.browser.preview.messages.is_empty() {
         return;
     }
     let server = stream.server.clone();
@@ -10506,6 +10514,141 @@ mod tests {
 
     fn plain_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn refresh_results_only_touch_metadata_on_stream_owned_threads() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Old title", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item-1", "type": "agentMessage", "text": "Streamed content ahead of history"}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        // A history fetch landing mid-stream lags the streamed transcript: it
+        // must update header metadata only.
+        let fetched = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "New title", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item-1", "type": "agentMessage", "text": "Lagging history"}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        );
+        state.replace_detail(1, fetched.clone());
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.title, "New title", "metadata adopts the refresh");
+        assert_eq!(
+            message_text(&detail.messages[0]),
+            "Streamed content ahead of history",
+            "stream-owned transcript is untouched by refreshes"
+        );
+
+        // The stream's own snapshot (attach) replaces in full.
+        state.replace_detail_from_stream(1, fetched);
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(message_text(&detail.messages[0]), "Lagging history");
+
+        // Once the stream no longer delivers, refreshes own content again.
+        state.stream.as_mut().expect("stream").status = StreamStatus::Following;
+        let refetched = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "New title", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item-1", "type": "agentMessage", "text": "Final history"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        );
+        state.replace_detail(1, refetched);
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(message_text(&detail.messages[0]), "Final history");
+    }
+
+    #[test]
+    fn preview_fetch_does_not_overwrite_stream_owned_preview() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        let epoch = state.set_preview_loading("work".to_string(), "t1".to_string());
+        state.browser.preview.loading = false;
+        state.browser.preview.messages = vec![message_block(
+            Some("turn-1".to_string()),
+            Some("msg_a".to_string()),
+            "assistant",
+            None,
+            "Streamed preview content",
+            100,
+        )];
+        state.stream = Some(StreamState::new(
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+
+        state.set_preview_loaded(
+            epoch,
+            "work".to_string(),
+            "t1".to_string(),
+            vec![message_block(
+                Some("turn-1".to_string()),
+                Some("item-1".to_string()),
+                "assistant",
+                None,
+                "Lagging history",
+                100,
+            )],
+        );
+        assert_eq!(
+            message_text(&state.browser.preview.messages[0]),
+            "Streamed preview content",
+            "stream-owned preview is untouched by fetches"
+        );
     }
 
     #[tokio::test]
