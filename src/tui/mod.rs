@@ -5713,6 +5713,9 @@ fn format_browser_updated_epoch_at(value: i64, now: i64, relative: bool) -> Stri
         return format_epoch(value);
     }
     let age = now.saturating_sub(value);
+    if age == 0 {
+        return "now".to_string();
+    }
     if age < 60 {
         return format!("{} ago", plural_duration(age, "second"));
     }
@@ -6074,6 +6077,7 @@ mod tests {
     fn browser_updated_time_is_toggleable_and_relative_for_all_past_times() {
         let now = 1_700_000_000;
 
+        assert_eq!(format_browser_updated_epoch_at(now, now, true), "now");
         assert_eq!(
             format_browser_updated_epoch_at(now - 30, now, true),
             "30 seconds ago"
