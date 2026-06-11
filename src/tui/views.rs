@@ -441,6 +441,11 @@ fn live_indicator_span(trailing: &str) -> Span<'static> {
     )
 }
 
+/// "Live" means: this thread's event feed is subscribed (send- or
+/// attach-originated) for a turn that is in progress. Stream tasks are
+/// per-turn, so a non-detached Starting/Running stream implies an executing
+/// (or imminently starting) turn; the post-turn `Following` probe and all
+/// terminal states are explicitly not live.
 fn stream_is_live_for(state: &TuiState, server: &str, thread_id: &str) -> bool {
     state.stream.as_ref().is_some_and(|stream| {
         stream.server == server
