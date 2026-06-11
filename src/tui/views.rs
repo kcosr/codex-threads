@@ -969,6 +969,10 @@ fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 "-/+ refresh interval: {}s",
                 state.browser.auto_refresh_seconds
             ),
+            format!(
+                "a auto-attach live streams: {}",
+                on_off(state.prefs.browser.auto_attach)
+            ),
             "Esc close".to_string(),
         ],
     );
@@ -1073,7 +1077,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "Menus and Prompts",
         "  Filters: a toggle archived filter  Sort: u updated, c created, d direction",
         "  Columns: 1 status, 2 updated, 3 cwd, 4 annotation, 5 relative time",
-        "  Columns: t auto-refresh, -/+ refresh interval",
+        "  Columns: t auto-refresh, -/+ refresh interval, a auto-attach",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
         "  Open in Codex confirmation: Enter launch, Esc cancel",

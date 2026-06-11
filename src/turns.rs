@@ -13,6 +13,11 @@ use crate::session::request_with_resume_retry;
 #[cfg(feature = "tui")]
 use crate::session::resume_thread_for_action_with_notifications;
 
+/// How long the watched turn must stay silent on the live subscription
+/// before the fallback poll runs. While notifications for the turn are
+/// flowing, no polls are issued at all.
+const TURN_POLL_QUIET_SECS: u64 = 3;
+
 #[derive(Debug)]
 pub struct TurnStartOptions {
     pub model: Option<String>,
@@ -682,6 +687,10 @@ where
 
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The live subscription is the primary transport; polling is only the
+    // fallback for turns whose notifications stop arriving (or never match,
+    // e.g. when turn/start returned a temporary turn id).
+    let mut last_turn_evidence = std::time::Instant::now();
     let turn_timeout = tokio::time::sleep(options.timeout);
     tokio::pin!(turn_timeout);
     loop {
@@ -703,6 +712,7 @@ where
                             &mut events,
                             &mut on_assistant_text_from_poll,
                         ).await?;
+                        last_turn_evidence = std::time::Instant::now();
                         emit_new_events(&events, before_len, &mut on_event)?;
                         if let Some(terminal) = terminal {
                             return Ok(TurnWaitOutcome::Terminal(terminal));
@@ -742,6 +752,9 @@ where
             }
             notification = client.next_notification_or_request() => {
                 let notification = notification?;
+                if notification_concerns_turn(&wait, &notification) {
+                    last_turn_evidence = std::time::Instant::now();
+                }
                 let before_len = events.len();
                 if let Some(terminal) = process_turn_notification(
                     &wait,
@@ -755,6 +768,9 @@ where
                 emit_new_events(&events, before_len, &mut on_event)?;
             }
             _ = poll.tick() => {
+                if last_turn_evidence.elapsed() < Duration::from_secs(TURN_POLL_QUIET_SECS) {
+                    continue;
+                }
                 let before_len = events.len();
                 let terminal = poll_turn_completion(
                     client,
@@ -763,6 +779,7 @@ where
                     &mut events,
                     &mut on_assistant_text_from_poll,
                 ).await?;
+                last_turn_evidence = std::time::Instant::now();
                 emit_new_events(&events, before_len, &mut on_event)?;
                 if let Some(terminal) = terminal {
                     return Ok(TurnWaitOutcome::Terminal(terminal));
@@ -779,6 +796,17 @@ struct TurnWaitContext<'a> {
     prompt: Option<&'a str>,
     started_after_epoch: Option<i64>,
     poll_limit: u32,
+}
+
+/// Whether a notification proves the live subscription still delivers
+/// traffic for the watched turn. Notifications for other turns do not count:
+/// they leave open the possibility that `wait.turn_id` is a stale or
+/// temporary id whose real turn only the fallback poll can re-align.
+fn notification_concerns_turn(wait: &TurnWaitContext<'_>, notification: &Notification) -> bool {
+    let params = &notification.params;
+    params["threadId"] == wait.thread_id
+        && (params["turnId"] == wait.turn_id.as_str()
+            || params["turn"]["id"] == wait.turn_id.as_str())
 }
 
 pub async fn start_turn(
@@ -884,6 +912,9 @@ where
     }
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // See wait_for_turn_controlled: polls back off while turn notifications
+    // are flowing on the live subscription.
+    let mut last_turn_evidence = std::time::Instant::now();
     let turn_timeout = tokio::time::sleep(timeout);
     tokio::pin!(turn_timeout);
     loop {
@@ -902,6 +933,9 @@ where
             }
             notification = client.next_notification_or_request() => {
                 let notification = notification?;
+                if notification_concerns_turn(&wait, &notification) {
+                    last_turn_evidence = std::time::Instant::now();
+                }
                 let before_len = events.len();
                 if let Some(terminal) = process_turn_notification(
                     &wait,
@@ -915,6 +949,9 @@ where
                 emit_new_events(&events, before_len, &mut on_event)?;
             }
             _ = poll.tick() => {
+                if last_turn_evidence.elapsed() < Duration::from_secs(TURN_POLL_QUIET_SECS) {
+                    continue;
+                }
                 let before_len = events.len();
                 let terminal = poll_turn_completion(
                     client,
@@ -923,6 +960,7 @@ where
                     &mut events,
                     &mut on_assistant_text_from_poll,
                 ).await?;
+                last_turn_evidence = std::time::Instant::now();
                 emit_new_events(&events, before_len, &mut on_event)?;
                 if let Some(terminal) = terminal {
                     return Ok(TurnWaitOutcome::Terminal(terminal));

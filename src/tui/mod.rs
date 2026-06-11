@@ -1481,6 +1481,10 @@ async fn handle_terminal_event(
                         schedule_browser_refresh(state, fetch_tx).await?;
                     }
                 }
+                KeyCode::Char('a') => {
+                    state.prefs.browser.auto_attach = !state.prefs.browser.auto_attach;
+                    changed = true;
+                }
                 KeyCode::Char('-') | KeyCode::Char('_') => {
                     changed = adjust_auto_refresh_interval(state, -(AUTO_REFRESH_STEP_SECS as i64));
                 }
@@ -4243,6 +4247,9 @@ fn auto_attach_selected_browser_thread_if_active(
     yolo: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    if !state.prefs.browser.auto_attach {
+        return;
+    }
     if !matches!(state.mode, Mode::Browser) || state.stream.is_some() {
         return;
     }
@@ -4277,6 +4284,9 @@ fn auto_attach_open_detail_thread_if_active(
     yolo: bool,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    if !state.prefs.browser.auto_attach {
+        return;
+    }
     if !matches!(state.mode, Mode::Detail) {
         return;
     }
@@ -4362,6 +4372,9 @@ fn follow_thread_stream_if_active(
     thread_id: String,
     app_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    if !state.prefs.browser.auto_attach {
+        return;
+    }
     if !stream_event_matches_visible_thread(state, &server, &thread_id) {
         return;
     }
@@ -10533,6 +10546,48 @@ mod tests {
 
     fn plain_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[tokio::test]
+    async fn auto_attach_flag_gates_automatic_stream_attach() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.auto_attach = false;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![test_thread_row("t1", "active")];
+        state.browser.selected = 0;
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+
+        auto_attach_selected_browser_thread_if_active(
+            &mut state,
+            test_targets_named(&["work"]),
+            false,
+            app_tx.clone(),
+        );
+        assert!(
+            state.stream.is_none(),
+            "auto-attach off must not attach on selection"
+        );
+
+        state.prefs.browser.auto_attach = true;
+        auto_attach_selected_browser_thread_if_active(
+            &mut state,
+            test_targets_named(&["work"]),
+            false,
+            app_tx,
+        );
+        assert!(
+            state.stream.is_some(),
+            "auto-attach on attaches the active selection"
+        );
     }
 
     #[test]

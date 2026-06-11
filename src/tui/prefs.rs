@@ -39,6 +39,15 @@ pub struct BrowserPrefs {
     pub preview_pane: bool,
     #[serde(rename = "relativeUpdated")]
     pub relative_updated: bool,
+    /// When on, selecting or opening an active thread attaches its live
+    /// stream automatically; when off, content comes from history fetches
+    /// and only explicit attaches (`T`) or own sends stream.
+    #[serde(rename = "autoAttach", default = "default_auto_attach")]
+    pub auto_attach: bool,
+}
+
+fn default_auto_attach() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +91,7 @@ impl Default for BrowserPrefs {
             direction: SortDirectionPref::Desc,
             preview_pane: true,
             relative_updated: true,
+            auto_attach: true,
         }
     }
 }

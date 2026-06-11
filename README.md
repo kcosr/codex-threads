@@ -244,7 +244,13 @@ active. On inactive threads, `Tab` toggles stream/no-wait for new turns. Browser
 compose streams into the preview while the thread remains selected, follows
 queued turns on that thread, and detaches locally when selection moves away. If
 the initial selected browser row is active, or if an active thread is opened in
-detail, the TUI attaches to it automatically.
+detail, the TUI attaches to it automatically. Automatic attaching is governed
+by the persisted auto-attach toggle (`a` in the `c` menu, on by default): with
+it off, browsing shows content from history fetches only — no live stream is
+opened per selection — and only an explicit `T` attach or your own sends
+stream. While a stream is attached it is the sole content transport: status
+polling backs off entirely while turn notifications are flowing and only
+resumes as a fallback after a few quiet seconds.
 Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
 refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing

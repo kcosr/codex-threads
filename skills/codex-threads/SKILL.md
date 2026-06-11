@@ -116,7 +116,10 @@ Useful TUI keys:
 - `T` attaches to the selected active thread in the browser or the open active
   thread in detail.
 - `r` refreshes; `R` resets pagination; `t` toggles real browser auto-refresh.
-  Use the `c` menu to set the persisted 5-300 second refresh interval.
+  Use the `c` menu to set the persisted 5-300 second refresh interval and the
+  `a` auto-attach toggle: with auto-attach off, browsing shows content from
+  history fetches without opening live streams; `T` and own sends still
+  stream.
 - `l` explicitly loads the selected/open thread, matching
   `status THREAD_ID --load`, then refreshes visible metadata and history.
 - `y` copies the active thread id with OSC 52.
