@@ -15,8 +15,22 @@ use crate::session::resume_thread_for_action_with_notifications;
 
 /// How long the watched turn must stay silent on the live subscription
 /// before the fallback poll runs. While notifications for the turn are
-/// flowing, no polls are issued at all.
-const TURN_POLL_QUIET_SECS: u64 = 3;
+/// flowing, no polls are issued at all. Override the default of 3 seconds
+/// with `CODEX_THREADS_TURN_POLL_QUIET_SECS` (clamped to 1-300).
+const TURN_POLL_QUIET_SECS_DEFAULT: u64 = 3;
+const TURN_POLL_QUIET_SECS_ENV: &str = "CODEX_THREADS_TURN_POLL_QUIET_SECS";
+
+fn turn_poll_quiet_duration() -> Duration {
+    static QUIET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *QUIET.get_or_init(|| {
+        let seconds = std::env::var(TURN_POLL_QUIET_SECS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| seconds.clamp(1, 300))
+            .unwrap_or(TURN_POLL_QUIET_SECS_DEFAULT);
+        Duration::from_secs(seconds)
+    })
+}
 
 #[derive(Debug)]
 pub struct TurnStartOptions {
@@ -768,7 +782,7 @@ where
                 emit_new_events(&events, before_len, &mut on_event)?;
             }
             _ = poll.tick() => {
-                if last_turn_evidence.elapsed() < Duration::from_secs(TURN_POLL_QUIET_SECS) {
+                if last_turn_evidence.elapsed() < turn_poll_quiet_duration() {
                     continue;
                 }
                 let before_len = events.len();
@@ -949,7 +963,7 @@ where
                 emit_new_events(&events, before_len, &mut on_event)?;
             }
             _ = poll.tick() => {
-                if last_turn_evidence.elapsed() < Duration::from_secs(TURN_POLL_QUIET_SECS) {
+                if last_turn_evidence.elapsed() < turn_poll_quiet_duration() {
                     continue;
                 }
                 let before_len = events.len();

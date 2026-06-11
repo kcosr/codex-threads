@@ -1186,7 +1186,7 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
     let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
-    tui.write(b"T");
+    // The initial selection is the active thread; auto-attach streams it.
     tui.wait_for("attached live update");
     wait_for_file_contains(&stream_log, "attached live update");
     server.wait_for_method_count("thread/resume", 1);

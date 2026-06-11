@@ -41,7 +41,7 @@ pub struct BrowserPrefs {
     pub relative_updated: bool,
     /// When on, selecting or opening an active thread attaches its live
     /// stream automatically; when off, content comes from history fetches
-    /// and only explicit attaches (`T`) or own sends stream.
+    /// and only the user's own sends stream.
     #[serde(rename = "autoAttach", default = "default_auto_attach")]
     pub auto_attach: bool,
 }

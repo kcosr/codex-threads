@@ -113,13 +113,10 @@ Useful TUI keys:
 - `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
   but app-server does not expose a clear-name operation.
 - `A` opens confirmation to archive or unarchive the active thread.
-- `T` attaches to the selected active thread in the browser or the open active
-  thread in detail.
 - `r` refreshes; `R` resets pagination; `t` toggles real browser auto-refresh.
   Use the `c` menu to set the persisted 5-300 second refresh interval and the
   `a` auto-attach toggle: with auto-attach off, browsing shows content from
-  history fetches without opening live streams; `T` and own sends still
-  stream.
+  history fetches without opening live streams; own sends still stream.
 - `l` explicitly loads the selected/open thread, matching
   `status THREAD_ID --load`, then refreshes visible metadata and history.
 - `y` copies the active thread id with OSC 52.
@@ -136,11 +133,13 @@ Useful TUI keys:
   transcript bottom; while in detail, `Enter` opens the message action, `n/N`
   move between message-search matches, and `Esc` unlinks the local detail view
   and returns to the browser.
-- In detail, `T` attaches to an active turn and `i` confirms interrupt. Use
+- In detail, `i` confirms interrupt. Use
   `Enter` or `m` to compose; active threads default to steer and `Tab` switches
   between steer and normal send. Attach resumes with a turn snapshot first,
   then streams new events.
 - `q` quits. Local detach leaves remote turns running unless interrupted.
+- Set `CODEX_THREADS_TURN_POLL_QUIET_SECS` (default 3) to adjust how long a
+  watched turn must stay silent before the fallback status poll runs.
 - Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to capture raw stream
   events for transcript debugging.
 - Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to capture every JSON-RPC

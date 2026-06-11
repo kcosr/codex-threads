@@ -224,8 +224,8 @@ browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `Enter` to open a thread, `p` to toggle the lazy recent-message preview pane,
 `[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
 visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
-to confirm archive or unarchive, `T` to attach to the selected active thread,
-`i` to confirm interrupting it, `r` to refresh, `y` to copy the active thread id
+to confirm archive or unarchive,
+`i` to confirm interrupting the selected active thread, `r` to refresh, `y` to copy the active thread id
 with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
 `m` to compose. Use
 `l` to explicitly load the selected or open thread, matching
@@ -247,8 +247,7 @@ the initial selected browser row is active, or if an active thread is opened in
 detail, the TUI attaches to it automatically. Automatic attaching is governed
 by the persisted auto-attach toggle (`a` in the `c` menu, on by default): with
 it off, browsing shows content from history fetches only — no live stream is
-opened per selection — and only an explicit `T` attach or your own sends
-stream. While a stream is attached it is the sole content transport: status
+opened per selection — and only your own sends stream. While a stream is attached it is the sole content transport: status
 polling backs off entirely while turn notifications are flowing and only
 resumes as a fallback after a few quiet seconds.
 Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
@@ -256,7 +255,7 @@ refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
-operation. In detail, `T` attaches to an active turn, `i` confirms interrupt,
+operation. In detail, `i` confirms interrupt,
 `Enter` or `m` composes a message or steer action based on whether the thread is
 active, and `q` quits. Normal send uses Codex app-server's `turn/start` path;
 steer uses `turn/steer` when the thread is active and the composer is in steer
@@ -283,6 +282,9 @@ timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
 spans when the default-off `tui-syntax-highlighting` Cargo feature is enabled.
 Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to append raw stream
 events while debugging live transcript rendering.
+Set `CODEX_THREADS_TURN_POLL_QUIET_SECS` (default 3, clamped to 1-300) to
+adjust how long a watched turn must stay silent before the fallback status
+poll runs while waiting on or attached to a turn.
 Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to additionally append every
 JSON-RPC frame exchanged with app-servers — one NDJSON line per frame with a
 millisecond timestamp, per-connection id, and direction (`send`/`recv`) — plus

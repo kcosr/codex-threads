@@ -1755,59 +1755,6 @@ async fn handle_terminal_event(
                 schedule_thread_load(state, fetch_tx, server, thread_id).await?;
             }
         }
-        KeyCode::Char('T') => {
-            if matches!(state.mode, Mode::Detail)
-                && let Some(detail) = &state.detail
-                && let Some(turn_id) = detail.active_turn_id.clone()
-            {
-                let server = detail.server.clone();
-                let thread_id = detail.thread_id.clone();
-                detach_stream(state);
-                let (control_tx, control_rx) = mpsc::unbounded_channel();
-                let stream_id = state.allocate_stream_id();
-                state.stream = Some(StreamState::new_for_server_with_id(
-                    stream_id,
-                    server.clone(),
-                    thread_id.clone(),
-                    Some(turn_id.clone()),
-                    StreamStatus::Running,
-                    true,
-                ));
-                state.stream_control = Some(control_tx);
-                spawn_attach_task(
-                    targets.get(&server)?.clone(),
-                    thread_id.clone(),
-                    turn_id,
-                    yolo,
-                    control_rx,
-                    stream_id,
-                    app_tx.clone(),
-                );
-            } else if matches!(state.mode, Mode::Browser)
-                && let Some((server, thread_id)) = state.selected_thread_key()
-            {
-                detach_stream(state);
-                let stream_id = state.allocate_stream_id();
-                state.stream = Some(StreamState::new_for_server_with_id(
-                    stream_id,
-                    server.clone(),
-                    thread_id.clone(),
-                    None,
-                    StreamStatus::Starting,
-                    true,
-                ));
-                let (control_tx, control_rx) = mpsc::unbounded_channel();
-                state.stream_control = Some(control_tx);
-                spawn_browser_attach_task(
-                    targets.get(&server)?.clone(),
-                    thread_id,
-                    yolo,
-                    control_rx,
-                    stream_id,
-                    app_tx.clone(),
-                );
-            }
-        }
         KeyCode::Char('i') => match state.mode {
             Mode::Detail => {
                 if let Some(detail) = &state.detail
