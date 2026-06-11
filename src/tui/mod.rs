@@ -2778,7 +2778,7 @@ fn active_stream_can_queue_prompt(state: &TuiState, server: &str, thread_id: &st
             && stream.thread_id == thread_id
             && matches!(
                 stream.status,
-                StreamStatus::Starting | StreamStatus::Running
+                StreamStatus::Starting | StreamStatus::Running | StreamStatus::Following
             )
     })
 }
@@ -4343,7 +4343,7 @@ fn follow_thread_stream_if_active(
         server,
         thread_id.clone(),
         None,
-        StreamStatus::Starting,
+        StreamStatus::Following,
         true,
     ));
     let (control_tx, control_rx) = mpsc::unbounded_channel();

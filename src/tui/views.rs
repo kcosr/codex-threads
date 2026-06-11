@@ -340,7 +340,10 @@ fn browser_row_status(state: &TuiState, server: &str, thread_id: &str, fallback:
         StreamStatus::Failed | StreamStatus::Interrupted => {
             format_stream_status(stream.status).to_string()
         }
-        StreamStatus::Completed | StreamStatus::Detached => fallback.to_string(),
+        // The follow probe is not a live turn: show the thread's own status.
+        StreamStatus::Following | StreamStatus::Completed | StreamStatus::Detached => {
+            fallback.to_string()
+        }
     }
 }
 
@@ -1179,6 +1182,7 @@ fn format_stream_status(status: StreamStatus) -> &'static str {
     match status {
         StreamStatus::Starting => "starting",
         StreamStatus::Running => "running",
+        StreamStatus::Following => "following",
         StreamStatus::Completed => "completed",
         StreamStatus::Failed => "failed",
         StreamStatus::Interrupted => "interrupted",
@@ -2139,6 +2143,53 @@ mod tests {
         assert!(!text.contains("thread-1"));
         assert!(!text.contains("turn-1"));
         assert!(!text.contains("list rows="));
+    }
+
+    #[test]
+    fn follow_probe_shows_thread_status_without_live_indicator() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![ThreadRow {
+            server: "work".to_string(),
+            id: "thread-1".to_string(),
+            title: "Finished thread".to_string(),
+            status: "idle".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "/tmp/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }];
+        state.browser.selected = 0;
+        state.browser.preview.server = Some("work".to_string());
+        state.browser.preview.thread_id = Some("thread-1".to_string());
+        // After a turn completes, the follow probe waits for a queued
+        // follow-up turn; it must not present itself as a live stream.
+        state.stream = Some(StreamState::new(
+            "thread-1".to_string(),
+            None,
+            StreamStatus::Following,
+            true,
+        ));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("idle"), "row shows its own status");
+        assert!(!text.contains("starting"), "probe must not show starting");
+        assert!(!text.contains(" live"), "probe must not show live");
     }
 
     #[test]

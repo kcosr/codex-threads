@@ -320,6 +320,9 @@ impl StreamState {
 pub enum StreamStatus {
     Starting,
     Running,
+    /// Probing for a queued follow-up turn after one completed; nothing is
+    /// streaming yet.
+    Following,
     Completed,
     Failed,
     Interrupted,
