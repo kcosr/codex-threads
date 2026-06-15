@@ -209,7 +209,9 @@ pub struct MessageSpan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+// `Rgb` is only constructed by the syntax-highlighting path; without that
+// feature it is matched but never built.
+#[cfg_attr(not(feature = "tui-syntax-highlighting"), allow(dead_code))]
 pub enum MessageColor {
     Rgb(u8, u8, u8),
 }

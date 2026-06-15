@@ -587,17 +587,15 @@ pub async fn interrupt_turn(
 }
 
 #[cfg(feature = "tui")]
-pub async fn attach_turn<F, G>(
+pub async fn attach_turn<F>(
     target: &Target,
     client: &mut RpcClient,
     options: AttachTurnOptions,
     control_rx: mpsc::UnboundedReceiver<TurnControl>,
     mut on_event: F,
-    on_assistant_text_from_poll: G,
 ) -> Result<TurnWaitOutcome>
 where
     F: FnMut(&Value) -> Result<()>,
-    G: FnMut(&str) -> Result<()>,
 {
     let mut early_notifications = Vec::new();
     let resume = resume_thread_for_action_with_notifications(
@@ -659,24 +657,21 @@ where
         },
         control_rx,
         on_event,
-        on_assistant_text_from_poll,
     )
     .await
 }
 
 #[cfg(feature = "tui")]
-pub async fn wait_for_turn_controlled<F, G>(
+pub async fn wait_for_turn_controlled<F>(
     target: &Target,
     client: &mut RpcClient,
     started: StartedTurn,
     options: ControlledTurnWaitOptions,
     mut control_rx: mpsc::UnboundedReceiver<TurnControl>,
     mut on_event: F,
-    mut on_assistant_text_from_poll: G,
 ) -> Result<TurnWaitOutcome>
 where
     F: FnMut(&Value) -> Result<()>,
-    G: FnMut(&str) -> Result<()>,
 {
     let mut events = vec![started.acceptance];
     let mut assistant = started.assistant_seed;
@@ -724,7 +719,6 @@ where
                             &mut wait,
                             &mut assistant,
                             &mut events,
-                            &mut on_assistant_text_from_poll,
                         ).await?;
                         last_turn_evidence = std::time::Instant::now();
                         emit_new_events(&events, before_len, &mut on_event)?;
@@ -791,7 +785,6 @@ where
                     &mut wait,
                     &mut assistant,
                     &mut events,
-                    &mut on_assistant_text_from_poll,
                 ).await?;
                 last_turn_evidence = std::time::Instant::now();
                 emit_new_events(&events, before_len, &mut on_event)?;
@@ -891,18 +884,16 @@ pub async fn start_turn(
     })
 }
 
-pub async fn wait_for_turn<F, G>(
+pub async fn wait_for_turn<F>(
     target: &Target,
     client: &mut RpcClient,
     started: StartedTurn,
     poll_limit: u32,
     timeout: Duration,
     mut on_event: F,
-    mut on_assistant_text_from_poll: G,
 ) -> Result<TurnWaitOutcome>
 where
     F: FnMut(&Value) -> Result<()>,
-    G: FnMut(&str) -> Result<()>,
 {
     let mut events = vec![started.acceptance];
     let mut assistant = started.assistant_seed;
@@ -972,7 +963,6 @@ where
                     &mut wait,
                     &mut assistant,
                     &mut events,
-                    &mut on_assistant_text_from_poll,
                 ).await?;
                 last_turn_evidence = std::time::Instant::now();
                 emit_new_events(&events, before_len, &mut on_event)?;
@@ -989,7 +979,6 @@ async fn poll_turn_completion(
     wait: &mut TurnWaitContext<'_>,
     assistant: &mut AssistantResponses,
     events: &mut Vec<Value>,
-    _on_assistant_text_from_poll: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<Option<TurnTerminal>> {
     let mut notifications = Vec::new();
     let result = client

@@ -84,7 +84,10 @@ fn normalize_language(language: &str) -> Option<&str> {
 }
 
 fn message_color(color: SyntectColor) -> Option<MessageColor> {
-    if color.a == 0x00 || color.a == 0x01 {
+    // syntect uses alpha 0 as the "use the default foreground" sentinel; any
+    // other alpha is an explicit theme color (terminals ignore alpha, so the
+    // RGB triple is what matters).
+    if color.a == 0x00 {
         return None;
     }
     Some(MessageColor::Rgb(color.r, color.g, color.b))

@@ -428,8 +428,9 @@ fn live_spinner_frame() -> char {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as usize;
-    LIVE_SPINNER_FRAMES[(millis / 120) % LIVE_SPINNER_FRAMES.len()]
+        .as_millis();
+    let frame = (millis / super::LIVE_SPINNER_TICK_MS as u128) % LIVE_SPINNER_FRAMES.len() as u128;
+    LIVE_SPINNER_FRAMES[frame as usize]
 }
 
 fn live_indicator_span(trailing: &str) -> Span<'static> {

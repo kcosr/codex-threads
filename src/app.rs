@@ -860,12 +860,6 @@ async fn start_turn(
             }
             Ok(())
         },
-        |text| {
-            if !json_out && !text.is_empty() {
-                println!("{text}");
-            }
-            Ok(())
-        },
     )
     .await?;
     match outcome {

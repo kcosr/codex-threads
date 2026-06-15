@@ -93,14 +93,25 @@ pub async fn list_threads(
         params.insert("cwd".to_string(), json!(cwd));
     }
     let mut result = if let Some(since) = request.since {
+        // The `since` filter is on the `updatedAt` axis, so early-exit is only
+        // sound when pages are guaranteed newest-first on that same axis. That
+        // holds only when the caller explicitly sorts by `updated` descending;
+        // the default list order is server-defined (an older thread may precede
+        // a newer one across pages), so without an explicit sort we page to
+        // exhaustion.
+        let since_ordered_desc = matches!(request.sort, Some(SortKey::Updated))
+            && direction(request.asc, request.desc) == "desc";
         scan_since_filtered(
             client,
             "thread/list",
             params,
             request.cursor,
             request.limit,
-            since,
-            ThreadProjection::Direct,
+            SinceScan {
+                since,
+                projection: ThreadProjection::Direct,
+                ordered_desc: since_ordered_desc,
+            },
         )
         .await?
     } else {
@@ -125,14 +136,20 @@ pub async fn search_threads(
         params.insert("archived".to_string(), json!(true));
     }
     let mut result = if let Some(since) = request.since {
+        // `thread/search` does not send a sort key/direction, so the server's
+        // result ordering is not guaranteed to be updatedAt-descending. Page to
+        // exhaustion rather than risk dropping older-but-matching threads.
         scan_since_filtered(
             client,
             "thread/search",
             params,
             request.cursor,
             request.limit,
-            since,
-            ThreadProjection::SearchResult,
+            SinceScan {
+                since,
+                projection: ThreadProjection::SearchResult,
+                ordered_desc: false,
+            },
         )
         .await?
     } else {
@@ -319,14 +336,28 @@ pub async fn loaded_status(
     )
 }
 
+/// Filter configuration for [`scan_since_filtered`].
+struct SinceScan {
+    /// Keep threads whose `updatedAt` is at or after this cutoff. The cutoff
+    /// always applies to the `updatedAt` axis, regardless of the caller's
+    /// `--sort`.
+    since: i64,
+    projection: ThreadProjection,
+    /// When true the caller guarantees pages arrive newest-first on the
+    /// `updatedAt` axis, so the first thread older than `since` means every
+    /// later thread is older too and paging can stop. When false (ascending
+    /// order, a different sort key, or an unknown server ordering) the scan
+    /// must page to exhaustion.
+    ordered_desc: bool,
+}
+
 async fn scan_since_filtered(
     client: &mut RpcClient,
     method: &str,
     mut base_params: Map<String, Value>,
     mut cursor: Option<String>,
     limit: u32,
-    since: i64,
-    projection: ThreadProjection,
+    scan: SinceScan,
 ) -> Result<Value> {
     let mut data = Vec::new();
     let mut next_cursor = Value::Null;
@@ -346,14 +377,22 @@ async fn scan_since_filtered(
         next_cursor = page["nextCursor"].clone();
         backwards_cursor = page["backwardsCursor"].clone();
 
+        let mut reached_since_boundary = false;
         for item in page["data"].as_array().into_iter().flatten() {
-            if thread_updated_at(item, projection).unwrap_or(0) >= since {
+            if thread_updated_at(item, scan.projection).unwrap_or(0) >= scan.since {
                 data.push(item.clone());
                 remaining -= 1;
                 if remaining == 0 {
                     break;
                 }
+            } else if scan.ordered_desc {
+                reached_since_boundary = true;
+                break;
             }
+        }
+
+        if reached_since_boundary {
+            break;
         }
 
         let Some(next) = next_cursor.as_str().filter(|value| !value.is_empty()) else {

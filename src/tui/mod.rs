@@ -2295,12 +2295,11 @@ fn scroll_detail(state: &mut TuiState, delta: isize) -> bool {
         return false;
     };
     if delta.is_negative() {
-        detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs() as u16);
+        let step = u16::try_from(delta.unsigned_abs()).unwrap_or(u16::MAX);
+        detail.scroll = detail.scroll.saturating_sub(step);
     } else {
-        detail.scroll = detail
-            .scroll
-            .saturating_add(delta as u16)
-            .min(detail.max_scroll());
+        let step = u16::try_from(delta).unwrap_or(u16::MAX);
+        detail.scroll = detail.scroll.saturating_add(step).min(detail.max_scroll());
     }
     delta.is_negative() && detail.scroll == 0 && detail.next_cursor.is_some() && !detail.loading
 }
@@ -2849,17 +2848,10 @@ async fn attach_existing_turn_stream(
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> Result<StreamStatus> {
     let tx = app_tx.clone();
-    let outcome = attach_turn(
-        target,
-        client,
-        options,
-        control_rx,
-        |event| {
-            send_stream_event(&tx, stream_id, event.clone());
-            Ok(())
-        },
-        |_| Ok(()),
-    )
+    let outcome = attach_turn(target, client, options, control_rx, |event| {
+        send_stream_event(&tx, stream_id, event.clone());
+        Ok(())
+    })
     .await?;
     Ok(stream_status_from_wait_outcome(outcome, stream_id, &tx))
 }
@@ -2887,7 +2879,6 @@ async fn wait_started_turn_stream(
             send_stream_event(&tx, stream_id, event.clone());
             Ok(())
         },
-        |_| Ok(()),
     )
     .await?;
     Ok(stream_status_from_wait_outcome(outcome, stream_id, &tx))
@@ -3704,8 +3695,15 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                         return;
                     }
                 } else if event_thread_id.is_some_and(|thread_id| {
-                    event_server != current_stream.server
-                        || thread_id != current_stream.thread_id.as_str()
+                    // For unowned (stream_id == None) events the server is often
+                    // inferred from the current stream, which would make an
+                    // inferred-server comparison tautological. Match on the
+                    // event's *explicit* server when it has one, and otherwise
+                    // rely solely on the thread id.
+                    thread_id != current_stream.thread_id.as_str()
+                        || event["server"]
+                            .as_str()
+                            .is_some_and(|server| server != current_stream.server)
                 }) {
                     return;
                 }
