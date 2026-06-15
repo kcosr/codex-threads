@@ -14,6 +14,10 @@ app-server threads from a terminal or another agent.
 > usually means this setup is missing, not that something is broken. See
 > [Quickstart](#quickstart) for the full setup.
 
+<p align="center">
+  <img src="docs/assets/tui-screenshot.png" alt="codex-threads TUI showing thread list and transcript preview" width="520">
+</p>
+
 It exists for workflows the Codex CLI does not currently cover well: asking
 what threads were active recently, what happened in a repo, whether a thread is
 still running, and sending a follow-up to an existing session. The Codex desktop
