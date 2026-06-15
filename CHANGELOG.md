@@ -5,49 +5,7 @@
 ### Added
 
 - Add `codex-threads tui`, an interactive terminal UI for browsing, viewing,
-  searching, and controlling threads.
-- Add TUI `l` shortcut to explicitly load the selected or open thread.
-- Add opt-in PTY smoke tests for TUI navigation, streaming, attach/detach, and
-  CLI history/status validation.
-
-### Fixed
-
-- Keep TUI browser row status from falling back to stale `notLoaded` after a
-  locally observed send or stream completion.
-- Keep TUI streaming transcript updates from splitting anonymous deltas into
-  separate fragments after an attached snapshot.
-- Show a connected/detach-oriented detail footer while attached to a stream.
-- Fix TUI transcript and preview bottom scrolling on narrow terminals by
-  counting post-wrap rendered rows.
-- Remove unused unbounded storage of raw stream events in the TUI.
-- Preserve attach-time and polled active-turn assistant updates so browser
-  preview and detail transcripts stay current while attached.
-- Keep normal TUI compose sends on Codex app-server's `turn/start` path while
-  exposing explicit browser steer and interrupt controls for active threads.
-- Let TUI detail scrolling and `gg`/`G` load history through to real transcript
-  start/end boundaries instead of stopping at the prefetched window, using the
-  server's maximum turn page size for full-history jumps.
-- Recognize Shift-G in terminals that report it as shifted lowercase `g`.
-- Prevent TUI history jumps from repeatedly requesting a non-advancing cursor.
-- Keep browser auto-attach streams from duplicating snapshot assistant text when
-  anonymous live deltas arrive after launch.
-- Avoid duplicate human CLI assistant output when turn notifications are missed
-  and completion is discovered through polling.
-- Keep TUI detail and browser streaming sends attached to the turn returned by
-  `turn/start` instead of a pre-existing active turn.
-- Keep live-updated TUI transcript messages from showing stale turn-start
-  timestamps inherited from active-turn snapshots.
-- Let CLI/TUI turn waits complete when live app-server returns a temporary
-  `turn/start` id that differs from the persisted turn id in history.
-- Show turn timestamps only on the first rendered TUI message block for a turn
-  instead of repeating the same turn timestamp on every message.
-- Suppress repeated TUI transcript headers for consecutive same-role messages in
-  the same turn.
-- Keep TUI transcript scroll bounds in sync with suppressed headers so long
-  threads opened at the bottom do not render blank.
-- Keep TUI streams attached to the selected thread across queued follow-up turns
-  and preserve optimistic queued messages until app-server history includes
-  them.
+  searching, streaming, and controlling threads.
 
 ## [0.1.5] - 2026-06-05
 
