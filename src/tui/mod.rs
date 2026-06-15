@@ -3471,9 +3471,14 @@ fn spawn_create_session_task(
             .await?;
             let thread_id = thread_id_from_start(&start)?;
             created_thread_id = Some(thread_id.clone());
-            if let Some(name) = &title {
-                set_thread_name(&target, &mut client, thread_id.clone(), name.clone()).await?;
-            }
+            let naming_error = if let Some(name) = &title {
+                set_thread_name(&target, &mut client, thread_id.clone(), name.clone())
+                    .await
+                    .err()
+                    .map(|error| format!("{error:#}"))
+            } else {
+                None
+            };
             let _ = app_tx.send(AppEvent::SessionCreated {
                 stream_id,
                 server: server.clone(),
@@ -3481,6 +3486,7 @@ fn spawn_create_session_task(
                 cwd: cwd.clone(),
                 title: title.clone(),
                 prompt: prompt.clone(),
+                naming_error,
             });
             let prompt_for_event = prompt.clone();
             let started = start_turn_request(
@@ -3595,6 +3601,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             cwd,
             title,
             prompt,
+            naming_error,
         } => {
             let sent_at = format_current_epoch();
             let row_title = title.unwrap_or_else(|| {
@@ -3641,7 +3648,11 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                 &prompt,
                 100,
             )];
-            state.set_notice("session created");
+            if let Some(error) = naming_error {
+                state.set_notice(format!("session created; rename failed: {error}"));
+            } else {
+                state.set_notice("session created");
+            }
         }
         AppEvent::SessionCreateFailed { server, error } => {
             state.stream_control = None;
@@ -10844,6 +10855,7 @@ mod tests {
                 cwd: "/repos/project".to_string(),
                 title: Some("Fresh session".to_string()),
                 prompt: "hello there".to_string(),
+                naming_error: None,
             },
             &mut state,
         );

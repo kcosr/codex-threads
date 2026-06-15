@@ -96,6 +96,7 @@ pub(crate) enum AppEvent {
         cwd: String,
         title: Option<String>,
         prompt: String,
+        naming_error: Option<String>,
     },
     SessionCreateFailed {
         server: String,

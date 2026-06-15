@@ -45,6 +45,7 @@ struct ServerState {
     threads: HashMap<String, ThreadRecord>,
     order: Vec<String>,
     next_turn: u64,
+    fail_thread_name_set: bool,
 }
 
 struct StartedMockTurn {
@@ -63,6 +64,14 @@ struct TuiPty {
 
 impl TuiMockServer {
     fn start() -> Self {
+        Self::start_with_state(ServerState::new())
+    }
+
+    fn start_with_name_set_failure() -> Self {
+        Self::start_with_state(ServerState::new_with_name_set_failure())
+    }
+
+    fn start_with_state(server_state: ServerState) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
         let config = temp.path().join("config.toml");
@@ -75,7 +84,7 @@ impl TuiMockServer {
         )
         .expect("config");
 
-        let state = Arc::new(Mutex::new(ServerState::new()));
+        let state = Arc::new(Mutex::new(server_state));
         let received = Arc::new(Mutex::new(Vec::new()));
         spawn_mock_listener(socket, state, Arc::clone(&received));
 
@@ -192,6 +201,14 @@ fn spawn_mock_listener(
 
 impl ServerState {
     fn new() -> Self {
+        Self::new_with_options(false)
+    }
+
+    fn new_with_name_set_failure() -> Self {
+        Self::new_with_options(true)
+    }
+
+    fn new_with_options(fail_thread_name_set: bool) -> Self {
         let active_turn = json!({
             "id": "turn_active",
             "status": "inProgress",
@@ -298,6 +315,7 @@ impl ServerState {
                 "thread_long".to_string(),
             ],
             next_turn: 2,
+            fail_thread_name_set,
         }
     }
 
@@ -617,8 +635,10 @@ async fn handle_websocket<S>(
             }
         }
 
-        let result = mock_result(method, &request, &state);
-        let response = json!({ "id": id, "result": result });
+        let response = match mock_result(method, &request, &state) {
+            Ok(result) => json!({ "id": id, "result": result }),
+            Err(error) => json!({ "id": id, "error": error }),
+        };
         if ws
             .send(Message::Text(response.to_string().into()))
             .await
@@ -755,9 +775,13 @@ async fn send_delta<S>(
         .await;
 }
 
-fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -> Value {
+fn mock_result(
+    method: &str,
+    request: &Value,
+    state: &Arc<Mutex<ServerState>>,
+) -> Result<Value, Value> {
     let mut state = state.lock().expect("state");
-    match method {
+    let result = match method {
         "thread/start" => {
             let cwd = request["params"]["cwd"].as_str().unwrap_or("");
             let id = state.add_thread(cwd);
@@ -809,6 +833,12 @@ fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -
         "turn/start" => json!({"turn": {"id": "turn_2", "status": "inProgress", "items": []}}),
         "turn/steer" => json!({"turnId": request["params"]["expectedTurnId"].clone()}),
         "turn/interrupt" => json!({}),
+        "thread/name/set" if state.fail_thread_name_set => {
+            return Err(json!({
+                "code": -32000,
+                "message": "mock name set failure"
+            }));
+        }
         "thread/name/set" => {
             let id = thread_id(request).to_string();
             if let Some(name) = request["params"]["name"].as_str()
@@ -821,7 +851,8 @@ fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -
         "thread/archive" => json!({"thread": state.thread_json(thread_id(request))}),
         "thread/unarchive" => json!({"thread": state.thread_json(thread_id(request))}),
         other => panic!("unexpected method {other}"),
-    }
+    };
+    Ok(result)
 }
 
 fn thread_id(request: &Value) -> &str {
@@ -1283,6 +1314,43 @@ fn tui_browser_new_session_flow_creates_named_thread_and_streams() {
     assert!(
         rpc_lines.contains("\"kind\":\"recv\""),
         "rpc log should capture received frames"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_new_session_flow_continues_when_name_set_fails() {
+    let server = TuiMockServer::start_with_name_set_failure();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"n");
+    tui.wait_for("New session cwd");
+    tui.write(b"\r");
+    tui.wait_for("New session name");
+    tui.type_text("Unrenamed session");
+    tui.write(b"\r");
+    tui.wait_for("New session first message");
+    tui.type_text("hello despite rename failure");
+    tui.write(b"\r");
+
+    server.wait_for_method_count("thread/start", 1);
+    server.wait_for_method_count("thread/name/set", 1);
+    server.wait_for_method_count("turn/start", 1);
+    tui.wait_for("Unrenamed session");
+    tui.wait_for("rename failed");
+    tui.wait_for("stream reply for hello despite rename failure");
+    tui.quit();
+
+    let turn_starts = server.requests_for("turn/start");
+    assert_eq!(turn_starts.len(), 1);
+    assert!(
+        turn_starts[0]["params"]["threadId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("thread_created_")),
+        "first turn should still target the created thread after rename failure"
     );
 }
 
