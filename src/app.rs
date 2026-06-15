@@ -1,14 +1,14 @@
-use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use serde_json::{Map, Value, json};
 
 use crate::annotations::{
     AnnotationListItem, clear_annotation, clear_annotations, list_annotations, load_annotation,
-    namespace_annotations, set_annotation,
+    set_annotation,
 };
 use crate::cli::*;
 use crate::completion::{
@@ -18,7 +18,19 @@ use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
     resolve_config_path, resolve_direct_target, resolve_target,
 };
-use crate::rpc::{Notification, RpcClient, RpcRequestError};
+use crate::errors::{ExitError, app_server_error, usage_error};
+use crate::rpc::RpcClient;
+use crate::session::{
+    ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
+    ShowThreadRequest, ThreadProjection, ThreadStatusRequest, insert_thread_yolo_permissions,
+    is_thread_not_found_error, list_threads, load_messages, loaded_status, read_thread_detail,
+    request_with_resume_retry, resume_thread_for_inspection, search_threads, thread_status,
+};
+use crate::time_filter::parse_since;
+use crate::turns::{
+    TurnStartOptions, TurnTerminal, TurnWaitOutcome, start_turn as start_turn_request,
+    wait_for_turn,
+};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_SHOW_LAST: u32 = 20;
@@ -27,13 +39,6 @@ const TURN_WAIT_TIMEOUT_SECS: u64 = 60 * 60;
 const THREAD_LABEL_WIDTH: usize = 56;
 const SEARCH_SNIPPET_WIDTH: usize = 48;
 const ANNOTATION_WIDTH: usize = 40;
-
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-struct ExitError {
-    code: i32,
-    message: String,
-}
 
 pub async fn run_cli<I, T>(args: I) -> i32
 where
@@ -134,6 +139,17 @@ async fn run(cli: Cli) -> Result<i32> {
                 |target, client| async move { show_command(target, client, command).await },
             )
             .await
+        }
+        #[cfg(feature = "tui")]
+        Command::Tui(command) => {
+            let target = resolve_target_for_command(
+                &config,
+                cli.connect.as_deref(),
+                cli.connect_auth_token_env.as_deref(),
+                cli.connect_auth_token.as_deref(),
+                command.server.server.clone(),
+            )?;
+            crate::tui::run_tui(target, command, yolo).await
         }
         Command::Messages(command) => {
             with_client(
@@ -555,40 +571,22 @@ fn render_server_ping_results(results: Vec<Value>, json_output: bool) -> Result<
 
 async fn list_command(target: Target, mut client: RpcClient, command: ListCommand) -> Result<i32> {
     let since = command.since.as_deref().map(parse_since).transpose()?;
-    let mut params = Map::new();
-    insert_opt(&mut params, "cursor", command.cursor.clone());
     let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    params.insert("limit".to_string(), json!(limit));
-    if let Some(sort) = command.sort {
-        params.insert("sortKey".to_string(), json!(sort_key(sort)));
-    }
-    params.insert(
-        "sortDirection".to_string(),
-        json!(direction(command.asc, command.desc)),
-    );
-    if command.archived {
-        params.insert("archived".to_string(), json!(true));
-    }
-    if let Some(cwd) = command.cwd {
-        params.insert("cwd".to_string(), json!(cwd));
-    }
-    let mut result = if let Some(since) = since {
-        scan_since_filtered(
-            &mut client,
-            "thread/list",
-            params,
-            command.cursor,
+    let result = list_threads(
+        &target,
+        &mut client,
+        ListThreadsRequest {
             limit,
+            cursor: command.cursor,
             since,
-            ThreadProjection::Direct,
-        )
-        .await?
-    } else {
-        client
-            .request("thread/list", Value::Object(params), |_| {})
-            .await?
-    };
-    attach_thread_annotations(&target, &mut result, ThreadProjection::Direct)?;
+            cwd: command.cwd,
+            archived: command.archived,
+            sort: command.sort,
+            asc: command.asc,
+            desc: command.desc,
+        },
+    )
+    .await?;
     emit_threads_result(&target, command.json, result, ThreadProjection::Direct)
 }
 
@@ -598,31 +596,19 @@ async fn search_command(
     command: SearchCommand,
 ) -> Result<i32> {
     let since = command.since.as_deref().map(parse_since).transpose()?;
-    let mut params = Map::new();
-    insert_opt(&mut params, "cursor", command.cursor.clone());
     let limit = command.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    params.insert("limit".to_string(), json!(limit));
-    params.insert("searchTerm".to_string(), json!(command.query));
-    if command.archived {
-        params.insert("archived".to_string(), json!(true));
-    }
-    let mut result = if let Some(since) = since {
-        scan_since_filtered(
-            &mut client,
-            "thread/search",
-            params,
-            command.cursor,
+    let result = search_threads(
+        &target,
+        &mut client,
+        SearchThreadsRequest {
+            query: command.query,
             limit,
+            cursor: command.cursor,
             since,
-            ThreadProjection::SearchResult,
-        )
-        .await?
-    } else {
-        client
-            .request("thread/search", Value::Object(params), |_| {})
-            .await?
-    };
-    attach_thread_annotations(&target, &mut result, ThreadProjection::SearchResult)?;
+            archived: command.archived,
+        },
+    )
+    .await?;
     emit_threads_result(
         &target,
         command.json,
@@ -631,135 +617,20 @@ async fn search_command(
     )
 }
 
-#[derive(Clone, Copy)]
-enum ThreadProjection {
-    Direct,
-    SearchResult,
-}
-
-async fn scan_since_filtered(
-    client: &mut RpcClient,
-    method: &str,
-    mut base_params: Map<String, Value>,
-    mut cursor: Option<String>,
-    limit: u32,
-    since: i64,
-    projection: ThreadProjection,
-) -> Result<Value> {
-    let mut data = Vec::new();
-    let mut next_cursor = Value::Null;
-    let mut backwards_cursor = Value::Null;
-    let mut remaining = limit;
-
-    base_params.remove("cursor");
-    base_params.remove("limit");
-
-    while remaining > 0 {
-        let mut params = base_params.clone();
-        insert_opt(&mut params, "cursor", cursor.clone());
-        params.insert("limit".to_string(), json!(remaining));
-        let page = client
-            .request(method, Value::Object(params), |_| {})
-            .await?;
-        next_cursor = page["nextCursor"].clone();
-        backwards_cursor = page["backwardsCursor"].clone();
-
-        for item in page["data"].as_array().cloned().unwrap_or_default() {
-            if thread_updated_at(&item, projection).unwrap_or(0) >= since {
-                data.push(item);
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
-            }
-        }
-
-        let Some(next) = next_cursor.as_str().filter(|value| !value.is_empty()) else {
-            break;
-        };
-        if cursor.as_deref() == Some(next) {
-            break;
-        }
-        cursor = Some(next.to_string());
-    }
-
-    Ok(json!({
-        "data": data,
-        "nextCursor": next_cursor,
-        "backwardsCursor": backwards_cursor
-    }))
-}
-
-fn thread_updated_at(item: &Value, projection: ThreadProjection) -> Option<i64> {
-    match projection {
-        ThreadProjection::Direct => item["updatedAt"].as_i64(),
-        ThreadProjection::SearchResult => item["thread"]["updatedAt"].as_i64(),
-    }
-}
-
-fn attach_thread_annotations(
-    target: &Target,
-    result: &mut Value,
-    projection: ThreadProjection,
-) -> Result<()> {
-    let annotations = namespace_annotations(target)?;
-    if annotations.is_empty() {
-        return Ok(());
-    }
-    let Some(items) = result["data"].as_array_mut() else {
-        return Ok(());
-    };
-    for item in items {
-        let Some(thread) = (match projection {
-            ThreadProjection::Direct => Some(item),
-            ThreadProjection::SearchResult => item.get_mut("thread"),
-        }) else {
-            continue;
-        };
-        if let Some(thread_id) = thread["id"].as_str()
-            && let Some(annotation) = annotations.get(thread_id)
-            && let Some(thread_object) = thread.as_object_mut()
-        {
-            thread_object.insert("annotation".to_string(), json!(annotation));
-        }
-    }
-    Ok(())
-}
-
-fn attach_annotation_to_thread(target: &Target, thread: &mut Value) -> Result<()> {
-    if let Some(thread_id) = thread["id"].as_str()
-        && let Some(annotation) = load_annotation(target, thread_id)?
-        && let Some(thread_object) = thread.as_object_mut()
-    {
-        thread_object.insert("annotation".to_string(), json!(annotation));
-    }
-    Ok(())
-}
-
 async fn show_command(target: Target, mut client: RpcClient, command: ShowCommand) -> Result<i32> {
-    let thread = client
-        .request(
-            "thread/read",
-            json!({"threadId": command.thread_id, "includeTurns": false}),
-            |_| {},
-        )
-        .await?;
-    let turns = client
-        .request(
-            "thread/turns/list",
-            json!({
-                "threadId": command.thread_id,
-                "cursor": command.cursor,
-                "limit": command.last.unwrap_or(DEFAULT_SHOW_LAST),
-                "sortDirection": direction(command.asc, command.desc),
-                "itemsView": items_view(command.items)
-            }),
-            |_| {},
-        )
-        .await?;
-    let mut thread = thread["thread"].clone();
-    attach_annotation_to_thread(&target, &mut thread)?;
-    let result = json!({"server": target.server, "thread": thread, "turns": turns});
+    let result = read_thread_detail(
+        &target,
+        &mut client,
+        ShowThreadRequest {
+            thread_id: command.thread_id,
+            last: command.last.unwrap_or(DEFAULT_SHOW_LAST),
+            cursor: command.cursor,
+            asc: command.asc,
+            desc: command.desc,
+            items: command.items,
+        },
+    )
+    .await?;
     if command.json {
         print_json(&result)?;
     } else {
@@ -773,45 +644,21 @@ async fn messages_command(
     mut client: RpcClient,
     command: MessagesCommand,
 ) -> Result<i32> {
-    let result = client
-        .request(
-            "thread/turns/list",
-            json!({
-                "threadId": command.thread_id,
-                "limit": command.max_turns,
-                "sortDirection": "desc",
-                "itemsView": "full"
-            }),
-            |_| {},
-        )
-        .await?;
-    let mut messages = flatten_messages(&result);
-    if let Some(since) = &command.since {
-        let cutoff = parse_since(since)?;
-        messages.retain(|m| {
-            m["turnStartedAt"]
-                .as_i64()
-                .or_else(|| m["turnCompletedAt"].as_i64())
-                .unwrap_or(0)
-                >= cutoff
-        });
-    }
-    let filtered_role = command.role.map(message_role_name);
-    if let Some(role) = filtered_role {
-        messages.retain(|m| m["role"].as_str() == Some(role));
-    }
-    if let Some(last) = command.last
-        && messages.len() > last
-    {
-        messages = messages.split_off(messages.len() - last);
-    }
-    let output = json!({
-        "server": target.server,
-        "threadId": command.thread_id,
-        "messages": messages,
-        "truncated": result["nextCursor"].is_string(),
-        "nextCursor": result["nextCursor"].clone()
-    });
+    let since = command.since.as_deref().map(parse_since).transpose()?;
+    let result = load_messages(
+        &target,
+        &mut client,
+        MessagesRequest {
+            thread_id: command.thread_id,
+            last: command.last,
+            since,
+            role: command.role,
+            max_turns: command.max_turns,
+        },
+    )
+    .await?;
+    let output = result.output;
+    let filtered_role = result.filtered_role.map(message_role_name);
     if command.json {
         print_json(&output)?;
     } else {
@@ -939,339 +786,117 @@ async fn start_turn(
     prompt: String,
     options: TurnOptions,
 ) -> Result<i32> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(thread_id));
-    params.insert(
-        "input".to_string(),
-        json!([{"type": "text", "text": prompt, "textElements": []}]),
-    );
-    if options.yolo {
-        insert_turn_yolo_permissions(&mut params);
-    }
-    insert_opt(&mut params, "model", options.model);
     if let Some(effort) = options.effort.as_deref() {
         validate_effort(effort)?;
-        params.insert("effort".to_string(), json!(effort));
     }
-    if let Some(tier) = options.service_tier {
-        params.insert("serviceTier".to_string(), json!(tier));
-    }
-    let early_notifications = RefCell::new(Vec::new());
-    let params = Value::Object(params);
-    let result = request_with_resume_retry(
+    let json_out = options.json;
+    let stream = options.stream;
+    let no_wait = options.no_wait;
+
+    let started = start_turn_request(
+        &target,
         &mut client,
-        "turn/start",
-        params,
-        &thread_id,
-        options.yolo,
-        || {
-            early_notifications.borrow_mut().clear();
-        },
-        |notification| {
-            early_notifications.borrow_mut().push(notification);
+        thread_id,
+        prompt,
+        TurnStartOptions {
+            model: options.model,
+            effort: options.effort,
+            service_tier: options.service_tier,
+            yolo: options.yolo,
         },
     )
     .await?;
-    let turn_id = result["turn"]["id"]
-        .as_str()
-        .ok_or_else(|| app_server_error("turn/start response missing turn.id"))?
-        .to_string();
-    let acceptance = json!({"type": "accepted", "server": target.server, "threadId": thread_id, "turnId": turn_id, "status": "accepted"});
-    if options.json && options.stream {
-        println!("{}", serde_json::to_string(&acceptance)?);
-    } else if options.json && options.no_wait {
-        print_json(&acceptance)?;
-    } else if !options.json {
+    if json_out && stream {
+        println!("{}", serde_json::to_string(&started.acceptance)?);
+    } else if json_out && no_wait {
+        print_json(&started.acceptance)?;
+    } else if !json_out {
         print_key_values(&[
             ("server", target.server.as_str()),
-            ("threadId", thread_id.as_str()),
-            ("turnId", turn_id.as_str()),
+            ("threadId", started.thread_id.as_str()),
+            ("turnId", started.turn_id.as_str()),
             ("status", "accepted"),
         ]);
     }
-    if options.no_wait {
+    if no_wait {
         return Ok(0);
     }
 
-    let mut events = vec![acceptance];
-    let mut assistant_text = String::new();
-    let wait = TurnWaitContext {
-        target: &target,
-        thread_id: &thread_id,
-        turn_id: &turn_id,
-        json_out: options.json,
-        stream: options.stream,
-    };
-    for notification in early_notifications.into_inner() {
-        if let Some(code) =
-            process_turn_notification(&wait, notification, &mut assistant_text, &mut events)?
-        {
-            return Ok(code);
-        }
-    }
-    let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let turn_timeout = tokio::time::sleep(std::time::Duration::from_secs(TURN_WAIT_TIMEOUT_SECS));
-    tokio::pin!(turn_timeout);
-    loop {
-        tokio::select! {
-            _ = &mut turn_timeout => {
-                return Err(app_server_error(format!(
-                    "timed out waiting for turn `{turn_id}` to complete"
-                )));
+    let outcome = wait_for_turn(
+        &target,
+        &mut client,
+        started,
+        TURN_SCAN_LIMIT,
+        Duration::from_secs(TURN_WAIT_TIMEOUT_SECS),
+        |event| {
+            if json_out && stream {
+                println!("{}", serde_json::to_string(event)?);
+            } else if !json_out {
+                print_human_event(event);
             }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("interrupted locally; turn is still running");
-                eprint!("{}", key_values_text(&[
+            Ok(())
+        },
+        |text| {
+            if !json_out && !text.is_empty() {
+                println!("{text}");
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    match outcome {
+        TurnWaitOutcome::Terminal(terminal) => {
+            emit_turn_terminal_output(json_out, stream, &terminal, target.server.as_str())
+        }
+        TurnWaitOutcome::LocalInterrupt { thread_id, turn_id } => {
+            eprintln!("interrupted locally; turn is still running");
+            eprint!(
+                "{}",
+                key_values_text(&[
                     ("server", target.server.as_str()),
                     ("threadId", thread_id.as_str()),
                     ("turnId", turn_id.as_str()),
-                ]));
-                return Ok(130);
-            }
-            notification = client.next_notification_or_request() => {
-                let notification = notification?;
-                if let Some(code) = process_turn_notification(
-                    &wait,
-                    notification,
-                    &mut assistant_text,
-                    &mut events,
-                )? {
-                    return Ok(code);
-                }
-            }
-            _ = poll.tick() => {
-                if let Some(code) = poll_turn_completion(
-                    &mut client,
-                    &wait,
-                    &mut assistant_text,
-                    &mut events,
-                ).await? {
-                    return Ok(code);
-                }
-            }
+                ])
+            );
+            Ok(130)
         }
     }
+}
+
+fn emit_turn_terminal_output(
+    json_out: bool,
+    stream: bool,
+    terminal: &TurnTerminal,
+    server: &str,
+) -> Result<i32> {
+    if json_out && !stream {
+        print_json(&terminal.output)?;
+    } else if !json_out {
+        if terminal
+            .output
+            .get("progress")
+            .and_then(Value::as_array)
+            .is_some_and(|events| events.iter().any(|event| event.get("delta").is_some()))
+        {
+            println!();
+        }
+        print_key_values(&[
+            ("status", terminal.output["status"].as_str().unwrap_or("")),
+            ("server", server),
+            (
+                "threadId",
+                terminal.output["threadId"].as_str().unwrap_or(""),
+            ),
+            ("turnId", terminal.output["turnId"].as_str().unwrap_or("")),
+        ]);
+    }
+    Ok(terminal.exit_code)
 }
 
 fn print_legacy_warnings(config: &AppConfig) {
     for warning in legacy_server_warnings(config) {
         eprintln!("warning: {warning}");
     }
-}
-
-async fn resume_thread_for_action(
-    client: &mut RpcClient,
-    thread_id: &str,
-    yolo: bool,
-) -> Result<()> {
-    let mut params = Map::new();
-    params.insert("threadId".to_string(), json!(thread_id));
-    params.insert("excludeTurns".to_string(), json!(true));
-    if yolo {
-        insert_thread_yolo_permissions(&mut params);
-    }
-    client
-        .request("thread/resume", Value::Object(params), |_| {})
-        .await?;
-    Ok(())
-}
-
-async fn resume_thread_for_inspection(client: &mut RpcClient, thread_id: &str) -> Result<Value> {
-    let result = client
-        .request(
-            "thread/resume",
-            json!({"threadId": thread_id, "excludeTurns": true}),
-            |_| {},
-        )
-        .await?;
-    let _ = client
-        .request("thread/unsubscribe", json!({"threadId": thread_id}), |_| {})
-        .await;
-    Ok(result)
-}
-
-async fn request_with_resume_retry<F>(
-    client: &mut RpcClient,
-    method: &str,
-    params: Value,
-    thread_id: &str,
-    yolo: bool,
-    mut before_retry: impl FnMut(),
-    mut on_notification: F,
-) -> Result<Value>
-where
-    F: FnMut(Notification),
-{
-    // Only use this for operations whose app-server implementation requires a
-    // loaded CodexThread. Persisted metadata/history/goal commands can operate
-    // without this, and interrupting a non-loaded thread cannot become useful
-    // by loading an inactive session.
-    match client
-        .request(method, params.clone(), |notification| {
-            on_notification(notification);
-        })
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(err) if is_thread_not_found_error(&err, method, thread_id) => {
-            before_retry();
-            resume_thread_for_action(client, thread_id, yolo).await?;
-            client
-                .request(method, params, |notification| {
-                    on_notification(notification);
-                })
-                .await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn is_thread_not_found_error(err: &anyhow::Error, method: &str, thread_id: &str) -> bool {
-    let Some(error) = err.downcast_ref::<RpcRequestError>() else {
-        return false;
-    };
-    // Codex app-server currently returns invalid_request(-32600) with this
-    // message from request_processors::{turn_processor,thread_processor}::load_thread.
-    error.method == method
-        && error.error.code == -32600
-        && error.error.message == format!("thread not found: {thread_id}")
-}
-
-struct TurnWaitContext<'a> {
-    target: &'a Target,
-    thread_id: &'a str,
-    turn_id: &'a str,
-    json_out: bool,
-    stream: bool,
-}
-
-async fn poll_turn_completion(
-    client: &mut RpcClient,
-    wait: &TurnWaitContext<'_>,
-    assistant_text: &mut String,
-    events: &mut Vec<Value>,
-) -> Result<Option<i32>> {
-    let mut notifications = Vec::new();
-    let result = client
-        .request(
-            "thread/turns/list",
-            json!({"threadId": wait.thread_id, "limit": TURN_SCAN_LIMIT, "sortDirection": "desc", "itemsView": "full"}),
-            |notification| notifications.push(notification),
-        )
-        .await?;
-    for notification in notifications {
-        if let Some(code) = process_turn_notification(wait, notification, assistant_text, events)? {
-            return Ok(Some(code));
-        }
-    }
-
-    let turn = result["data"].as_array().and_then(|turns| {
-        turns
-            .iter()
-            .find(|turn| turn["id"].as_str() == Some(wait.turn_id))
-    });
-    let Some(turn) = turn else {
-        return Ok(None);
-    };
-    reject_unknown_turn_status(turn)?;
-    let status = turn_status(turn);
-    if !matches!(status, "completed" | "failed" | "interrupted") {
-        return Ok(None);
-    }
-    if assistant_text.is_empty() {
-        *assistant_text = extract_assistant_text_from_turn(turn);
-        if !wait.json_out && !assistant_text.is_empty() {
-            println!("{assistant_text}");
-        }
-    }
-    let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": wait.turn_id, "status": status, "source": "poll"});
-    if wait.json_out && wait.stream {
-        println!("{}", serde_json::to_string(&event)?);
-    }
-    events.push(event);
-    emit_turn_terminal(wait, status, assistant_text, events)
-}
-
-fn process_turn_notification(
-    wait: &TurnWaitContext<'_>,
-    notification: Notification,
-    assistant_text: &mut String,
-    events: &mut Vec<Value>,
-) -> Result<Option<i32>> {
-    let Some(event) = turn_event(
-        &wait.target.server,
-        wait.thread_id,
-        wait.turn_id,
-        notification,
-        assistant_text,
-    )?
-    else {
-        return Ok(None);
-    };
-    if wait.json_out && wait.stream {
-        println!("{}", serde_json::to_string(&event)?);
-    } else if !wait.json_out {
-        print_human_event(&event);
-    }
-
-    let status = event["status"].as_str().map(str::to_string);
-    events.push(event);
-    if !matches!(
-        status.as_deref(),
-        Some("completed" | "failed" | "interrupted")
-    ) {
-        return Ok(None);
-    }
-
-    let status = status.expect("status checked");
-    emit_turn_terminal(wait, &status, assistant_text, events)
-}
-
-fn emit_turn_terminal(
-    wait: &TurnWaitContext<'_>,
-    status: &str,
-    assistant_text: &str,
-    events: &[Value],
-) -> Result<Option<i32>> {
-    let output = json!({
-        "server": wait.target.server,
-        "threadId": wait.thread_id,
-        "turnId": wait.turn_id,
-        "status": status,
-        "progress": events,
-        "assistantResponses": if assistant_text.is_empty() { Vec::<Value>::new() } else { vec![json!({"text": assistant_text})] },
-        "finalAssistantText": assistant_text
-    });
-    if wait.json_out && !wait.stream {
-        print_json(&output)?;
-    } else if !wait.json_out {
-        if events.iter().any(|event| event.get("delta").is_some()) {
-            println!();
-        }
-        print_key_values(&[
-            ("status", output["status"].as_str().unwrap_or("")),
-            ("server", wait.target.server.as_str()),
-            ("threadId", wait.thread_id),
-            ("turnId", wait.turn_id),
-        ]);
-    }
-    Ok(Some(if output["status"].as_str() == Some("completed") {
-        0
-    } else {
-        1
-    }))
-}
-
-fn extract_assistant_text_from_turn(turn: &Value) -> String {
-    turn["items"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter(|item| item["type"].as_str() == Some("agentMessage"))
-        .filter_map(|item| item["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 async fn settings_show_command(
@@ -1349,29 +974,16 @@ async fn status_command(
     command: StatusCommand,
 ) -> Result<i32> {
     if let Some(thread_id) = command.thread_id {
-        if command.load {
-            let _ = resume_thread_for_inspection(&mut client, &thread_id).await?;
-        }
-        let thread = client
-            .request(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-                |_| {},
-            )
-            .await?;
-        let turns = client
-            .request(
-                "thread/turns/list",
-                json!({"threadId": thread_id, "limit": TURN_SCAN_LIMIT, "sortDirection": "desc", "itemsView": "notLoaded"}),
-                |_| {},
-            )
-            .await?;
-        let active_turn_id = turns["data"]
-            .as_array()
-            .and_then(|turns| turns.iter().find(|turn| turn_status(turn) == "inProgress"))
-            .and_then(|turn| turn["id"].as_str())
-            .map(str::to_string);
-        let output = json!({"server": target.server, "threadId": thread_id, "thread": thread["thread"], "activeTurnId": active_turn_id, "truncated": turns["nextCursor"].is_string()});
+        let output = thread_status(
+            &target,
+            &mut client,
+            ThreadStatusRequest {
+                thread_id: thread_id.clone(),
+                load: command.load,
+                turn_scan_limit: TURN_SCAN_LIMIT,
+            },
+        )
+        .await?;
         if command.json {
             print_json(&output)?;
         } else {
@@ -1380,7 +992,7 @@ async fn status_command(
                 ("threadId", thread_id.as_str()),
                 (
                     "status",
-                    thread["thread"]["status"]["type"].as_str().unwrap_or(""),
+                    output["thread"]["status"]["type"].as_str().unwrap_or(""),
                 ),
                 (
                     "activeTurnId",
@@ -1389,14 +1001,14 @@ async fn status_command(
             ]);
         }
     } else {
-        let loaded = client
-            .request(
-                "thread/loaded/list",
-                json!({"limit": DEFAULT_LIST_LIMIT}),
-                |_| {},
-            )
-            .await?;
-        let output = json!({"server": target.server, "reachable": true, "loadedThreadIds": loaded["data"], "nextCursor": loaded["nextCursor"]});
+        let output = loaded_status(
+            &target,
+            &mut client,
+            LoadedStatusRequest {
+                limit: DEFAULT_LIST_LIMIT,
+            },
+        )
+        .await?;
         if command.json {
             print_json(&output)?;
         } else {
@@ -1744,53 +1356,6 @@ async fn goal_clear_command(
     emit_json_or_status(command.json, &output)
 }
 
-fn turn_event(
-    server: &str,
-    thread_id: &str,
-    turn_id: &str,
-    notification: Notification,
-    assistant_text: &mut String,
-) -> Result<Option<Value>> {
-    match notification.method.as_str() {
-        "item/agentMessage/delta"
-            if notification.params["threadId"] == thread_id
-                && notification.params["turnId"] == turn_id =>
-        {
-            let delta = notification.params["delta"].as_str().unwrap_or("");
-            assistant_text.push_str(delta);
-            Ok(Some(
-                json!({"type": "progress", "server": server, "threadId": thread_id, "turnId": turn_id, "delta": delta}),
-            ))
-        }
-        "item/completed"
-            if notification.params["threadId"] == thread_id
-                && notification.params["turnId"] == turn_id =>
-        {
-            if notification.params["item"]["type"].as_str() == Some("agentMessage")
-                && let Some(text) = notification.params["item"]["text"].as_str()
-                && assistant_text.is_empty()
-            {
-                assistant_text.push_str(text);
-                return Ok(Some(
-                    json!({"type": "assistantMessage", "server": server, "threadId": thread_id, "turnId": turn_id, "text": text}),
-                ));
-            }
-            Ok(None)
-        }
-        "turn/completed"
-            if notification.params["threadId"] == thread_id
-                && notification.params["turn"]["id"] == turn_id =>
-        {
-            reject_unknown_turn_status(&notification.params["turn"])?;
-            let status = turn_status(&notification.params["turn"]);
-            Ok(Some(
-                json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status}),
-            ))
-        }
-        _ => Ok(None),
-    }
-}
-
 fn print_human_event(event: &Value) {
     if let Some(delta) = event["delta"].as_str() {
         print!("{delta}");
@@ -1800,31 +1365,6 @@ fn print_human_event(event: &Value) {
     {
         println!("{text}");
     }
-}
-
-fn flatten_messages(turns: &Value) -> Vec<Value> {
-    let mut out = Vec::new();
-    for turn in turns["data"].as_array().unwrap_or(&Vec::new()).iter().rev() {
-        for item in turn["items"].as_array().unwrap_or(&Vec::new()) {
-            match item["type"].as_str() {
-                Some("userMessage") => {
-                    let text = item["content"]
-                        .as_array()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .filter_map(|input| input["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    out.push(json!({"role": "user", "text": text, "turnId": turn["id"], "itemId": item["id"], "turnStartedAt": turn["startedAt"], "turnCompletedAt": turn["completedAt"]}));
-                }
-                Some("agentMessage") => {
-                    out.push(json!({"role": "assistant", "text": item["text"], "turnId": turn["id"], "itemId": item["id"], "turnStartedAt": turn["startedAt"], "turnCompletedAt": turn["completedAt"]}));
-                }
-                _ => {}
-            }
-        }
-    }
-    out
 }
 
 fn print_messages(messages: &[Value], filtered_role: Option<&str>) {
@@ -2310,63 +1850,12 @@ fn insert_opt(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
     }
 }
 
-fn insert_thread_yolo_permissions(map: &mut Map<String, Value>) {
-    // Thread start/resume use the legacy SandboxMode string shape.
-    map.insert("approvalPolicy".to_string(), json!("never"));
-    map.insert("sandbox".to_string(), json!("danger-full-access"));
-}
-
-fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
-    // Turn start uses the newer SandboxPolicy object shape.
-    map.insert("approvalPolicy".to_string(), json!("never"));
-    map.insert(
-        "sandboxPolicy".to_string(),
-        json!({"type": "dangerFullAccess"}),
-    );
-}
-
-fn sort_key(sort: SortKey) -> &'static str {
-    match sort {
-        SortKey::Updated => "updated_at",
-        SortKey::Created => "created_at",
-    }
-}
-
-fn direction(asc: bool, desc: bool) -> &'static str {
-    if asc {
-        "asc"
-    } else {
-        let _desc_requested = desc;
-        "desc"
-    }
-}
-
-fn items_view(view: ItemsView) -> &'static str {
-    match view {
-        ItemsView::Summary => "summary",
-        ItemsView::Full => "full",
-        ItemsView::None => "notLoaded",
-    }
-}
-
 fn turn_status(turn: &Value) -> &'static str {
     match turn["status"].as_str().unwrap_or("inProgress") {
         "completed" => "completed",
         "interrupted" => "interrupted",
         "failed" => "failed",
         _ => "inProgress",
-    }
-}
-
-fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
-    let Some(status) = turn["status"].as_str() else {
-        return Ok(());
-    };
-    match status {
-        "completed" | "interrupted" | "failed" | "inProgress" | "running" | "pending" => Ok(()),
-        _ => Err(app_server_error(format!(
-            "app-server returned unrecognized turn status `{status}`"
-        ))),
     }
 }
 
@@ -2390,31 +1879,6 @@ fn goal_status(status: &str) -> Result<&'static str> {
     }
 }
 
-fn parse_since(since: &str) -> Result<i64> {
-    if let Ok(timestamp) = since.parse::<i64>() {
-        return Ok(timestamp);
-    }
-    let (number, multiplier) = if let Some(value) = since.strip_suffix('s') {
-        (value, 1)
-    } else if let Some(value) = since.strip_suffix('m') {
-        (value, 60)
-    } else if let Some(value) = since.strip_suffix('h') {
-        (value, 60 * 60)
-    } else if let Some(value) = since.strip_suffix('d') {
-        (value, 60 * 60 * 24)
-    } else {
-        return Err(usage_error(format!("invalid --since value `{since}`")));
-    };
-    let seconds: i64 = number
-        .parse()
-        .with_context(|| format!("invalid --since value `{since}`"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    Ok(now - seconds * multiplier)
-}
-
 fn classify_error(err: &anyhow::Error) -> i32 {
     if let Some(error) = err.downcast_ref::<ExitError>() {
         return error.code;
@@ -2435,20 +1899,4 @@ fn classify_error(err: &anyhow::Error) -> i32 {
     } else {
         2
     }
-}
-
-fn usage_error(message: impl Into<String>) -> anyhow::Error {
-    ExitError {
-        code: 2,
-        message: message.into(),
-    }
-    .into()
-}
-
-fn app_server_error(message: impl Into<String>) -> anyhow::Error {
-    ExitError {
-        code: 3,
-        message: message.into(),
-    }
-    .into()
 }

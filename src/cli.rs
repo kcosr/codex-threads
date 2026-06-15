@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use crate::config::REASONING_EFFORTS;
 
@@ -45,6 +46,8 @@ pub enum Command {
     List(ListCommand),
     Search(SearchCommand),
     Show(ShowCommand),
+    #[cfg(feature = "tui")]
+    Tui(TuiCommand),
     #[command(
         about = "Show flattened messages from a bounded recent turn scan",
         after_help = "Message selection order: fetch recent turns with --max-turns, flatten user/assistant messages, apply --since, apply --role, then apply --last.\n\n--max-turns is the recent turn scan window, not the final message display limit. Use --last for the final number of messages to print. Role filters only see messages inside the scanned turns, so widen --max-turns when searching for sparse or older roles.\n\nThere is no messages --first. For beginning-of-thread or older exact paging, use show --asc and/or show --cursor with the needed --items view."
@@ -161,6 +164,29 @@ pub struct ShowCommand {
     pub items: ItemsView,
     #[arg(long)]
     pub json: bool,
+}
+
+#[cfg(feature = "tui")]
+#[derive(Debug, Args)]
+pub struct TuiCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    #[arg(long)]
+    pub query: Option<String>,
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
+    pub cwd: Option<String>,
+    #[arg(long)]
+    pub archived: bool,
+    #[arg(long)]
+    pub limit: Option<u32>,
+    #[arg(long, value_enum)]
+    pub sort: Option<SortKey>,
+    #[arg(long, conflicts_with = "desc")]
+    pub asc: bool,
+    #[arg(long)]
+    pub desc: bool,
 }
 
 #[derive(Debug, Args)]
@@ -472,7 +498,8 @@ pub struct AnnotatePruneCommand {
     pub json: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "camelCase")]
 pub enum SortKey {
     Updated,
     Created,

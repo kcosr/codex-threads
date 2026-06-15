@@ -39,6 +39,8 @@ CLI as a safety boundary.
 - Deterministic target selection with `--server`, `CODEX_THREADS_SERVER`, or a
   single configured server.
 - Thread list, search, detail, status, and flattened message history commands.
+- Interactive TUI browser for listing, searching, viewing, annotating,
+  refreshing, sending, steering, and interrupting threads.
 - Local thread annotations projected into list, search, and detail output.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
@@ -193,6 +195,54 @@ codex-threads show THREAD_ID --last 10 --items summary --json
 codex-threads show THREAD_ID --asc --items full --json
 ```
 
+Launch the interactive browser with the same initial filters:
+
+```bash
+codex-threads tui --since 24h --cwd "$PWD"
+codex-threads tui --query "release process" --limit 20
+```
+
+Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
+browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
+`?` for keyboard help, `/` to search threads or loaded transcript messages,
+`Enter` to open a thread, `p` to toggle the lazy recent-message preview pane,
+`[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
+visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
+to confirm archive or unarchive, `T` to attach to the selected active thread,
+`S` to steer the selected active thread, `i` to confirm interrupting it, `r` to
+refresh, `y` to copy the active thread id with OSC 52, and `m` to compose. Use
+`l` to explicitly load the selected or open thread, matching
+`status THREAD_ID --load`, then refresh visible metadata and history.
+Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
+stream/no-wait for new turns. Browser compose streams into the preview while the
+thread remains selected, follows queued turns on that thread, and detaches
+locally when selection moves away. If the initial selected browser row is
+active, the TUI attaches to it automatically.
+Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
+refresh interval from 5-300 seconds with `-` and `+`.
+Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
+uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
+and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
+operation. In detail, `T` attaches to an active turn, `S` steers it, `i`
+confirms interrupt, `Enter` or `m` composes a normal message, and `q` quits.
+Normal compose uses Codex app-server's `turn/start` path, including for active
+threads; explicit steer remains on `S`. Attaching resumes the thread with turns
+included so the active-turn snapshot appears before new stream notifications.
+Opening a thread loads a small recent turn window, orders it chronologically,
+and starts at the bottom of the transcript. Scrolling up at the top loads the
+next older chunk above the current transcript and preserves the current view. In
+detail, `gg` and `Home` load through to the real transcript start before jumping
+there; `G` and `End` load through to the real transcript end before jumping
+there. Detail views refresh in place while open, and `Esc` returns to the
+browser after unlinking the local detail view and detaching any local stream.
+Local detach leaves remote turns running.
+Transcript rendering is markdown-aware for common headings, blockquotes, lists,
+paragraph spacing, and fenced code blocks. Message headings show role and
+timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
+spans when the default-off `tui-syntax-highlighting` Cargo feature is enabled.
+Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to append raw stream
+events while debugging live transcript rendering.
+
 ## Configuration
 
 Default config path:
@@ -297,6 +347,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
+| `tui` | Launch the interactive browser with `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |
@@ -407,6 +458,10 @@ commands. Blocking `new PROMPT --json` and `send --json` include:
 - `assistantResponses`
 - `finalAssistantText`
 
+Streamed assistant progress events include Codex `itemId` when available, and
+`assistantResponses` contains one entry per assistant item so clients can keep
+separate assistant messages distinct.
+
 `--json --stream` is available for `new PROMPT` and `send`. It emits NDJSON:
 one accepted event, zero or more progress events, and one terminal event.
 
@@ -447,6 +502,20 @@ commands can set, get, clear, list, search, and prune those local records.
 on returned thread objects when one exists. Human `list` and `search` add an
 `ANNOTATION` column only when displayed rows have annotations; human `show`
 prints the annotation in the thread detail.
+
+TUI preferences are local `codex-threads` state, separate from annotations:
+
+1. `$CODEX_THREADS_STATE/tui.json`
+2. `$XDG_STATE_HOME/codex-threads/tui.json`
+3. `~/.local/state/codex-threads/tui.json`
+
+The TUI persists disposable UI preferences such as visible columns,
+auto-refresh, the 5-300 second refresh interval, preview pane, and default sort.
+Corrupt or unsupported preference files are renamed to
+`tui.json.corrupt.<epoch>` when possible and fall back to defaults instead of
+blocking launch. In search mode, `--cwd` is a local refinement over the loaded
+search page; sort controls are disabled until the app-server search API supports
+server-side sorting.
 
 Exit codes:
 
@@ -534,6 +603,15 @@ cargo build --release
 
 The integration smoke tests in `tests/mock_smoke.rs` start mock UDS and TCP
 WebSocket app-servers and exercise the compiled CLI binary end to end.
+
+The opt-in PTY smoke tests in `tests/tui_pty_smoke.rs` drive the real
+interactive TUI through a pseudo-terminal, including browser/detail navigation,
+streaming sends, attach/detach, and CLI history/status validation against a
+stateful mock app-server:
+
+```bash
+cargo test --test tui_pty_smoke -- --ignored
+```
 
 Live smoke checks are opt-in:
 
