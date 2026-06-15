@@ -7,8 +7,6 @@
 - Add `codex-threads tui`, an interactive terminal UI for browsing, viewing,
   searching, streaming, and controlling threads
   ([#6](https://github.com/kcosr/codex-threads/pull/6)).
-- Add TUI `o` shortcut to confirm launching Codex's own TUI for the active
-  thread.
 
 ## [0.1.5] - 2026-06-05
 
