@@ -3,6 +3,17 @@
 `codex-threads` is a companion CLI for inspecting and controlling Codex
 app-server threads from a terminal or another agent.
 
+> [!IMPORTANT]
+> `codex-threads` only sees threads on the Codex app-server instance it
+> connects to. This tool is built around running a shared, long-lived
+> `codex app-server --listen <socket>` (Unix domain socket or WebSocket),
+> pointing `codex-threads` at that socket, and starting interactive Codex TUI
+> sessions against the same socket with `codex --remote <socket>`. Codex
+> sessions started without `--remote` are not on that shared server, so
+> `codex-threads` cannot list, inspect, or control them — an empty thread list
+> usually means this setup is missing, not that something is broken. See
+> [Quickstart](#quickstart) for the full setup.
+
 It exists for workflows the Codex CLI does not currently cover well: asking
 what threads were active recently, what happened in a repo, whether a thread is
 still running, and sending a follow-up to an existing session. The Codex desktop
@@ -40,7 +51,7 @@ CLI as a safety boundary.
   single configured server.
 - Thread list, search, detail, status, and flattened message history commands.
 - Interactive TUI browser for listing, searching, viewing, annotating,
-  refreshing, sending, steering, and interrupting threads.
+  refreshing, sending, steering, interrupting, and creating threads.
 - Local thread annotations projected into list, search, and detail output.
 - Thread creation with required `--cwd`.
 - Prompted `new` and `send` commands that wait by default, stream human output,
@@ -49,6 +60,12 @@ CLI as a safety boundary.
   supports them.
 - Thread naming, archive/unarchive, active-turn steer/interrupt, model listing,
   and goal get/set/clear.
+
+## Screenshot
+
+<p align="center">
+  <img src="docs/assets/tui-screenshot.png" alt="codex-threads TUI showing thread list and transcript preview" width="520">
+</p>
 
 ## Install
 
@@ -202,32 +219,58 @@ codex-threads tui --since 24h --cwd "$PWD"
 codex-threads tui --query "release process" --limit 20
 ```
 
+By default, `codex-threads tui` opens all configured servers and shows a
+`SERVER` column when more than one target is visible. Use `--server ALIAS` or
+`CODEX_THREADS_SERVER` to narrow the TUI to one server. `--connect` remains a
+single direct target.
+
 Inside the TUI, use `j/k`, arrow keys, or mouse wheel scrolling to move in the
 browser and detail transcript; use `gg` and `G` to jump to top and bottom. Use
 `?` for keyboard help, `/` to search threads or loaded transcript messages,
 `Enter` to open a thread, `p` to toggle the lazy recent-message preview pane,
 `[` and `]` to page browser results, `f` for filters, `s` for sort, `c` for
 visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
-to confirm archive or unarchive, `T` to attach to the selected active thread,
-`S` to steer the selected active thread, `i` to confirm interrupting it, `r` to
-refresh, `y` to copy the active thread id with OSC 52, and `m` to compose. Use
+to confirm archive or unarchive,
+`i` to confirm interrupting the selected active thread, `r` to refresh, `y` to copy the active thread id
+with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
+`m` to compose. Use
 `l` to explicitly load the selected or open thread, matching
 `status THREAD_ID --load`, then refresh visible metadata and history.
-Compose uses `Enter` to send and `Ctrl-J` to insert a newline; `Tab` toggles
-stream/no-wait for new turns. Browser compose streams into the preview while the
-thread remains selected, follows queued turns on that thread, and detaches
-locally when selection moves away. If the initial selected browser row is
-active, the TUI attaches to it automatically.
+In the browser, `n` creates a new session: pick the server when more than one
+is configured, confirm the working directory (prefilled from the selected
+thread, falling back to the TUI's launch directory), optionally name the
+session up front, then type the first message. The thread is created when the
+message is sent — `Esc` at any step cancels without creating anything — and
+the new row appears selected at the top while the first turn streams into the
+preview.
+Compose uses `Enter` to submit and `Ctrl-J` to insert a newline. On active
+threads, compose defaults to steering the active turn; `Tab` switches to a
+normal new-turn send, and `Tab` switches back to steer while the thread remains
+active. On inactive threads, `Tab` toggles stream/no-wait for new turns. Browser
+compose streams into the preview while the thread remains selected, follows
+queued turns on that thread, and detaches locally when selection moves away. If
+the initial selected browser row is active, or if an active thread is opened in
+detail, the TUI attaches to it automatically. Automatic attaching is governed
+by the persisted auto-attach toggle (`a` in the `c` menu, on by default): with
+it off, browsing shows content from history fetches only — no live stream is
+opened per selection — and only your own sends stream. While a stream is attached it is the sole content transport: status
+polling backs off entirely while turn notifications are flowing and only
+resumes as a fallback after a few quiet seconds. An animated green `live`
+indicator marks the attached stream in the detail header, the preview pane
+title, and the browser STATUS column.
 Use `t` to toggle real browser auto-refresh; the `c` menu adjusts the persisted
 refresh interval from 5-300 seconds with `-` and `+`.
 Search prompts use `Enter` to apply and `Ctrl-D` to clear. Annotation editing
 uses `Enter` to save and `Ctrl-D` to clear. Rename editing uses `Enter` to save
 and `Ctrl-D` to clear the draft; app-server does not expose a clear-name
-operation. In detail, `T` attaches to an active turn, `S` steers it, `i`
-confirms interrupt, `Enter` or `m` composes a normal message, and `q` quits.
-Normal compose uses Codex app-server's `turn/start` path, including for active
-threads; explicit steer remains on `S`. Attaching resumes the thread with turns
-included so the active-turn snapshot appears before new stream notifications.
+operation. In detail, `i` confirms interrupt,
+`Enter` or `m` composes a message or steer action based on whether the thread is
+active, and `q` quits. Normal send uses Codex app-server's `turn/start` path;
+steer uses `turn/steer` when the thread is active and the composer is in steer
+mode. Attaching resumes the thread with turns included so the active-turn
+snapshot appears before new stream notifications; deltas that arrive while the
+snapshot is being fetched are trimmed against it, so attached transcripts
+continue from the snapshot without replaying text it already contains.
 Opening a thread loads a small recent turn window, orders it chronologically,
 and starts at the bottom of the transcript. Scrolling up at the top loads the
 next older chunk above the current transcript and preserves the current view. In
@@ -236,12 +279,27 @@ there; `G` and `End` load through to the real transcript end before jumping
 there. Detail views refresh in place while open, and `Esc` returns to the
 browser after unlinking the local detail view and detaching any local stream.
 Local detach leaves remote turns running.
+Opening in Codex temporarily returns terminal control to `codex resume
+<thread-id> --remote <server-endpoint> --cd <thread-cwd>`, adding
+`--dangerously-bypass-approvals-and-sandbox` when the codex-threads TUI was
+launched with yolo enabled, then redraws and refreshes the codex-threads TUI
+after Codex exits.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
 spans when the default-off `tui-syntax-highlighting` Cargo feature is enabled.
 Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to append raw stream
 events while debugging live transcript rendering.
+Set `CODEX_THREADS_TURN_POLL_QUIET_SECS` (default 3, clamped to 1-300) to
+adjust how long a watched turn must stay silent before the fallback status
+poll runs while waiting on or attached to a turn.
+Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to additionally append every
+JSON-RPC frame exchanged with app-servers — one NDJSON line per frame with a
+millisecond timestamp, per-connection id, and direction (`send`/`recv`) — plus
+attach-time snapshot seeding and replay reconciliation decisions. This is the
+ground-truth capture for diagnosing streaming issues such as duplicated or
+missing transcript text; it can grow large and contains full thread content,
+so enable it only while reproducing a problem.
 
 ## Configuration
 
@@ -269,6 +327,12 @@ Server target precedence for commands that target one app-server:
 `--connect` bypasses configured servers and reports the endpoint URI as the
 `server` value in JSON output. It is mutually exclusive with `--server` and
 `CODEX_THREADS_SERVER`.
+
+The TUI is the exception to single-target defaulting: without `--server`,
+`CODEX_THREADS_SERVER`, or `--connect`, it opens every configured server and
+uses the server column to disambiguate rows. Browser paging cursors remain
+per-server, so the merged all-server browser starts with one page from each
+server; narrow with `--server` when you need cursor paging on one target.
 
 Configured servers use a single endpoint string:
 
@@ -347,7 +411,7 @@ Follow-up `send` commands keep the thread's existing app-server settings unless
 | `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search QUERY` | Search one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
-| `tui` | Launch the interactive browser with `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
+| `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
 | `new --cwd PATH [PROMPT]` | Create a thread and optionally start the first turn. Supports `--model`, `--effort`, `--service-tier`, `--name`, `--json`, `--stream`, `--no-wait`. |
 | `send THREAD_ID PROMPT` | Start a follow-up turn. Supports `--model`, `--effort`, `--service-tier`, `--json`, `--stream`, `--no-wait`. |

@@ -8,8 +8,8 @@ use crate::tui::keymap::{
     BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
 };
 use crate::tui::state::{
-    BrowserSource, ComposeTarget, Mode, SendMode, StreamStatus, TuiState, message_header_visible,
-    transcript_rendered_line_count,
+    BrowserSource, ComposeState, ComposeTarget, Mode, SendMode, StreamStatus, TuiState,
+    message_header_visible, transcript_rendered_line_count,
 };
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
@@ -36,6 +36,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
                 ..
             }
             | Mode::ConfirmArchive {
+                return_to_detail: true,
+                ..
+            }
+            | Mode::ConfirmOpenCodex {
                 return_to_detail: true,
                 ..
             }
@@ -101,19 +105,51 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         } => {
             draw_confirm_archive(frame, area, thread_id, *archived);
         }
+        Mode::ConfirmOpenCodex { thread_id, cwd, .. } => {
+            draw_confirm_open_codex(frame, area, thread_id, cwd);
+        }
+        Mode::NewSessionServerMenu {
+            servers, selected, ..
+        } => {
+            draw_new_session_server_menu(frame, area, servers, *selected);
+        }
+        Mode::NewSessionCwdInput { draft } => draw_prompt(
+            frame,
+            area,
+            "New session cwd",
+            &draft.cwd,
+            "Enter continue, Ctrl-D clear, Esc cancel",
+        ),
+        Mode::NewSessionTitleInput { draft } => draw_prompt(
+            frame,
+            area,
+            "New session name (optional)",
+            &draft.title,
+            "Enter continue, Ctrl-D clear, Esc cancel",
+        ),
         Mode::Compose(compose) => {
             let label = match compose.target {
                 ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
                     "Steer active turn"
                 }
+                ComposeTarget::NewThread { .. } => "New session first message",
                 ComposeTarget::NewTurn { .. } => match compose.send_mode {
+                    SendMode::Stream if compose_new_turn_can_steer(state, compose) => {
+                        "Send new turn"
+                    }
                     SendMode::Stream => "Compose stream",
                     SendMode::NoWait => "Compose no-wait",
                 },
             };
             let footer = match compose.target {
                 ComposeTarget::Steer { .. } | ComposeTarget::SteerSelected { .. } => {
-                    "Enter steer, Ctrl-J newline, Esc cancel"
+                    "Enter steer, Ctrl-J newline, Tab send, Esc cancel"
+                }
+                ComposeTarget::NewThread { .. } => {
+                    "Enter create session + send, Ctrl-J newline, Esc cancel"
+                }
+                ComposeTarget::NewTurn { .. } if compose_new_turn_can_steer(state, compose) => {
+                    "Enter send, Ctrl-J newline, Tab steer, Esc cancel"
                 }
                 ComposeTarget::NewTurn { .. } => "Enter send, Ctrl-J newline, Tab mode, Esc cancel",
             };
@@ -124,11 +160,34 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
+fn compose_new_turn_can_steer(state: &TuiState, compose: &ComposeState) -> bool {
+    let ComposeTarget::NewTurn { thread_id, .. } = &compose.target else {
+        return false;
+    };
+    state.stream.as_ref().is_some_and(|stream| {
+        stream.thread_id.as_str() == thread_id.as_str()
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+    }) || state.detail.as_ref().is_some_and(|detail| {
+        detail.thread_id.as_str() == thread_id.as_str() && detail.active_turn_id.is_some()
+    }) || state
+        .browser
+        .rows
+        .iter()
+        .any(|row| row.id.as_str() == thread_id.as_str() && row.is_running())
+}
+
 pub fn sync_viewport_state(state: &mut TuiState, area: Rect) {
+    let chunks = root_chunks(area);
+    let (table_area, _) = browser_areas(state, chunks[0]);
+    state
+        .browser
+        .clamp_row_offset(browser_visible_rows(table_area));
     if state.detail.is_none() {
         return;
     }
-    let chunks = root_chunks(area);
     let detail_chunks = detail_chunks(chunks[0]);
     if let Some(detail) = &mut state.detail {
         detail.set_viewport_size(
@@ -156,8 +215,8 @@ fn detail_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let (table_area, preview_area) = if state.prefs.browser.preview_pane && area.height >= 16 {
+fn browser_areas(state: &TuiState, area: Rect) -> (Rect, Option<Rect>) {
+    if state.prefs.browser.preview_pane && area.height >= 16 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -165,9 +224,22 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         (chunks[0], Some(chunks[1]))
     } else {
         (area, None)
-    };
+    }
+}
+
+/// Data rows that fit in the browser table: the area minus its two border
+/// rows and the header row.
+fn browser_visible_rows(table_area: Rect) -> usize {
+    table_area.height.saturating_sub(3) as usize
+}
+
+fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let (table_area, preview_area) = browser_areas(state, area);
     let visible = state.visible_columns();
     let mut header = vec![Cell::from("THREAD")];
+    if state.browser.multi_server {
+        header.push(Cell::from("SERVER"));
+    }
     if visible.status {
         header.push(Cell::from("STATUS"));
     }
@@ -180,37 +252,52 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if visible.annotation {
         header.push(Cell::from("ANNOTATION"));
     }
-    let widths = browser_column_widths(table_area.width, visible);
+    let widths = browser_column_widths(table_area.width, visible, state.browser.multi_server);
 
-    let rows = state.browser.rows.iter().enumerate().map(|(index, row)| {
-        let title = if let Some(snippet) = &row.snippet {
-            format!("{}  {}", row.title, snippet)
-        } else {
-            row.title.clone()
-        };
-        let mut cells = vec![Cell::from(title)];
-        if visible.status {
-            cells.push(Cell::from(browser_row_status(state, &row.id, &row.status)));
-        }
-        if visible.updated {
-            cells.push(Cell::from(row.updated.clone()));
-        }
-        if visible.cwd {
-            cells.push(Cell::from(compact_home_path(&row.cwd)));
-        }
-        if visible.annotation {
-            cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
-        }
-        let style = if index == state.browser.selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Row::new(cells).style(style)
-    });
+    let rows = state
+        .browser
+        .rows
+        .iter()
+        .enumerate()
+        .skip(state.browser.row_offset)
+        .take(browser_visible_rows(table_area))
+        .map(|(index, row)| {
+            let title = if let Some(snippet) = &row.snippet {
+                format!("{}  {}", row.title, snippet)
+            } else {
+                row.title.clone()
+            };
+            let mut cells = vec![Cell::from(title)];
+            if state.browser.multi_server {
+                cells.push(Cell::from(row.server.clone()));
+            }
+            if visible.status {
+                cells.push(Cell::from(browser_row_status(
+                    state,
+                    &row.server,
+                    &row.id,
+                    &row.status,
+                )));
+            }
+            if visible.updated {
+                cells.push(Cell::from(row.updated.clone()));
+            }
+            if visible.cwd {
+                cells.push(Cell::from(compact_home_path(&row.cwd)));
+            }
+            if visible.annotation {
+                cells.push(Cell::from(row.annotation.clone().unwrap_or_default()));
+            }
+            let style = if index == state.browser.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Row::new(cells).style(style)
+        });
 
     let title = match state.browser.source {
         BrowserSource::List => " Threads ",
@@ -232,29 +319,41 @@ fn draw_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 }
 
-fn browser_row_status(state: &TuiState, thread_id: &str, fallback: &str) -> String {
+fn browser_row_status(state: &TuiState, server: &str, thread_id: &str, fallback: &str) -> String {
     let Some(stream) = &state.stream else {
         return fallback.to_string();
     };
-    if stream.thread_id != thread_id {
+    if stream.server != server || stream.thread_id != thread_id {
         return fallback.to_string();
     }
     match stream.status {
+        StreamStatus::Starting | StreamStatus::Running if !stream.detached => {
+            format!(
+                "{} {}",
+                live_spinner_frame(),
+                format_stream_status(stream.status)
+            )
+        }
         StreamStatus::Starting | StreamStatus::Running => {
             format_stream_status(stream.status).to_string()
         }
         StreamStatus::Failed | StreamStatus::Interrupted => {
             format_stream_status(stream.status).to_string()
         }
-        StreamStatus::Completed | StreamStatus::Detached => fallback.to_string(),
+        // The follow probe is not a live turn: show the thread's own status.
+        StreamStatus::Following | StreamStatus::Completed | StreamStatus::Detached => {
+            fallback.to_string()
+        }
     }
 }
 
 fn browser_column_widths(
     table_width: u16,
     visible: &crate::tui::prefs::VisibleColumns,
+    multi_server: bool,
 ) -> Vec<Constraint> {
     const TITLE_MAX: u16 = 44;
+    const SERVER_WIDTH: u16 = 12;
     const CWD_MAX: u16 = 46;
     const ANNOTATION_MAX: u16 = 40;
     const STATUS_WIDTH: u16 = 11;
@@ -262,6 +361,9 @@ fn browser_column_widths(
 
     let mut fixed_width = 0;
     let mut flexible_columns = vec![(0_u16, TITLE_MAX, 4_u16)];
+    if multi_server {
+        fixed_width += SERVER_WIDTH;
+    }
     if visible.status {
         fixed_width += STATUS_WIDTH;
     }
@@ -276,6 +378,7 @@ fn browser_column_widths(
     }
 
     let column_count = 1
+        + usize::from(multi_server)
         + usize::from(visible.status)
         + usize::from(visible.updated)
         + usize::from(visible.cwd)
@@ -288,6 +391,9 @@ fn browser_column_widths(
     let flexible_widths = allocate_flexible_widths(available, &flexible_columns);
 
     let mut widths = vec![Constraint::Length(flexible_widths[0])];
+    if multi_server {
+        widths.push(Constraint::Length(SERVER_WIDTH));
+    }
     if visible.status {
         widths.push(Constraint::Length(STATUS_WIDTH));
     }
@@ -314,6 +420,43 @@ fn allocate_flexible_widths(available: u16, columns: &[(u16, u16, u16)]) -> [u16
             .min(*max);
     }
     widths
+}
+
+const LIVE_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn live_spinner_frame() -> char {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = (millis / super::LIVE_SPINNER_TICK_MS as u128) % LIVE_SPINNER_FRAMES.len() as u128;
+    LIVE_SPINNER_FRAMES[frame as usize]
+}
+
+fn live_indicator_span(trailing: &str) -> Span<'static> {
+    Span::styled(
+        format!("{} live{trailing}", live_spinner_frame()),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// "Live" means: this thread's event feed is subscribed (send- or
+/// attach-originated) for a turn that is in progress. Stream tasks are
+/// per-turn, so a non-detached Starting/Running stream implies an executing
+/// (or imminently starting) turn; the post-turn `Following` probe and all
+/// terminal states are explicitly not live.
+fn stream_is_live_for(state: &TuiState, server: &str, thread_id: &str) -> bool {
+    state.stream.as_ref().is_some_and(|stream| {
+        stream.server == server
+            && stream.thread_id == thread_id
+            && !stream.detached
+            && matches!(
+                stream.status,
+                StreamStatus::Starting | StreamStatus::Running
+            )
+    })
 }
 
 fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -345,15 +488,19 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         (vec![Line::from("No message preview available")], 0)
     };
+    let title = if stream_is_live_for(state, &row.server, &row.id) {
+        Line::from(vec![
+            Span::raw(" Recent Messages "),
+            live_indicator_span(" "),
+        ])
+    } else {
+        Line::from(" Recent Messages ")
+    };
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .block(
-                Block::default()
-                    .title(" Recent Messages ")
-                    .borders(Borders::ALL),
-            ),
+            .block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
@@ -366,13 +513,23 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let chunks = detail_chunks(area);
     let detail_status = detail_header_status(state);
     let connection = detail_connection_label(state);
-    let annotation = detail.annotation.clone().unwrap_or_default();
-    let mut metadata_spans = vec![Span::raw(detail_status)];
+    let inner_width = chunks[0].width.saturating_sub(2) as usize;
+    let mut used_width = detail_status.chars().count();
+    let mut metadata_spans = Vec::new();
+    if detail_has_connected_stream(state) {
+        let live = live_indicator_span("  ");
+        used_width += live.content.chars().count();
+        metadata_spans.push(live);
+    }
+    metadata_spans.push(Span::raw(detail_status));
     if let Some(connection) = connection {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(connection));
+        used_width += 2 + connection.chars().count();
     }
-    if !annotation.is_empty() {
+    if let Some(annotation) =
+        detail_header_annotation(detail.annotation.as_deref(), inner_width, used_width)
+    {
         metadata_spans.push(Span::raw("  "));
         metadata_spans.push(Span::raw(annotation));
     }
@@ -396,6 +553,35 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .style(Style::default()),
         chunks[1],
     );
+}
+
+fn detail_header_annotation(
+    annotation: Option<&str>,
+    inner_width: usize,
+    used_width: usize,
+) -> Option<String> {
+    let annotation = annotation?.trim();
+    if annotation.is_empty() {
+        return None;
+    }
+    let available = inner_width.checked_sub(used_width + 2)?;
+    if available < "note: ".chars().count() {
+        return None;
+    }
+    let text = annotation.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(truncate_text(&format!("note: {text}"), available))
+}
+
+fn truncate_text(text: &str, max_width: usize) -> String {
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return text.chars().take(max_width).collect();
+    }
+    let mut value = text.chars().take(max_width - 3).collect::<String>();
+    value.push_str("...");
+    value
 }
 
 fn transcript_lines(messages: &[crate::tui::state::MessageBlock]) -> Vec<Line<'static>> {
@@ -568,6 +754,10 @@ fn draws_detail_background(state: &TuiState) -> bool {
             | Mode::Compose(_)
             | Mode::ConfirmInterrupt { .. }
             | Mode::ConfirmArchive {
+                return_to_detail: true,
+                ..
+            }
+            | Mode::ConfirmOpenCodex {
                 return_to_detail: true,
                 ..
             }
@@ -795,6 +985,27 @@ fn draw_sort_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
+fn draw_new_session_server_menu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    servers: &[String],
+    selected: usize,
+) {
+    let mut lines: Vec<String> = servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| {
+            if index == selected {
+                format!("> {server}")
+            } else {
+                format!("  {server}")
+            }
+        })
+        .collect();
+    lines.push("j/k move  Enter select  Esc cancel".to_string());
+    draw_static_modal(frame, area, "New session server", &lines);
+}
+
 fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let columns = state.visible_columns();
     draw_static_modal(
@@ -814,6 +1025,10 @@ fn draw_columns_menu(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             format!(
                 "-/+ refresh interval: {}s",
                 state.browser.auto_refresh_seconds
+            ),
+            format!(
+                "a auto-attach live streams: {}",
+                on_off(state.prefs.browser.auto_attach)
             ),
             "Esc close".to_string(),
         ],
@@ -855,6 +1070,19 @@ fn draw_confirm_archive(frame: &mut Frame<'_>, area: Rect, thread_id: &str, arch
     );
 }
 
+fn draw_confirm_open_codex(frame: &mut Frame<'_>, area: Rect, thread_id: &str, cwd: &str) {
+    draw_static_modal(
+        frame,
+        area,
+        "Open In Codex",
+        &[
+            format!("Launch Codex TUI for {thread_id}?"),
+            format!("cwd: {cwd}"),
+            "Enter launch, Esc cancel".to_string(),
+        ],
+    );
+}
+
 fn draw_static_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String]) {
     let height = (lines.len() as u16 + 2).max(5);
     let area = centered_rect(area, 70, height);
@@ -883,21 +1111,22 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Browser: [ previous page  ] next page",
         "",
         "Browser",
-        "  Enter open detail  m compose message  / search threads",
-        "  l load selected thread  T attach/watch active turn",
-        "  S steer selected active turn  i interrupt selected active turn",
+        "  Enter open detail  m compose message or steer active turn  o open in Codex TUI",
+        "  n new session (server, cwd, optional name, first message)  / search threads",
+        "  l load selected thread",
+        "  i interrupt selected active turn",
         "  a annotate  e rename  A confirm archive/unarchive",
         "  f filters  s sort  c columns/time/refresh  p preview  t auto-refresh",
         "",
         "Detail",
-        "  Esc browser/detach detail session  Enter or m compose/message action",
+        "  Esc browser/detach detail session  Enter or m compose message or steer",
         "  gg/Home real transcript start  G/End real transcript end",
         "  / search loaded transcript  n/N next/previous match",
-        "  l load thread  a annotate  e rename  A confirm archive/unarchive",
-        "  T attach  S steer  i interrupt",
+        "  l load thread  o open in Codex TUI  a annotate  e rename  A confirm archive/unarchive",
+        "  i interrupt",
         "",
         "Compose and Text Inputs",
-        "  Compose: Enter send  Ctrl-J newline  Tab stream/no-wait  Esc cancel",
+        "  Compose: Enter submit  Ctrl-J newline  Tab steer/send or stream/no-wait  Esc cancel",
         "  Search: Enter apply  Ctrl-D clear  Esc cancel",
         "  Rename: Enter save  Ctrl-D clear draft  Esc cancel",
         "  Annotation: Enter save  Ctrl-D clear  Esc cancel",
@@ -905,9 +1134,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "Menus and Prompts",
         "  Filters: a toggle archived filter  Sort: u updated, c created, d direction",
         "  Columns: 1 status, 2 updated, 3 cwd, 4 annotation, 5 relative time",
-        "  Columns: t auto-refresh, -/+ refresh interval",
+        "  Columns: t auto-refresh, -/+ refresh interval, a auto-attach",
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
+        "  Open in Codex confirmation: Enter launch, Esc cancel",
     ];
     frame.render_widget(
         Paragraph::new(items.join("\n"))
@@ -958,6 +1188,7 @@ fn format_stream_status(status: StreamStatus) -> &'static str {
     match status {
         StreamStatus::Starting => "starting",
         StreamStatus::Running => "running",
+        StreamStatus::Following => "following",
         StreamStatus::Completed => "completed",
         StreamStatus::Failed => "failed",
         StreamStatus::Interrupted => "interrupted",
@@ -978,6 +1209,104 @@ mod tests {
 
     use super::*;
 
+    fn numbered_thread_row(index: usize) -> ThreadRow {
+        ThreadRow {
+            server: "work".to_string(),
+            id: format!("thread-{index:02}"),
+            title: format!("Thread {index:02}"),
+            status: "idle".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "/home/kevin/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn browser_selection_stays_visible_when_preview_pane_shrinks_table() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = (0..12).map(numbered_thread_row).collect();
+        state.browser.selected = 9;
+
+        // 18-row terminal: 16 rows for the browser, split 8/8 with the
+        // preview pane, leaving 5 visible table rows after borders + header.
+        let area = Rect::new(0, 0, 100, 18);
+        sync_viewport_state(&mut state, area);
+        let backend = TestBackend::new(100, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("Thread 09"), "selected row must stay visible");
+        assert!(text.contains("Thread 05"));
+        assert!(
+            !text.contains("Thread 04"),
+            "rows above window are scrolled out"
+        );
+        assert!(!text.contains("Thread 10"), "rows below window stay hidden");
+
+        // Moving back above the window scrolls it up again.
+        state.browser.selected = 2;
+        sync_viewport_state(&mut state, area);
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("Thread 02"));
+        assert!(!text.contains("Thread 09"));
+    }
+
+    #[test]
+    fn clamp_row_offset_tracks_selection_and_row_count() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.rows = (0..12).map(numbered_thread_row).collect();
+
+        state.browser.selected = 9;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 5);
+
+        // Scrolling within the window keeps the offset stable.
+        state.browser.selected = 6;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 5);
+
+        state.browser.selected = 1;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 1);
+
+        // Shrinking the row list clamps a stale offset.
+        state.browser.selected = 0;
+        state.browser.row_offset = 10;
+        state.browser.rows.truncate(6);
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 0);
+
+        state.browser.rows.clear();
+        state.browser.row_offset = 3;
+        state.browser.clamp_row_offset(5);
+        assert_eq!(state.browser.row_offset, 0);
+    }
+
     #[test]
     fn browser_render_includes_rows_and_annotation_column() {
         let mut state = TuiState::new(TuiInit {
@@ -991,6 +1320,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows.push(ThreadRow {
+            server: "work".to_string(),
             id: "thread-1".to_string(),
             title: "Fix tests".to_string(),
             status: "idle".to_string(),
@@ -1011,6 +1341,7 @@ mod tests {
                 item_id: Some("user-1".to_string()),
                 role: "user".to_string(),
                 timestamp: Some("2026-06-05 09:29".to_string()),
+                raw_text: "recent user message".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "recent user message".to_string(),
@@ -1023,6 +1354,7 @@ mod tests {
                 item_id: Some("assistant-1".to_string()),
                 role: "assistant".to_string(),
                 timestamp: Some("2026-06-05 09:30".to_string()),
+                raw_text: "recent assistant message".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "recent assistant message".to_string(),
@@ -1059,6 +1391,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.browser.rows.push(ThreadRow {
+            server: "work".to_string(),
             id: "thread-1".to_string(),
             title: "Running task".to_string(),
             status: "idle".to_string(),
@@ -1117,7 +1450,7 @@ mod tests {
         assert!(text.contains("? help"));
         assert!(text.contains("r/R refresh"));
         assert!(text.contains("l load"));
-        assert!(text.contains("S steer"));
+        assert!(text.contains("m msg/steer"));
         assert!(text.contains("i int"));
         assert!(text.contains("[] page"));
     }
@@ -1136,6 +1469,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "active".to_string(),
@@ -1194,6 +1528,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1203,6 +1538,7 @@ mod tests {
                 item_id: Some("item-1".to_string()),
                 role: "assistant".to_string(),
                 timestamp: None,
+                raw_text: String::new(),
                 lines: (0..10)
                     .map(|index| MessageLine {
                         kind: MessageLineKind::Text,
@@ -1313,7 +1649,7 @@ mod tests {
         let prefs = TuiPrefs::default();
 
         assert_eq!(
-            browser_column_widths(250, &prefs.browser.columns),
+            browser_column_widths(250, &prefs.browser.columns, false),
             vec![
                 Constraint::Length(44),
                 Constraint::Length(11),
@@ -1322,6 +1658,46 @@ mod tests {
                 Constraint::Length(40),
             ]
         );
+    }
+
+    #[test]
+    fn browser_draws_server_column_when_multiple_servers_are_visible() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.browser.multi_server = true;
+        state.browser.rows = vec![ThreadRow {
+            server: "main".to_string(),
+            id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            updated: "now".to_string(),
+            cwd: "~".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }];
+
+        let backend = TestBackend::new(140, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("SERVER"));
+        assert!(text.contains("main"));
     }
 
     #[test]
@@ -1352,6 +1728,7 @@ mod tests {
         });
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn {
+                server: "work".to_string(),
                 thread_id: "thread-1".to_string(),
             },
             text: "first line\nsecond line".to_string(),
@@ -1382,6 +1759,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::AnnotationInput {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             draft: "annotation text".to_string(),
             return_to_detail: false,
@@ -1419,6 +1797,7 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::RenameInput {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             draft: "New thread name".to_string(),
             return_to_detail: false,
@@ -1457,6 +1836,7 @@ mod tests {
         });
         state.mode = Mode::Compose(ComposeState {
             target: ComposeTarget::NewTurn {
+                server: "work".to_string(),
                 thread_id: "thread-1".to_string(),
             },
             text: (1..=30)
@@ -1490,6 +1870,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1500,6 +1881,7 @@ mod tests {
                     item_id: Some("item-1".to_string()),
                     role: "user".to_string(),
                     timestamp: Some("2026-06-05 09:00".to_string()),
+                    raw_text: "Please inspect this".to_string(),
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Please inspect this".to_string(),
@@ -1512,6 +1894,7 @@ mod tests {
                     item_id: Some("item-2".to_string()),
                     role: "assistant".to_string(),
                     timestamp: Some("2026-06-05 09:01".to_string()),
+                    raw_text: "First response line\nContinuation line".to_string(),
                     lines: vec![
                         MessageLine {
                             kind: MessageLineKind::Text,
@@ -1531,6 +1914,7 @@ mod tests {
                     item_id: Some("item-2b".to_string()),
                     role: "assistant".to_string(),
                     timestamp: Some("2026-06-05 09:01".to_string()),
+                    raw_text: "Second assistant item".to_string(),
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Second assistant item".to_string(),
@@ -1543,6 +1927,7 @@ mod tests {
                     item_id: Some("item-3".to_string()),
                     role: "user".to_string(),
                     timestamp: Some("2026-06-05 09:02".to_string()),
+                    raw_text: "Next turn".to_string(),
                     lines: vec![MessageLine {
                         kind: MessageLineKind::Text,
                         text: "Next turn".to_string(),
@@ -1590,6 +1975,64 @@ mod tests {
     }
 
     #[test]
+    fn detail_header_renders_labeled_annotation_text() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Detail;
+        state.detail = Some(DetailState {
+            server: "work".to_string(),
+            thread_id: "thread-1".to_string(),
+            title: "Thread".to_string(),
+            status: "idle".to_string(),
+            annotation: Some("unexpected message-like annotation".to_string()),
+            messages: vec![MessageBlock {
+                turn_id: Some("turn-1".to_string()),
+                item_id: Some("item-1".to_string()),
+                role: "user".to_string(),
+                timestamp: None,
+                raw_text: "transcript content".to_string(),
+                lines: vec![MessageLine {
+                    kind: MessageLineKind::Text,
+                    text: "transcript content".to_string(),
+                    spans: Vec::new(),
+                }],
+                is_match: false,
+            }],
+            scroll: 0,
+            search_query: String::new(),
+            matches: Vec::new(),
+            match_index: 0,
+            next_cursor: None,
+            backwards_cursor: None,
+            current_cursor: None,
+            active_turn_id: None,
+            loading: false,
+            epoch: 1,
+            last_refresh_at: None,
+            viewport_height: None,
+            viewport_width: None,
+            last_error: None,
+        });
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("Thread"));
+        assert!(text.contains("idle"));
+        assert!(text.contains("note: unexpected message-like annotation"));
+        assert!(text.contains("transcript content"));
+    }
+
+    #[test]
     fn detail_interrupt_confirm_keeps_detail_background() {
         let mut state = TuiState::new(TuiInit {
             query: None,
@@ -1602,11 +2045,13 @@ mod tests {
             prefs: TuiPrefs::default(),
         });
         state.mode = Mode::ConfirmInterrupt {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             turn_id: Some("turn-1".to_string()),
             return_to_detail: true,
         };
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1616,6 +2061,7 @@ mod tests {
                 item_id: Some("item-1".to_string()),
                 role: "user".to_string(),
                 timestamp: None,
+                raw_text: "detail stays visible".to_string(),
                 lines: vec![MessageLine {
                     kind: MessageLineKind::Text,
                     text: "detail stays visible".to_string(),
@@ -1661,6 +2107,7 @@ mod tests {
         });
         state.mode = Mode::Detail;
         state.detail = Some(DetailState {
+            server: "work".to_string(),
             thread_id: "thread-1".to_string(),
             title: "Thread".to_string(),
             status: "idle".to_string(),
@@ -1694,9 +2141,114 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(text.contains("running  connected"));
+        assert!(
+            text.contains(" live"),
+            "connected running stream shows the animated live indicator"
+        );
         assert!(!text.contains("stream=running"));
         assert!(!text.contains("thread-1"));
         assert!(!text.contains("turn-1"));
         assert!(!text.contains("list rows="));
+    }
+
+    #[test]
+    fn follow_probe_shows_thread_status_without_live_indicator() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![ThreadRow {
+            server: "work".to_string(),
+            id: "thread-1".to_string(),
+            title: "Finished thread".to_string(),
+            status: "idle".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "/tmp/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }];
+        state.browser.selected = 0;
+        state.browser.preview.server = Some("work".to_string());
+        state.browser.preview.thread_id = Some("thread-1".to_string());
+        // After a turn completes, the follow probe waits for a queued
+        // follow-up turn; it must not present itself as a live stream.
+        state.stream = Some(StreamState::new(
+            "thread-1".to_string(),
+            None,
+            StreamStatus::Following,
+            true,
+        ));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(text.contains("idle"), "row shows its own status");
+        assert!(!text.contains("starting"), "probe must not show starting");
+        assert!(!text.contains(" live"), "probe must not show live");
+    }
+
+    #[test]
+    fn preview_title_shows_live_indicator_for_streaming_selection() {
+        let mut prefs = TuiPrefs::default();
+        prefs.browser.preview_pane = true;
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs,
+        });
+        state.browser.rows = vec![ThreadRow {
+            server: "work".to_string(),
+            id: "thread-1".to_string(),
+            title: "Streaming thread".to_string(),
+            status: "active".to_string(),
+            updated: "2026-06-05 09:30".to_string(),
+            cwd: "/tmp/repo".to_string(),
+            annotation: None,
+            snippet: None,
+            raw: serde_json::json!({}),
+        }];
+        state.browser.selected = 0;
+        state.browser.preview.server = Some("work".to_string());
+        state.browser.preview.thread_id = Some("thread-1".to_string());
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(
+            !text.contains(" live"),
+            "no live indicator without a running stream"
+        );
+
+        state.stream = Some(StreamState::new(
+            "thread-1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            false,
+        ));
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let content = terminal.backend().buffer().content();
+        let text = content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(
+            text.contains("Recent Messages") && text.contains(" live"),
+            "preview title shows the live indicator while streaming"
+        );
     }
 }

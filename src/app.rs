@@ -14,17 +14,20 @@ use crate::cli::*;
 use crate::completion::{
     completion_candidates, completion_instructions, completion_script, normalize_shell,
 };
+#[cfg(feature = "tui")]
+use crate::config::resolve_tui_targets;
 use crate::config::{
     AppConfig, Target, is_valid_reasoning_effort, legacy_server_warnings, load_config,
     resolve_config_path, resolve_direct_target, resolve_target,
 };
-use crate::errors::{ExitError, app_server_error, usage_error};
+use crate::errors::{ExitError, usage_error};
 use crate::rpc::RpcClient;
 use crate::session::{
     ListThreadsRequest, LoadedStatusRequest, MessagesRequest, SearchThreadsRequest,
-    ShowThreadRequest, ThreadProjection, ThreadStatusRequest, insert_thread_yolo_permissions,
+    ShowThreadRequest, ThreadProjection, ThreadStartOptions, ThreadStatusRequest,
     is_thread_not_found_error, list_threads, load_messages, loaded_status, read_thread_detail,
-    request_with_resume_retry, resume_thread_for_inspection, search_threads, thread_status,
+    request_with_resume_retry, resume_thread_for_inspection, search_threads, start_thread,
+    thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::turns::{
@@ -142,14 +145,14 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         #[cfg(feature = "tui")]
         Command::Tui(command) => {
-            let target = resolve_target_for_command(
+            let targets = resolve_tui_targets_for_command(
                 &config,
                 cli.connect.as_deref(),
                 cli.connect_auth_token_env.as_deref(),
                 cli.connect_auth_token.as_deref(),
                 command.server.server.clone(),
             )?;
-            crate::tui::run_tui(target, command, yolo).await
+            crate::tui::run_tui(targets, command, yolo).await
         }
         Command::Messages(command) => {
             with_client(
@@ -424,6 +427,35 @@ fn resolve_target_for_command(
     resolve_target(config, server.as_deref())
 }
 
+#[cfg(feature = "tui")]
+fn resolve_tui_targets_for_command(
+    config: &AppConfig,
+    connect: Option<&str>,
+    connect_auth_token_env: Option<&str>,
+    connect_auth_token: Option<&str>,
+    server: Option<String>,
+) -> Result<Vec<Target>> {
+    if let Some(endpoint) = connect {
+        if server.is_some() || std::env::var("CODEX_THREADS_SERVER").is_ok() {
+            return Err(usage_error(
+                "--connect is mutually exclusive with --server and CODEX_THREADS_SERVER",
+            ));
+        }
+        return Ok(vec![resolve_direct_target(
+            endpoint,
+            connect_auth_token_env,
+            connect_auth_token,
+        )?]);
+    }
+
+    if connect_auth_token_env.is_some() || connect_auth_token.is_some() {
+        return Err(usage_error(
+            "--connect-auth-token and --connect-auth-token-env require --connect",
+        ));
+    }
+    resolve_tui_targets(config, server.as_deref())
+}
+
 async fn with_client<F, Fut>(
     config: &AppConfig,
     connect: Option<&str>,
@@ -684,34 +716,26 @@ async fn new_command(
             "new without PROMPT cannot use --no-wait or --stream",
         ));
     }
-    let mut params = Map::new();
-    params.insert("cwd".to_string(), json!(command.cwd));
-    if yolo {
-        insert_thread_yolo_permissions(&mut params);
-    }
     let thread_model = command.model.clone().or_else(|| target.model.clone());
     let thread_effort = command
         .effort
         .clone()
         .or_else(|| target.model_reasoning_effort.clone());
-    insert_opt(&mut params, "model", thread_model);
-    if let Some(tier) = &command.service_tier {
-        params.insert("serviceTier".to_string(), json!(tier));
-    }
     if let Some(effort) = thread_effort.as_deref() {
         validate_effort(effort)?;
-        params.insert(
-            "config".to_string(),
-            json!({"model_reasoning_effort": effort}),
-        );
     }
-    let start = client
-        .request("thread/start", Value::Object(params), |_| {})
-        .await?;
-    let thread_id = start["thread"]["id"]
-        .as_str()
-        .ok_or_else(|| app_server_error("thread/start response missing thread.id"))?
-        .to_string();
+    let start = start_thread(
+        &mut client,
+        &command.cwd,
+        ThreadStartOptions {
+            model: thread_model,
+            effort: thread_effort,
+            service_tier: command.service_tier.clone(),
+            yolo,
+        },
+    )
+    .await?;
+    let thread_id = thread_id_from_start(&start)?;
     if let Some(name) = &command.name {
         client
             .request(
@@ -833,12 +857,6 @@ async fn start_turn(
                 println!("{}", serde_json::to_string(event)?);
             } else if !json_out {
                 print_human_event(event);
-            }
-            Ok(())
-        },
-        |text| {
-            if !json_out && !text.is_empty() {
-                println!("{text}");
             }
             Ok(())
         },
@@ -1898,5 +1916,99 @@ fn classify_error(err: &anyhow::Error) -> i32 {
         3
     } else {
         2
+    }
+}
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::config::{AppConfig, ServerConfig};
+
+    use super::resolve_tui_targets_for_command;
+
+    fn test_config() -> AppConfig {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "main".to_string(),
+            ServerConfig {
+                endpoint: Some("unix:///tmp/codex-main.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
+                model: None,
+                model_reasoning_effort: None,
+            },
+        );
+        servers.insert(
+            "work".to_string(),
+            ServerConfig {
+                endpoint: Some("unix:///tmp/codex-work.sock".to_string()),
+                kind: None,
+                path: None,
+                auth_token_env: None,
+                auth_token: None,
+                model: None,
+                model_reasoning_effort: None,
+            },
+        );
+        AppConfig {
+            model: None,
+            model_reasoning_effort: None,
+            servers,
+        }
+    }
+
+    #[test]
+    fn tui_targets_default_to_all_configured_servers() {
+        let targets =
+            resolve_tui_targets_for_command(&test_config(), None, None, None, None).unwrap();
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.server.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main", "work"]
+        );
+    }
+
+    #[test]
+    fn tui_targets_honor_server_override() {
+        let targets = resolve_tui_targets_for_command(
+            &test_config(),
+            None,
+            None,
+            None,
+            Some("work".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].server, "work");
+    }
+
+    #[test]
+    fn tui_connect_is_mutually_exclusive_with_server_override() {
+        let error = resolve_tui_targets_for_command(
+            &test_config(),
+            Some("unix:///tmp/direct.sock"),
+            None,
+            None,
+            Some("main".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn tui_connect_auth_requires_connect() {
+        let error =
+            resolve_tui_targets_for_command(&test_config(), None, Some("TOKEN_ENV"), None, None)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("require --connect"));
     }
 }

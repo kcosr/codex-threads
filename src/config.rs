@@ -375,6 +375,21 @@ pub fn resolve_target(config: &AppConfig, server_flag: Option<&str>) -> Result<T
     )
 }
 
+#[cfg(feature = "tui")]
+pub fn resolve_tui_targets(config: &AppConfig, server_flag: Option<&str>) -> Result<Vec<Target>> {
+    if server_flag.is_some() || env::var("CODEX_THREADS_SERVER").is_ok() {
+        return Ok(vec![resolve_target(config, server_flag)?]);
+    }
+    if config.servers.is_empty() {
+        return Err(anyhow!("no servers configured"));
+    }
+    config
+        .servers
+        .iter()
+        .map(|(alias, server)| Target::configured(alias, server, config))
+        .collect()
+}
+
 pub fn resolve_target_from(
     config: &AppConfig,
     server_flag: Option<&str>,

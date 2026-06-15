@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -44,6 +45,7 @@ struct ServerState {
     threads: HashMap<String, ThreadRecord>,
     order: Vec<String>,
     next_turn: u64,
+    fail_thread_name_set: bool,
 }
 
 struct StartedMockTurn {
@@ -62,6 +64,14 @@ struct TuiPty {
 
 impl TuiMockServer {
     fn start() -> Self {
+        Self::start_with_state(ServerState::new())
+    }
+
+    fn start_with_name_set_failure() -> Self {
+        Self::start_with_state(ServerState::new_with_name_set_failure())
+    }
+
+    fn start_with_state(server_state: ServerState) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let socket = temp.path().join("codex.sock");
         let config = temp.path().join("config.toml");
@@ -74,27 +84,43 @@ impl TuiMockServer {
         )
         .expect("config");
 
-        let std_listener = StdUnixListener::bind(&socket).expect("bind mock socket");
-        std_listener.set_nonblocking(true).expect("nonblocking");
-        let state = Arc::new(Mutex::new(ServerState::new()));
+        let state = Arc::new(Mutex::new(server_state));
         let received = Arc::new(Mutex::new(Vec::new()));
-        let state_for_thread = Arc::clone(&state);
-        let received_for_thread = Arc::clone(&received);
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("runtime");
-            runtime.block_on(async move {
-                let listener = UnixListener::from_std(std_listener).expect("tokio listener");
-                loop {
-                    let (stream, _) = listener.accept().await.expect("accept");
-                    let state = Arc::clone(&state_for_thread);
-                    let received = Arc::clone(&received_for_thread);
-                    tokio::spawn(async move {
-                        let ws = accept_async(stream).await.expect("websocket accept");
-                        handle_websocket(ws, state, received).await;
-                    });
-                }
-            });
-        });
+        spawn_mock_listener(socket, state, Arc::clone(&received));
+
+        Self {
+            _temp: temp,
+            config,
+            received,
+        }
+    }
+
+    fn start_multi() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let main_socket = temp.path().join("main.sock");
+        let work_socket = temp.path().join("work.sock");
+        let config = temp.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "[servers.main]\ntype = \"uds\"\npath = \"{}\"\n\n[servers.work]\ntype = \"uds\"\npath = \"{}\"\n",
+                main_socket.display(),
+                work_socket.display()
+            ),
+        )
+        .expect("config");
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        spawn_mock_listener(
+            main_socket,
+            Arc::new(Mutex::new(ServerState::named("Main"))),
+            Arc::clone(&received),
+        );
+        spawn_mock_listener(
+            work_socket,
+            Arc::new(Mutex::new(ServerState::named("Work"))),
+            Arc::clone(&received),
+        );
 
         Self {
             _temp: temp,
@@ -124,6 +150,16 @@ impl TuiMockServer {
             .count()
     }
 
+    fn requests_for(&self, method: &str) -> Vec<Value> {
+        self.received
+            .lock()
+            .expect("received")
+            .iter()
+            .filter(|request| request["method"].as_str() == Some(method))
+            .cloned()
+            .collect()
+    }
+
     fn wait_for_method_count(&self, method: &str, min: usize) {
         let started = Instant::now();
         while started.elapsed() < WAIT_TIMEOUT {
@@ -139,8 +175,40 @@ impl TuiMockServer {
     }
 }
 
+fn spawn_mock_listener(
+    socket: PathBuf,
+    state: Arc<Mutex<ServerState>>,
+    received: Arc<Mutex<Vec<Value>>>,
+) {
+    let std_listener = StdUnixListener::bind(&socket).expect("bind mock socket");
+    std_listener.set_nonblocking(true).expect("nonblocking");
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async move {
+            let listener = UnixListener::from_std(std_listener).expect("tokio listener");
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let state = Arc::clone(&state);
+                let received = Arc::clone(&received);
+                tokio::spawn(async move {
+                    let ws = accept_async(stream).await.expect("websocket accept");
+                    handle_websocket(ws, state, received).await;
+                });
+            }
+        });
+    });
+}
+
 impl ServerState {
     fn new() -> Self {
+        Self::new_with_options(false)
+    }
+
+    fn new_with_name_set_failure() -> Self {
+        Self::new_with_options(true)
+    }
+
+    fn new_with_options(fail_thread_name_set: bool) -> Self {
         let active_turn = json!({
             "id": "turn_active",
             "status": "inProgress",
@@ -247,7 +315,17 @@ impl ServerState {
                 "thread_long".to_string(),
             ],
             next_turn: 2,
+            fail_thread_name_set,
         }
+    }
+
+    fn named(prefix: &str) -> Self {
+        let mut state = Self::new();
+        for thread in state.threads.values_mut() {
+            thread.name = format!("{prefix} {}", thread.name);
+            thread.cwd = format!("{}/{}", thread.cwd, prefix.to_ascii_lowercase());
+        }
+        state
     }
 
     fn thread_json(&self, id: &str) -> Value {
@@ -334,6 +412,25 @@ impl ServerState {
             "activeTurnId": active_turn_id,
             "truncated": false
         })
+    }
+
+    fn add_thread(&mut self, cwd: &str) -> String {
+        let id = format!("thread_created_{}", self.next_turn);
+        self.threads.insert(
+            id.clone(),
+            ThreadRecord {
+                id: id.clone(),
+                name: String::new(),
+                preview: String::new(),
+                cwd: cwd.to_string(),
+                status: "idle".to_string(),
+                updated_at: 1_700_000_300,
+                active_turn_id: None,
+                turns: Vec::new(),
+            },
+        );
+        self.order.insert(0, id.clone());
+        id
     }
 
     fn start_turn(&mut self, thread_id: &str, prompt: &str) -> StartedMockTurn {
@@ -524,19 +621,24 @@ async fn handle_websocket<S>(
             }
             .is_some()
             {
+                // Continuation of the snapshot's in-progress item arrives
+                // under an undeclared live id (no item/started), like the
+                // real app-server's `msg_<hash>` ids.
                 send_delta(
                     &mut ws,
                     &thread_id,
                     "turn_active",
-                    "item_active_agent",
+                    "msg_active_agent_live",
                     "attached live update",
                 )
                 .await;
             }
         }
 
-        let result = mock_result(method, &request, &state);
-        let response = json!({ "id": id, "result": result });
+        let response = match mock_result(method, &request, &state) {
+            Ok(result) => json!({ "id": id, "result": result }),
+            Err(error) => json!({ "id": id, "error": error }),
+        };
         if ws
             .send(Message::Text(response.to_string().into()))
             .await
@@ -555,27 +657,35 @@ async fn send_stream_notifications<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // Live notifications identify items in a different namespace than
+    // persisted snapshots (`msg_<hash>` vs `item-N`), mirroring the real
+    // app-server; new items are declared via item/started first.
+    let live_item_id = format!("msg_{turn_id}");
+    let _ = ws
+        .send(Message::Text(
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": live_item_id,
+                        "type": "agentMessage",
+                        "text": ""
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
     let mut parts = reply.splitn(3, ' ');
     let first = parts.next().unwrap_or("");
     let second = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("");
-    send_delta(
-        ws,
-        thread_id,
-        turn_id,
-        "item_agent_stream",
-        &format!("{first} "),
-    )
-    .await;
-    send_delta(
-        ws,
-        thread_id,
-        turn_id,
-        "item_agent_stream",
-        &format!("{second} "),
-    )
-    .await;
-    send_delta(ws, thread_id, turn_id, "item_agent_stream", rest).await;
+    send_delta(ws, thread_id, turn_id, &live_item_id, &format!("{first} ")).await;
+    send_delta(ws, thread_id, turn_id, &live_item_id, &format!("{second} ")).await;
+    send_delta(ws, thread_id, turn_id, &live_item_id, rest).await;
     let _ = ws
         .send(Message::Text(
             json!({
@@ -584,7 +694,7 @@ async fn send_stream_notifications<S>(
                     "threadId": thread_id,
                     "turnId": turn_id,
                     "item": {
-                        "id": "item_agent_stream",
+                        "id": live_item_id,
                         "type": "agentMessage",
                         "text": reply
                     }
@@ -665,9 +775,23 @@ async fn send_delta<S>(
         .await;
 }
 
-fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -> Value {
-    let state = state.lock().expect("state");
-    match method {
+fn mock_result(
+    method: &str,
+    request: &Value,
+    state: &Arc<Mutex<ServerState>>,
+) -> Result<Value, Value> {
+    let mut state = state.lock().expect("state");
+    let result = match method {
+        "thread/start" => {
+            let cwd = request["params"]["cwd"].as_str().unwrap_or("");
+            let id = state.add_thread(cwd);
+            json!({
+                "thread": state.thread_json(&id),
+                "model": "gpt-5.1-codex",
+                "reasoningEffort": "medium",
+                "serviceTier": Value::Null
+            })
+        }
         "initialize" => json!({
             "userAgent": "mock-codex",
             "codexHome": "/tmp/mock-codex",
@@ -709,11 +833,26 @@ fn mock_result(method: &str, request: &Value, state: &Arc<Mutex<ServerState>>) -
         "turn/start" => json!({"turn": {"id": "turn_2", "status": "inProgress", "items": []}}),
         "turn/steer" => json!({"turnId": request["params"]["expectedTurnId"].clone()}),
         "turn/interrupt" => json!({}),
-        "thread/name/set" => json!({"thread": state.thread_json(thread_id(request))}),
+        "thread/name/set" if state.fail_thread_name_set => {
+            return Err(json!({
+                "code": -32000,
+                "message": "mock name set failure"
+            }));
+        }
+        "thread/name/set" => {
+            let id = thread_id(request).to_string();
+            if let Some(name) = request["params"]["name"].as_str()
+                && let Some(thread) = state.threads.get_mut(&id)
+            {
+                thread.name = name.to_string();
+            }
+            json!({"thread": state.thread_json(&id)})
+        }
         "thread/archive" => json!({"thread": state.thread_json(thread_id(request))}),
         "thread/unarchive" => json!({"thread": state.thread_json(thread_id(request))}),
         other => panic!("unexpected method {other}"),
-    }
+    };
+    Ok(result)
 }
 
 fn thread_id(request: &Value) -> &str {
@@ -728,6 +867,15 @@ fn page(data: Value) -> Value {
 
 impl TuiPty {
     fn spawn(server: &TuiMockServer, state_dir: &TempDir, stream_log: &PathBuf) -> Self {
+        Self::spawn_with_env(server, state_dir, stream_log, &[])
+    }
+
+    fn spawn_with_env(
+        server: &TuiMockServer,
+        state_dir: &TempDir,
+        stream_log: &PathBuf,
+        extra_env: &[(&str, PathBuf)],
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -742,6 +890,13 @@ impl TuiPty {
         command.env("TERM", "xterm-256color");
         command.env("CODEX_THREADS_STATE", state_dir.path());
         command.env("CODEX_THREADS_TUI_STREAM_LOG", stream_log);
+        command.env(
+            "CODEX_THREADS_RPC_LOG",
+            stream_log.with_extension("rpc.ndjson"),
+        );
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         command.arg("--config");
         command.arg(&server.config);
         command.arg("tui");
@@ -749,7 +904,7 @@ impl TuiPty {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("pty reader");
         let writer = pair.master.take_writer().expect("pty writer");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(PTY_ROWS, PTY_COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(PTY_ROWS, PTY_COLS, 200)));
         let parser_for_thread = Arc::clone(&parser);
         let reader_thread = thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
@@ -787,6 +942,21 @@ impl TuiPty {
 
     fn wait_for(&self, expected: &str) {
         self.wait_for_all(&[expected]);
+    }
+
+    fn wait_for_exactly_once(&self, expected: &str) {
+        let started = Instant::now();
+        while started.elapsed() < WAIT_TIMEOUT {
+            let screen = self.screen();
+            if screen.matches(expected).count() == 1 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "timed out waiting for exactly one {expected:?}\n--- screen ---\n{}",
+            self.screen()
+        );
     }
 
     fn wait_for_all(&self, expected: &[&str]) {
@@ -847,6 +1017,73 @@ fn wait_for_file_contains(path: &PathBuf, expected: &str) {
     );
 }
 
+fn fake_codex_script(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let script = temp.path().join("fake-codex");
+    let stdin_log = temp.path().join("fake-codex-stdin.log");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'fake codex ready\\n'\nIFS= read -r line\nprintf '%s\\n' \"$line\" > \"$FAKE_CODEX_STDIN_LOG\"\nprintf 'fake codex exiting\\n'\n",
+    )
+    .expect("fake codex script");
+    let mut permissions = fs::metadata(&script).expect("fake metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("fake chmod");
+    (script, stdin_log)
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_merges_all_configured_servers_by_default() {
+    let server = TuiMockServer::start_multi();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&[
+        "SERVER",
+        "main",
+        "work",
+        "Main Active stream",
+        "Work Active stream",
+    ]);
+    tui.quit();
+
+    assert!(
+        server.method_count("thread/list") >= 2,
+        "TUI should fetch browser rows from both configured servers"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_codex_launch_hands_pty_input_to_child() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let fake_dir = TempDir::new().expect("fake dir");
+    let (fake_codex, fake_stdin_log) = fake_codex_script(&fake_dir);
+    let mut tui = TuiPty::spawn_with_env(
+        &server,
+        &state_dir,
+        &stream_log,
+        &[
+            ("CODEX_THREADS_CODEX_BIN", fake_codex),
+            ("FAKE_CODEX_STDIN_LOG", fake_stdin_log.clone()),
+        ],
+    );
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"j");
+    tui.write(b"o");
+    tui.wait_for_all(&["Open In Codex", "thread_beta"]);
+    tui.write(b"\r");
+    tui.wait_for("fake codex ready");
+    tui.write(b"child-input\r");
+    wait_for_file_contains(&fake_stdin_log, "child-input");
+    tui.wait_for("codex exited");
+    tui.quit();
+}
+
 #[test]
 #[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
 fn tui_detail_compose_stream_updates_screen_and_cli_history() {
@@ -864,6 +1101,7 @@ fn tui_detail_compose_stream_updates_screen_and_cli_history() {
     tui.type_text("tui smoke detail");
     tui.write(b"\r");
     tui.wait_for("stream reply for tui smoke detail");
+    tui.wait_for_exactly_once("stream reply for tui smoke detail");
     wait_for_file_contains(&stream_log, "stream reply for tui smoke detail");
     tui.write(b"\x1b");
     tui.wait_for("Threads");
@@ -896,10 +1134,13 @@ fn tui_detail_enter_send_on_initial_active_thread_follows_started_turn() {
         "attached history before live",
     ]);
     tui.write(b"\r");
-    tui.wait_for("Compose stream");
+    tui.wait_for("Steer active turn");
+    tui.write(b"\t");
+    tui.wait_for("Send new turn");
     tui.type_text("detail active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for detail active followup");
+    tui.wait_for_exactly_once("stream reply for detail active followup");
     wait_for_file_contains(&stream_log, "stream reply for detail active followup");
     tui.quit();
 
@@ -932,6 +1173,60 @@ fn tui_detail_loads_older_history_above_transcript() {
 
 #[test]
 #[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_detail_refresh_reuses_fetch_rpc_client() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"j");
+    tui.write(b"\r");
+    tui.wait_for_all(&["Transcript", "beta opening prompt", "beta opening response"]);
+
+    let initializations = server.method_count("initialize");
+    let before_refreshes = server.method_count("thread/turns/list");
+    tui.write(b"r");
+    server.wait_for_method_count("thread/turns/list", before_refreshes + 1);
+    tui.write(b"r");
+    server.wait_for_method_count("thread/turns/list", before_refreshes + 2);
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("initialize"),
+        initializations,
+        "detail refreshes should reuse the fetch worker RPC client"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_preview_reuses_preview_rpc_client() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task", "Long history"]);
+    let before_previews = server.method_count("thread/turns/list");
+    tui.write(b"j");
+    server.wait_for_method_count("thread/turns/list", before_previews + 1);
+    let initializations = server.method_count("initialize");
+    tui.write(b"j");
+    server.wait_for_method_count("thread/turns/list", before_previews + 2);
+    tui.write(b"k");
+    server.wait_for_method_count("thread/turns/list", before_previews + 3);
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("initialize"),
+        initializations,
+        "preview selection changes should reuse the preview worker RPC client"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
 fn tui_browser_attach_detaches_when_switching_sessions() {
     let server = TuiMockServer::start();
     let state_dir = TempDir::new().expect("state dir");
@@ -939,7 +1234,7 @@ fn tui_browser_attach_detaches_when_switching_sessions() {
     let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
-    tui.write(b"T");
+    // The initial selection is the active thread; auto-attach streams it.
     tui.wait_for("attached live update");
     wait_for_file_contains(&stream_log, "attached live update");
     server.wait_for_method_count("thread/resume", 1);
@@ -965,7 +1260,9 @@ fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
     tui.write(b"m");
-    tui.wait_for("Compose stream");
+    tui.wait_for("Steer active turn");
+    tui.write(b"\t");
+    tui.wait_for("Send new turn");
     tui.type_text("browser active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for browser active followup");
@@ -982,6 +1279,131 @@ fn tui_browser_normal_send_to_active_thread_uses_turn_start() {
 
 #[test]
 #[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_new_session_flow_creates_named_thread_and_streams() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"n");
+    tui.wait_for("New session cwd");
+    // The prompt is prefilled with the selected row's cwd; accept it.
+    tui.wait_for("/tmp/tui-active");
+    tui.write(b"\r");
+    tui.wait_for("New session name");
+    tui.type_text("Fresh session");
+    tui.write(b"\r");
+    tui.wait_for("New session first message");
+    tui.type_text("hello fresh session");
+    tui.write(b"\r");
+
+    server.wait_for_method_count("thread/start", 1);
+    server.wait_for_method_count("thread/name/set", 1);
+    server.wait_for_method_count("turn/start", 1);
+    tui.wait_for("Fresh session");
+    tui.wait_for("stream reply for hello fresh session");
+    tui.quit();
+
+    let starts = server.requests_for("thread/start");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0]["params"]["cwd"].as_str(),
+        Some("/tmp/tui-active"),
+        "cwd should be prefilled from the selected row"
+    );
+    let names = server.requests_for("thread/name/set");
+    assert_eq!(names[0]["params"]["name"].as_str(), Some("Fresh session"));
+    let turn_starts = server.requests_for("turn/start");
+    assert!(
+        turn_starts[0]["params"]["threadId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("thread_created_")),
+        "first turn should target the created thread"
+    );
+
+    let rpc_log = stream_log.with_extension("rpc.ndjson");
+    let rpc_lines = fs::read_to_string(&rpc_log).expect("rpc log");
+    assert!(
+        rpc_lines.contains("\"kind\":\"send\"") && rpc_lines.contains("thread/start"),
+        "rpc log should capture the thread/start exchange"
+    );
+    assert!(
+        rpc_lines.contains("\"kind\":\"recv\""),
+        "rpc log should capture received frames"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_new_session_flow_continues_when_name_set_fails() {
+    let server = TuiMockServer::start_with_name_set_failure();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"n");
+    tui.wait_for("New session cwd");
+    tui.write(b"\r");
+    tui.wait_for("New session name");
+    tui.type_text("Unrenamed session");
+    tui.write(b"\r");
+    tui.wait_for("New session first message");
+    tui.type_text("hello despite rename failure");
+    tui.write(b"\r");
+
+    server.wait_for_method_count("thread/start", 1);
+    server.wait_for_method_count("thread/name/set", 1);
+    server.wait_for_method_count("turn/start", 1);
+    tui.wait_for("Unrenamed session");
+    tui.wait_for("rename failed");
+    tui.wait_for("stream reply for hello despite rename failure");
+    tui.quit();
+
+    let turn_starts = server.requests_for("turn/start");
+    assert_eq!(turn_starts.len(), 1);
+    assert!(
+        turn_starts[0]["params"]["threadId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("thread_created_")),
+        "first turn should still target the created thread after rename failure"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_new_session_flow_allows_empty_name() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"n");
+    tui.wait_for("New session cwd");
+    tui.write(b"\r");
+    tui.wait_for("New session name");
+    tui.write(b"\r");
+    tui.wait_for("New session first message");
+    tui.type_text("hello unnamed session");
+    tui.write(b"\r");
+
+    server.wait_for_method_count("thread/start", 1);
+    server.wait_for_method_count("turn/start", 1);
+    tui.wait_for("hello unnamed session");
+    tui.wait_for("stream reply for hello unnamed session");
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("thread/name/set"),
+        0,
+        "empty new-session name should skip the optional rename RPC"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
 fn tui_browser_explicit_steer_and_interrupt_use_active_control_rpcs() {
     let server = TuiMockServer::start();
     let state_dir = TempDir::new().expect("state dir");
@@ -989,7 +1411,7 @@ fn tui_browser_explicit_steer_and_interrupt_use_active_control_rpcs() {
     let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
 
     tui.wait_for_all(&["Active stream", "Beta task"]);
-    tui.write(b"S");
+    tui.write(b"m");
     tui.wait_for("Steer active turn");
     tui.type_text("browser explicit steer");
     tui.write(b"\r");

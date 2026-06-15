@@ -26,12 +26,14 @@ pub(crate) enum FetchRequest {
     },
     Detail {
         epoch: u64,
+        server: String,
         thread_id: String,
         cursor: Option<String>,
         limit: u32,
         page_direction: DetailPageDirection,
     },
     LoadThread {
+        server: String,
         thread_id: String,
     },
 }
@@ -39,6 +41,7 @@ pub(crate) enum FetchRequest {
 #[derive(Debug)]
 pub(crate) struct PreviewRequest {
     pub epoch: u64,
+    pub server: String,
     pub thread_id: String,
 }
 
@@ -49,6 +52,7 @@ pub(crate) enum AppEvent {
         rows: Vec<ThreadRow>,
         next_cursor: Option<String>,
         backwards_cursor: Option<String>,
+        warning: Option<String>,
     },
     BrowserLoadFailed {
         epoch: u64,
@@ -65,20 +69,37 @@ pub(crate) enum AppEvent {
     },
     PreviewLoaded {
         epoch: u64,
+        server: String,
         thread_id: String,
         messages: Vec<MessageBlock>,
     },
     PreviewLoadFailed {
         epoch: u64,
+        server: String,
         thread_id: String,
         error: String,
     },
     ThreadLoaded {
+        server: String,
         thread_id: String,
         status: Value,
     },
     ThreadLoadFailed {
+        server: String,
         thread_id: String,
+        error: String,
+    },
+    SessionCreated {
+        stream_id: u64,
+        server: String,
+        thread_id: String,
+        cwd: String,
+        title: Option<String>,
+        prompt: String,
+        naming_error: Option<String>,
+    },
+    SessionCreateFailed {
+        server: String,
         error: String,
     },
     StreamEvent {
@@ -87,45 +108,54 @@ pub(crate) enum AppEvent {
     },
     StreamFailed {
         stream_id: Option<u64>,
+        server: String,
         thread_id: String,
         turn_id: Option<String>,
         error: String,
     },
     StreamFinished {
         stream_id: u64,
+        server: String,
         thread_id: String,
         turn_id: Option<String>,
         status: StreamStatus,
     },
     StreamIdle {
         stream_id: u64,
+        server: String,
         thread_id: String,
     },
     TurnQueued {
+        server: String,
         thread_id: String,
         turn_id: String,
         prompt: String,
     },
     TurnSubmitFailed {
+        server: String,
         thread_id: String,
         error: String,
     },
     ArchiveChanged {
+        server: String,
         thread_id: String,
         archived: bool,
         thread: Value,
     },
     ArchiveChangeFailed {
+        server: String,
         thread_id: String,
         archived: bool,
         error: String,
     },
     RenameChanged {
+        server: String,
         thread_id: String,
         name: String,
         thread: Value,
     },
     RenameChangeFailed {
+        server: String,
         thread_id: String,
         name: String,
         error: String,

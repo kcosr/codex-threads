@@ -15,7 +15,12 @@ const PREFS_VERSION: u32 = 1;
 const PREFS_FILE: &str = "tui.json";
 const LOCK_FILE: &str = "tui.json.lock";
 
+// `#[serde(default)]` on these structs fills any field missing from an older
+// (same-version) prefs file from `Default` instead of failing the whole parse
+// and resetting every preference. Genuinely corrupt files (bad JSON, wrong
+// types, version mismatch) are still detected and backed up.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct TuiPrefs {
     pub version: u32,
     #[serde(rename = "updatedAt")]
@@ -31,6 +36,7 @@ pub struct LoadedPrefs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct BrowserPrefs {
     pub columns: VisibleColumns,
     pub sort: Option<SortKey>,
@@ -39,9 +45,15 @@ pub struct BrowserPrefs {
     pub preview_pane: bool,
     #[serde(rename = "relativeUpdated")]
     pub relative_updated: bool,
+    /// When on, selecting or opening an active thread attaches its live
+    /// stream automatically; when off, content comes from history fetches
+    /// and only the user's own sends stream.
+    #[serde(rename = "autoAttach")]
+    pub auto_attach: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RefreshPrefs {
     pub auto: bool,
     #[serde(rename = "intervalSeconds")]
@@ -49,6 +61,7 @@ pub struct RefreshPrefs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct VisibleColumns {
     pub status: bool,
     pub updated: bool,
@@ -82,6 +95,7 @@ impl Default for BrowserPrefs {
             direction: SortDirectionPref::Desc,
             preview_pane: true,
             relative_updated: true,
+            auto_attach: true,
         }
     }
 }
@@ -195,7 +209,16 @@ fn backup_corrupt_prefs(path: &Path) {
     if !path.exists() {
         return;
     }
-    let backup = path.with_file_name(format!("{PREFS_FILE}.corrupt.{}", now_epoch_seconds()));
+    // Include the pid and nanosecond stamp so two corruptions within the same
+    // second (or from concurrent processes) do not overwrite each other.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = path.with_file_name(format!(
+        "{PREFS_FILE}.corrupt.{}.{nanos}",
+        std::process::id()
+    ));
     let _ = fs::rename(path, backup);
 }
 
@@ -323,5 +346,46 @@ mod tests {
             })
             .count();
         assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn missing_same_version_pref_fields_default_without_backup() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(PREFS_FILE);
+        fs::write(
+            &path,
+            serde_json::json!({
+                "version": PREFS_VERSION,
+                "updatedAt": 1,
+                "browser": {
+                    "columns": {
+                        "status": false
+                    }
+                },
+                "refresh": {}
+            })
+            .to_string(),
+        )
+        .expect("prefs");
+
+        let prefs = read_prefs_from_path(&path).expect("prefs load");
+
+        assert!(path.exists());
+        assert!(!prefs.browser.columns.status);
+        assert!(prefs.browser.columns.updated);
+        assert_eq!(prefs.browser.direction, SortDirectionPref::Desc);
+        assert!(prefs.browser.auto_attach);
+        assert_eq!(prefs.refresh.interval_seconds, 30);
+        let backups = fs::read_dir(temp.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tui.json.corrupt.")
+            })
+            .count();
+        assert_eq!(backups, 0);
     }
 }

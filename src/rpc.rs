@@ -51,6 +51,7 @@ pub struct Notification {
 pub struct RpcClient {
     stream: RpcStream,
     next_id: i64,
+    connection_id: u64,
 }
 
 impl RpcClient {
@@ -61,9 +62,57 @@ impl RpcClient {
                 RpcStream::Tcp(connect_websocket(url, auth_token.as_deref()).await?)
             }
         };
-        let mut client = Self { stream, next_id: 1 };
+        let connection_id = crate::debuglog::next_connection_id();
+        if crate::debuglog::enabled() {
+            let endpoint = match endpoint {
+                Endpoint::Unix { path } => format!("unix://{}", path.display()),
+                Endpoint::WebSocket { url, .. } => url.clone(),
+            };
+            crate::debuglog::log(
+                "connect",
+                Some(connection_id),
+                json!({"endpoint": endpoint}),
+            );
+        }
+        let mut client = Self {
+            stream,
+            next_id: 1,
+            connection_id,
+        };
         client.initialize().await?;
         Ok(client)
+    }
+
+    async fn send_message(
+        &mut self,
+        message: Message,
+    ) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
+        if crate::debuglog::enabled()
+            && let Message::Text(text) = &message
+        {
+            crate::debuglog::log(
+                "send",
+                Some(self.connection_id),
+                crate::debuglog::frame_payload(text),
+            );
+        }
+        self.stream.send(message).await
+    }
+
+    async fn next_message(
+        &mut self,
+    ) -> Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
+        let next = self.stream.next().await;
+        if crate::debuglog::enabled()
+            && let Some(Ok(Message::Text(text))) = &next
+        {
+            crate::debuglog::log(
+                "recv",
+                Some(self.connection_id),
+                crate::debuglog::frame_payload(text),
+            );
+        }
+        next
     }
 }
 
@@ -174,8 +223,7 @@ impl RpcClient {
         if !params.is_null() {
             message["params"] = params;
         }
-        self.stream
-            .send(Message::Text(message.to_string().into()))
+        self.send_message(Message::Text(message.to_string().into()))
             .await
             .context("failed to send notification")?;
         Ok(())
@@ -197,13 +245,12 @@ impl RpcClient {
         } else {
             json!({ "id": id, "method": method, "params": params })
         };
-        self.stream
-            .send(Message::Text(request.to_string().into()))
+        self.send_message(Message::Text(request.to_string().into()))
             .await
             .with_context(|| format!("failed to send `{method}` request"))?;
 
         loop {
-            let next = tokio::time::timeout(REQUEST_READ_TIMEOUT, self.stream.next())
+            let next = tokio::time::timeout(REQUEST_READ_TIMEOUT, self.next_message())
                 .await
                 .with_context(|| format!("timed out waiting for app-server `{method}` response"))?;
             let Some(message) = next else {
@@ -242,7 +289,7 @@ impl RpcClient {
 
     pub async fn next_notification_or_request(&mut self) -> Result<Notification> {
         loop {
-            let Some(message) = self.stream.next().await else {
+            let Some(message) = self.next_message().await else {
                 return Err(anyhow!("app-server connection closed"));
             };
             let message = message.context("failed to read websocket message")?;
@@ -277,8 +324,7 @@ impl RpcClient {
                 "message": format!("unsupported server request `{method}`")
             }
         });
-        self.stream
-            .send(Message::Text(response.to_string().into()))
+        self.send_message(Message::Text(response.to_string().into()))
             .await
             .context("failed to reject unsupported server request")?;
         Ok(())

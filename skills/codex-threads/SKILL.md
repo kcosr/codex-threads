@@ -85,6 +85,11 @@ codex-threads tui --since 24h --cwd "$PWD"
 codex-threads tui --query "release process" --limit 20
 ```
 
+By default, the TUI opens all configured servers and shows a `SERVER` column
+when more than one target is visible. Use `--server ALIAS` or
+`CODEX_THREADS_SERVER` to narrow the TUI to one server; `--connect` remains a
+single direct target.
+
 The TUI accepts the same initial discovery filters as `list`/`search`: `--query`,
 `--since`, `--cwd`, `--archived`, `--limit`, `--sort`, `--asc`, and `--desc`.
 Do not use it for machine-readable automation; use the CLI `--json` commands
@@ -108,10 +113,10 @@ Useful TUI keys:
 - `e` renames the active thread with `Enter` save; `Ctrl-D` clears the draft,
   but app-server does not expose a clear-name operation.
 - `A` opens confirmation to archive or unarchive the active thread.
-- `T` attaches to the selected active thread in the browser or the open active
-  thread in detail.
 - `r` refreshes; `R` resets pagination; `t` toggles real browser auto-refresh.
-  Use the `c` menu to set the persisted 5-300 second refresh interval.
+  Use the `c` menu to set the persisted 5-300 second refresh interval and the
+  `a` auto-attach toggle: with auto-attach off, browsing shows content from
+  history fetches without opening live streams; own sends still stream.
 - `l` explicitly loads the selected/open thread, matching
   `status THREAD_ID --load`, then refreshes visible metadata and history.
 - `y` copies the active thread id with OSC 52.
@@ -120,15 +125,26 @@ Useful TUI keys:
   the thread remains selected and detaches locally when selection moves away.
   If the initial selected browser row is active, the TUI attaches to it
   automatically.
+- `n` in the browser creates a new session: pick the server when more than one
+  is configured, confirm the cwd (prefilled from the selected thread), name it
+  optionally, then type the first message. The thread is created on send; `Esc`
+  at any step cancels without creating anything.
 - Opening a detail view loads a small recent turn window and starts at the
   transcript bottom; while in detail, `Enter` opens the message action, `n/N`
   move between message-search matches, and `Esc` unlinks the local detail view
   and returns to the browser.
-- In detail, `T` attaches to an active turn, `S` steers it, and `i` confirms
-  interrupt. Attach resumes with a turn snapshot first, then streams new events.
+- In detail, `i` confirms interrupt. Use
+  `Enter` or `m` to compose; active threads default to steer and `Tab` switches
+  between steer and normal send. Attach resumes with a turn snapshot first,
+  then streams new events.
 - `q` quits. Local detach leaves remote turns running unless interrupted.
+- Set `CODEX_THREADS_TURN_POLL_QUIET_SECS` (default 3) to adjust how long a
+  watched turn must stay silent before the fallback status poll runs.
 - Set `CODEX_THREADS_TUI_STREAM_LOG=/path/to/events.jsonl` to capture raw stream
   events for transcript debugging.
+- Set `CODEX_THREADS_RPC_LOG=/path/to/rpc.ndjson` to capture every JSON-RPC
+  frame (with connection ids and millisecond timestamps) plus attach replay
+  reconciliation decisions; use it to diagnose streaming duplication issues.
 
 In TUI search mode, `--cwd` is a local refinement over the loaded search page.
 Sort controls are disabled in search mode until app-server supports server-side

@@ -21,27 +21,55 @@ pub enum Mode {
     SortMenu,
     ColumnsMenu,
     ConfirmInterrupt {
+        server: String,
         thread_id: String,
         turn_id: Option<String>,
         return_to_detail: bool,
     },
     ConfirmArchive {
+        server: String,
         thread_id: String,
         archived: bool,
         return_to_detail: bool,
     },
+    ConfirmOpenCodex {
+        server: String,
+        thread_id: String,
+        cwd: String,
+        return_to_detail: bool,
+    },
     AnnotationInput {
+        server: String,
         thread_id: String,
         draft: String,
         return_to_detail: bool,
     },
     RenameInput {
+        server: String,
         thread_id: String,
         draft: String,
         return_to_detail: bool,
     },
+    NewSessionServerMenu {
+        draft: NewSessionDraft,
+        servers: Vec<String>,
+        selected: usize,
+    },
+    NewSessionCwdInput {
+        draft: NewSessionDraft,
+    },
+    NewSessionTitleInput {
+        draft: NewSessionDraft,
+    },
     Compose(ComposeState),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSessionDraft {
+    pub server: String,
+    pub cwd: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +80,14 @@ pub enum BrowserSource {
 
 #[derive(Debug, Clone)]
 pub struct BrowserState {
+    pub multi_server: bool,
     pub source: BrowserSource,
     pub query: String,
     pub rows: Vec<ThreadRow>,
     pub selected: usize,
+    /// First row rendered in the browser table; kept in sync with `selected`
+    /// each frame so the selection stays inside the visible window.
+    pub row_offset: usize,
     pub next_cursor: Option<String>,
     pub backwards_cursor: Option<String>,
     pub current_cursor: Option<String>,
@@ -74,9 +106,29 @@ pub struct BrowserState {
     pub last_error: Option<String>,
 }
 
+impl BrowserState {
+    /// Clamps `row_offset` so the selected row stays within the
+    /// `visible_rows`-tall window the browser table can actually render.
+    pub fn clamp_row_offset(&mut self, visible_rows: usize) {
+        if self.rows.is_empty() || visible_rows == 0 {
+            self.row_offset = 0;
+            return;
+        }
+        self.row_offset = self
+            .row_offset
+            .min(self.rows.len().saturating_sub(visible_rows));
+        if self.selected < self.row_offset {
+            self.row_offset = self.selected;
+        } else if self.selected >= self.row_offset + visible_rows {
+            self.row_offset = self.selected + 1 - visible_rows;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrowserPreviewState {
     pub epoch: u64,
+    pub server: Option<String>,
     pub thread_id: Option<String>,
     pub loading: bool,
     pub messages: Vec<MessageBlock>,
@@ -85,6 +137,7 @@ pub struct BrowserPreviewState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRow {
+    pub server: String,
     pub id: String,
     pub title: String,
     pub status: String,
@@ -97,6 +150,7 @@ pub struct ThreadRow {
 
 #[derive(Debug, Clone)]
 pub struct DetailState {
+    pub server: String,
     pub thread_id: String,
     pub title: String,
     pub status: String,
@@ -124,6 +178,9 @@ pub struct MessageBlock {
     pub item_id: Option<String>,
     pub role: String,
     pub timestamp: Option<String>,
+    /// Unrendered message text. `lines` is the wrapped markdown rendering and
+    /// cannot be used to recover the original text for prefix comparisons.
+    pub raw_text: String,
     pub lines: Vec<MessageLine>,
     pub is_match: bool,
 }
@@ -152,7 +209,9 @@ pub struct MessageSpan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+// `Rgb` is only constructed by the syntax-highlighting path; without that
+// feature it is matched but never built.
+#[cfg_attr(not(feature = "tui-syntax-highlighting"), allow(dead_code))]
 pub enum MessageColor {
     Rgb(u8, u8, u8),
 }
@@ -167,9 +226,24 @@ pub struct ComposeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeTarget {
-    NewTurn { thread_id: String },
-    Steer { thread_id: String, turn_id: String },
-    SteerSelected { thread_id: String },
+    NewTurn {
+        server: String,
+        thread_id: String,
+    },
+    NewThread {
+        server: String,
+        cwd: String,
+        title: Option<String>,
+    },
+    Steer {
+        server: String,
+        thread_id: String,
+        turn_id: String,
+    },
+    SteerSelected {
+        server: String,
+        thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +255,7 @@ pub enum SendMode {
 #[derive(Debug, Clone)]
 pub struct StreamState {
     pub id: u64,
+    pub server: String,
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub status: StreamStatus,
@@ -209,6 +284,7 @@ impl StreamState {
         Self::new_with_id(0, thread_id, turn_id, status, attached)
     }
 
+    #[cfg(test)]
     pub fn new_with_id(
         id: u64,
         thread_id: String,
@@ -216,8 +292,20 @@ impl StreamState {
         status: StreamStatus,
         attached: bool,
     ) -> Self {
+        Self::new_for_server_with_id(id, "work".to_string(), thread_id, turn_id, status, attached)
+    }
+
+    pub fn new_for_server_with_id(
+        id: u64,
+        server: String,
+        thread_id: String,
+        turn_id: Option<String>,
+        status: StreamStatus,
+        attached: bool,
+    ) -> Self {
         Self {
             id,
+            server,
             thread_id,
             turn_id,
             status,
@@ -234,6 +322,9 @@ impl StreamState {
 pub enum StreamStatus {
     Starting,
     Running,
+    /// Probing for a queued follow-up turn after one completed; nothing is
+    /// streaming yet.
+    Following,
     Completed,
     Failed,
     Interrupted,
@@ -257,6 +348,7 @@ pub struct TuiState {
     pub next_stream_id: u64,
     pub pending_goto_top: bool,
     pub pending_detail_jump: Option<DetailJump>,
+    pub force_terminal_clear: bool,
     pub notice: Option<Notice>,
     pub should_quit: bool,
 }
@@ -293,10 +385,12 @@ impl TuiState {
         Self {
             mode: Mode::Browser,
             browser: BrowserState {
+                multi_server: false,
                 source,
                 query,
                 rows: Vec::new(),
                 selected: 0,
+                row_offset: 0,
                 next_cursor: None,
                 backwards_cursor: None,
                 current_cursor: None,
@@ -321,6 +415,7 @@ impl TuiState {
             next_stream_id: 0,
             pending_goto_top: false,
             pending_detail_jump: None,
+            force_terminal_clear: false,
             notice: None,
             should_quit: false,
         }
@@ -359,6 +454,13 @@ impl TuiState {
             .map(|row| row.id.as_str())
     }
 
+    pub fn selected_thread_key(&self) -> Option<(String, String)> {
+        self.browser
+            .rows
+            .get(self.browser.selected)
+            .map(|row| (row.server.clone(), row.id.clone()))
+    }
+
     pub fn selected_thread_annotation(&self) -> Option<&str> {
         self.browser
             .rows
@@ -377,8 +479,9 @@ impl TuiState {
         self.browser.selected = next as usize;
     }
 
-    pub fn set_preview_loading(&mut self, thread_id: String) -> u64 {
+    pub fn set_preview_loading(&mut self, server: String, thread_id: String) -> u64 {
         self.browser.preview.epoch += 1;
+        self.browser.preview.server = Some(server);
         self.browser.preview.thread_id = Some(thread_id);
         self.browser.preview.loading = true;
         self.browser.preview.messages.clear();
@@ -389,12 +492,22 @@ impl TuiState {
     pub fn set_preview_loaded(
         &mut self,
         epoch: u64,
+        server: String,
         thread_id: String,
         mut messages: Vec<MessageBlock>,
     ) {
         if self.browser.preview.epoch != epoch
+            || self.browser.preview.server.as_deref() != Some(server.as_str())
             || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
         {
+            return;
+        }
+        if !self.browser.preview.messages.is_empty()
+            && self.stream_owns_thread_content(&server, &thread_id)
+        {
+            // The stream owns the preview content; the fetched history lags it.
+            self.browser.preview.loading = false;
+            self.browser.preview.error = None;
             return;
         }
         append_unpersisted_messages(&mut messages, &self.browser.preview.messages);
@@ -403,8 +516,15 @@ impl TuiState {
         self.browser.preview.error = None;
     }
 
-    pub fn set_preview_error(&mut self, epoch: u64, thread_id: String, error: String) {
+    pub fn set_preview_error(
+        &mut self,
+        epoch: u64,
+        server: String,
+        thread_id: String,
+        error: String,
+    ) {
         if self.browser.preview.epoch != epoch
+            || self.browser.preview.server.as_deref() != Some(server.as_str())
             || self.browser.preview.thread_id.as_deref() != Some(thread_id.as_str())
         {
             return;
@@ -424,7 +544,7 @@ impl TuiState {
         if epoch != self.browser.epoch {
             return;
         }
-        let previous_id = self.selected_thread_id().map(str::to_string);
+        let previous_key = self.selected_thread_key();
         let previous_rows = self.browser.rows.clone();
         let rows = rows
             .into_iter()
@@ -437,8 +557,13 @@ impl TuiState {
         self.browser.loading = false;
         self.browser.last_refresh_at = Some(Instant::now());
         self.browser.last_error = None;
-        self.browser.selected = previous_id
-            .and_then(|id| self.browser.rows.iter().position(|row| row.id == id))
+        self.browser.selected = previous_key
+            .and_then(|(server, id)| {
+                self.browser
+                    .rows
+                    .iter()
+                    .position(|row| row.server == server && row.id == id)
+            })
             .unwrap_or(0)
             .min(self.browser.rows.len().saturating_sub(1));
     }
@@ -451,7 +576,33 @@ impl TuiState {
         self.browser.last_error = Some(error);
     }
 
-    pub fn replace_detail(&mut self, epoch: u64, mut detail: DetailState) {
+    /// Whether a delivering stream owns this thread's content. While it does,
+    /// history fetches must not touch transcript content: the stream seeded
+    /// the history snapshot at attach time and applies all further updates.
+    /// The post-turn follow probe (`Following`) does not own anything.
+    pub fn stream_owns_thread_content(&self, server: &str, thread_id: &str) -> bool {
+        self.stream.as_ref().is_some_and(|stream| {
+            stream.server == server
+                && stream.thread_id == thread_id
+                && !stream.detached
+                && matches!(
+                    stream.status,
+                    StreamStatus::Starting | StreamStatus::Running
+                )
+        })
+    }
+
+    pub fn replace_detail(&mut self, epoch: u64, detail: DetailState) {
+        self.replace_detail_inner(epoch, detail, false);
+    }
+
+    /// Replace driven by the stream itself (the attach history snapshot);
+    /// bypasses the stream content-ownership guard.
+    pub fn replace_detail_from_stream(&mut self, epoch: u64, detail: DetailState) {
+        self.replace_detail_inner(epoch, detail, true);
+    }
+
+    fn replace_detail_inner(&mut self, epoch: u64, mut detail: DetailState, from_stream: bool) {
         let Some(current) = self.detail.as_ref() else {
             return;
         };
@@ -459,6 +610,22 @@ impl TuiState {
             return;
         }
         let same_thread = current.thread_id == detail.thread_id;
+        if !from_stream
+            && same_thread
+            && !current.messages.is_empty()
+            && self.stream_owns_thread_content(&detail.server, &detail.thread_id)
+        {
+            // The stream owns the transcript: adopt refreshed metadata only.
+            let current = self.detail.as_mut().expect("detail checked above");
+            current.title = detail.title;
+            current.status = detail.status;
+            current.annotation = detail.annotation;
+            current.active_turn_id = detail.active_turn_id;
+            current.loading = false;
+            current.last_refresh_at = Some(Instant::now());
+            current.last_error = None;
+            return;
+        }
         let previous_mode = self.mode.clone();
         if current.thread_id == detail.thread_id {
             let was_at_bottom =
@@ -487,10 +654,26 @@ impl TuiState {
     }
 
     pub fn extend_detail_older(&mut self, epoch: u64, mut page: DetailState) {
+        let stream_owns_content = self.detail.as_ref().is_some_and(|detail| {
+            detail.epoch == epoch
+                && detail.thread_id == page.thread_id
+                && self.stream_owns_thread_content(&detail.server, &detail.thread_id)
+        });
         let Some(detail) = &mut self.detail else {
             return;
         };
         if detail.epoch != epoch || detail.thread_id != page.thread_id {
+            return;
+        }
+        if stream_owns_content {
+            detail.next_cursor = page.next_cursor;
+            detail.backwards_cursor = page.backwards_cursor.or(detail.backwards_cursor.clone());
+            detail.current_cursor = page.current_cursor;
+            detail.active_turn_id = page.active_turn_id;
+            detail.status = page.status;
+            detail.loading = false;
+            detail.last_refresh_at = Some(Instant::now());
+            detail.last_error = None;
             return;
         }
         let previous_offset = detail.scroll as usize;
@@ -529,10 +712,26 @@ impl TuiState {
     }
 
     pub fn extend_detail_newer(&mut self, epoch: u64, mut page: DetailState) {
+        let stream_owns_content = self.detail.as_ref().is_some_and(|detail| {
+            detail.epoch == epoch
+                && detail.thread_id == page.thread_id
+                && self.stream_owns_thread_content(&detail.server, &detail.thread_id)
+        });
         let Some(detail) = &mut self.detail else {
             return;
         };
         if detail.epoch != epoch || detail.thread_id != page.thread_id {
+            return;
+        }
+        if stream_owns_content {
+            detail.next_cursor = page.next_cursor.or(detail.next_cursor.clone());
+            detail.backwards_cursor = page.backwards_cursor;
+            detail.current_cursor = page.current_cursor;
+            detail.active_turn_id = page.active_turn_id;
+            detail.status = page.status;
+            detail.loading = false;
+            detail.last_refresh_at = Some(Instant::now());
+            detail.last_error = None;
             return;
         }
         let was_at_bottom = detail.scroll == u16::MAX || detail.scroll >= detail.max_scroll();
@@ -654,6 +853,10 @@ fn preserve_detail_overlay_mode(previous_mode: Mode, same_thread: bool) -> Mode 
         | Mode::ConfirmArchive {
             return_to_detail: true,
             ..
+        }
+        | Mode::ConfirmOpenCodex {
+            return_to_detail: true,
+            ..
         } => previous_mode,
         _ => Mode::Detail,
     }
@@ -663,7 +866,10 @@ fn preserve_known_status(mut row: ThreadRow, previous_rows: &[ThreadRow]) -> Thr
     if !row.status.eq_ignore_ascii_case("notLoaded") {
         return row;
     }
-    let Some(previous) = previous_rows.iter().find(|previous| previous.id == row.id) else {
+    let Some(previous) = previous_rows
+        .iter()
+        .find(|previous| previous.server == row.server && previous.id == row.id)
+    else {
         return row;
     };
     if previous.status.is_empty() || previous.status.eq_ignore_ascii_case("notLoaded") {
@@ -814,7 +1020,9 @@ pub fn rendered_line_count(text: &str, width: usize) -> usize {
     if text.is_empty() {
         1
     } else {
-        textwrap::wrap(text, width.max(1)).len().max(1)
+        textwrap::wrap(text, textwrap::Options::new(width.max(1)).break_words(true))
+            .len()
+            .max(1)
     }
 }
 
@@ -862,8 +1070,17 @@ fn equivalent_persisted_message(existing: &MessageBlock, local: &MessageBlock) -
 
 fn same_message(left: &MessageBlock, right: &MessageBlock) -> bool {
     if left.item_id.is_some() || right.item_id.is_some() {
-        left.item_id == right.item_id
+        left.item_id == right.item_id || same_persisted_live_item(left, right)
     } else {
         left.turn_id == right.turn_id && left.role == right.role && left.lines == right.lines
     }
+}
+
+fn same_persisted_live_item(left: &MessageBlock, right: &MessageBlock) -> bool {
+    left.item_id.is_some()
+        && right.item_id.is_some()
+        && left.turn_id.is_some()
+        && left.turn_id == right.turn_id
+        && left.role == right.role
+        && left.raw_text == right.raw_text
 }

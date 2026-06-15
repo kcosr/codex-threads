@@ -552,6 +552,9 @@ fn mock_result(
         "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/paged") => {
             paged_threads(request)
         }
+        "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/sorted") => {
+            sorted_desc_threads(request)
+        }
         "thread/list" if request["params"]["cwd"].as_str() == Some("/tmp/multiline") => {
             page(json!([sample_multiline_preview_thread("thread_multiline")]))
         }
@@ -660,6 +663,34 @@ fn paged_threads(request: &Value) -> Value {
                 sample_thread_with_updated("thread_new_2", 1_700_000_200)
             ],
             "nextCursor": "page3",
+            "backwardsCursor": Value::Null
+        }),
+        _ => page(json!([])),
+    }
+}
+
+// Genuinely descending-by-updatedAt pages. `spage2` opens with a thread older
+// than the test cutoff, so a sort-aware `--since` scan should stop there and
+// never request `spage3` (whose "tripwire" thread is newer than the cutoff and
+// would wrongly appear if paging continued past the boundary).
+fn sorted_desc_threads(request: &Value) -> Value {
+    match request["params"]["cursor"].as_str() {
+        None => json!({
+            "data": [
+                sample_thread_with_updated("thread_s1", 1_700_000_300),
+                sample_thread_with_updated("thread_s2", 1_700_000_200)
+            ],
+            "nextCursor": "spage2",
+            "backwardsCursor": Value::Null
+        }),
+        Some("spage2") => json!({
+            "data": [sample_thread_with_updated("thread_s_old", 1_600_000_000)],
+            "nextCursor": "spage3",
+            "backwardsCursor": Value::Null
+        }),
+        Some("spage3") => json!({
+            "data": [sample_thread_with_updated("thread_s_tripwire", 1_700_000_999)],
+            "nextCursor": Value::Null,
             "backwardsCursor": Value::Null
         }),
         _ => page(json!([])),
@@ -1938,6 +1969,42 @@ fn list_since_filters_locally_across_server_pages() {
     assert_eq!(output["threads"][0]["id"], "thread_new_1");
     assert_eq!(output["threads"][1]["id"], "thread_new_2");
     assert_eq!(output["nextCursor"], "page3");
+}
+
+#[test]
+fn list_since_stops_paging_at_boundary_when_sorted_updated_desc() {
+    let server = MockServer::start();
+    let output = run_json(
+        &server,
+        &[
+            "list",
+            "--server",
+            "work",
+            "--json",
+            "--cwd",
+            "/tmp/sorted",
+            "--limit",
+            "10",
+            "--since",
+            "1700000000",
+            "--sort",
+            "updated",
+            "--desc",
+        ],
+    );
+    let threads = output["threads"].as_array().unwrap();
+    // Stops at the first thread older than `since`; never pages to `spage3`,
+    // so the newer-but-later "tripwire" thread must not appear.
+    assert_eq!(threads.len(), 2);
+    assert_eq!(threads[0]["id"], "thread_s1");
+    assert_eq!(threads[1]["id"], "thread_s2");
+    assert!(
+        !threads
+            .iter()
+            .any(|thread| thread["id"] == "thread_s_tripwire"),
+        "early-exit should not reach the tripwire page"
+    );
+    assert_eq!(output["nextCursor"], "spage3");
 }
 
 #[test]
