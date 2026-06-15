@@ -5,7 +5,8 @@
 ### Added
 
 - Add `codex-threads tui`, an interactive terminal UI for browsing, viewing,
-  searching, streaming, and controlling threads.
+  searching, streaming, and controlling threads
+  ([#6](https://github.com/kcosr/codex-threads/pull/6)).
 
 ## [0.1.5] - 2026-06-05
 
