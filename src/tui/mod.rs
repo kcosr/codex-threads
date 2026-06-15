@@ -2809,6 +2809,37 @@ fn stream_status_from_wait_outcome(
     }
 }
 
+fn stream_status_after_event(current: StreamStatus, event: &Value) -> StreamStatus {
+    match event["status"].as_str() {
+        Some("completed") => StreamStatus::Completed,
+        Some("failed") => StreamStatus::Failed,
+        Some("interrupted") => StreamStatus::Interrupted,
+        _ if current == StreamStatus::Following && !stream_event_has_content(event) => {
+            StreamStatus::Following
+        }
+        _ => StreamStatus::Running,
+    }
+}
+
+fn stream_event_has_content(event: &Value) -> bool {
+    event["delta"].is_string()
+        || event["text"].is_string()
+        || event["finalAssistantText"].is_string()
+        || event["assistantResponses"]
+            .as_array()
+            .is_some_and(|responses| {
+                responses.iter().any(|response| {
+                    response["text"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty())
+                })
+            })
+        || matches!(
+            event["type"].as_str(),
+            Some("accepted" | "attached" | "queued")
+        )
+}
+
 async fn attach_existing_turn_stream(
     target: &Target,
     client: &mut RpcClient,
@@ -3101,6 +3132,7 @@ async fn wait_for_next_active_turn(
                                 "prompt": prompt
                             }),
                         });
+                        return Ok(Some(queued.turn_id));
                     }
                     Some(TurnControl::Detach) | None => return Ok(None),
                 }
@@ -3775,12 +3807,7 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                         true,
                     ));
                 }
-                stream.status = match event["status"].as_str() {
-                    Some("completed") => StreamStatus::Completed,
-                    Some("failed") => StreamStatus::Failed,
-                    Some("interrupted") => StreamStatus::Interrupted,
-                    _ => StreamStatus::Running,
-                };
+                stream.status = stream_status_after_event(stream.status, &event);
                 if event["source"].as_str() == Some("poll") {
                     stream.last_poll_at = Some(std::time::Instant::now());
                 }
@@ -5638,7 +5665,7 @@ fn flush_markdown_buffer(
             push_blank_line(lines, kind);
             continue;
         }
-        for wrapped in textwrap::wrap(raw_line, width) {
+        for wrapped in wrap_text(raw_line, width) {
             lines.push(MessageLine {
                 kind,
                 text: wrapped.to_string(),
@@ -5661,11 +5688,21 @@ fn flush_code_buffer(
                 .iter()
                 .map(|span| span.text.as_str())
                 .collect::<String>();
-            lines.push(MessageLine {
-                kind: MessageLineKind::Code,
-                text,
-                spans,
-            });
+            if text.is_empty() {
+                push_blank_line(lines, MessageLineKind::Code);
+                continue;
+            }
+            for wrapped_spans in wrap_highlighted_spans(&spans, width) {
+                let text = wrapped_spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>();
+                lines.push(MessageLine {
+                    kind: MessageLineKind::Code,
+                    text,
+                    spans: wrapped_spans,
+                });
+            }
         }
         buffer.clear();
         return;
@@ -5675,7 +5712,7 @@ fn flush_code_buffer(
             push_blank_line(lines, MessageLineKind::Code);
             continue;
         }
-        for wrapped in textwrap::wrap(raw_line, width) {
+        for wrapped in wrap_text(raw_line, width) {
             lines.push(MessageLine {
                 kind: MessageLineKind::Code,
                 text: wrapped.to_string(),
@@ -5684,6 +5721,54 @@ fn flush_code_buffer(
         }
     }
     buffer.clear();
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    textwrap::wrap(text, textwrap::Options::new(width.max(1)).break_words(true))
+        .into_iter()
+        .map(|line| line.into_owned())
+        .collect()
+}
+
+fn wrap_highlighted_spans(spans: &[MessageSpan], width: usize) -> Vec<Vec<MessageSpan>> {
+    let width = width.max(1);
+    let mut lines: Vec<Vec<MessageSpan>> = Vec::new();
+    let mut current: Vec<MessageSpan> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in spans {
+        let mut chunk = String::new();
+        for ch in span.text.chars() {
+            if current_width == width && !chunk.is_empty() {
+                current.push(MessageSpan {
+                    text: std::mem::take(&mut chunk),
+                    color: span.color,
+                    bold: span.bold,
+                    italic: span.italic,
+                });
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            } else if current_width == width {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            chunk.push(ch);
+            current_width += 1;
+        }
+        if !chunk.is_empty() {
+            current.push(MessageSpan {
+                text: chunk,
+                color: span.color,
+                bold: span.bold,
+                italic: span.italic,
+            });
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn push_blank_line(lines: &mut Vec<MessageLine>, kind: MessageLineKind) {
@@ -6395,6 +6480,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn long_unbreakable_tokens_wrap_like_scroll_counting() {
+        let token = "x".repeat(25);
+        let lines = markdown_lines(&token, 10);
+
+        assert_eq!(crate::tui::state::rendered_line_count(&token, 10), 3);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.iter().map(|line| line.text.len()).sum::<usize>(), 25);
+    }
+
     #[cfg(feature = "tui-syntax-highlighting")]
     #[test]
     fn markdown_code_blocks_include_highlight_spans_when_feature_enabled() {
@@ -6524,6 +6619,113 @@ mod tests {
         assert_eq!(detail.messages[0].item_id.as_deref(), Some("old"));
         assert_eq!(detail.messages[1].item_id.as_deref(), Some("middle"));
         assert_eq!(detail.messages[2].item_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn detail_page_merge_dedups_live_and_persisted_item_ids() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": "older", "backwardsCursor": "newer", "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "msg_live", "type": "agentMessage", "text": "same assistant text"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        let newer = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "idle"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item_persisted", "type": "agentMessage", "text": "same assistant text"}
+                    ]}
+                ]}
+            }),
+            None,
+            "t1".to_string(),
+            1,
+            Some("newer".to_string()),
+        );
+
+        state.extend_detail_newer(1, newer);
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(message_text(&detail.messages[0]), "same assistant text");
+    }
+
+    #[test]
+    fn stream_owned_detail_page_merge_preserves_live_transcript_content() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.detail = Some(detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": "older", "backwardsCursor": "newer", "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "msg_live", "type": "agentMessage", "text": "live text"}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            None,
+        ));
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Running,
+            true,
+        ));
+        let newer = detail_state(
+            serde_json::json!({
+                "thread": {"id": "t1", "name": "Thread", "status": {"type": "active"}},
+                "turns": {"nextCursor": null, "backwardsCursor": null, "data": [
+                    {"id": "turn-1", "items": [
+                        {"id": "item_persisted", "type": "agentMessage", "text": "live text"}
+                    ]},
+                    {"id": "turn-2", "items": [
+                        {"id": "item_lagging", "type": "agentMessage", "text": "lagging history"}
+                    ]}
+                ]}
+            }),
+            Some(serde_json::json!({"activeTurnId": "turn-1"})),
+            "t1".to_string(),
+            1,
+            Some("newer".to_string()),
+        );
+
+        state.extend_detail_newer(1, newer);
+
+        let detail = state.detail.as_ref().expect("detail");
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(message_text(&detail.messages[0]), "live text");
+        assert_eq!(detail.status, "active");
     }
 
     #[test]
@@ -10384,6 +10586,63 @@ mod tests {
 
         assert!(state.stream.is_none());
         assert!(state.stream_control.is_none());
+    }
+
+    #[test]
+    fn following_stream_ignores_non_content_thread_events() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.stream = Some(StreamState::new_with_id(
+            7,
+            "t1".to_string(),
+            Some("turn-1".to_string()),
+            StreamStatus::Following,
+            true,
+        ));
+
+        handle_app_event(
+            AppEvent::StreamEvent {
+                stream_id: None,
+                event: serde_json::json!({
+                    "type": "steered",
+                    "threadId": "t1",
+                    "turnId": "turn-1"
+                }),
+            },
+            &mut state,
+        );
+
+        assert_eq!(
+            state.stream.as_ref().expect("stream").status,
+            StreamStatus::Following
+        );
+
+        handle_app_event(
+            AppEvent::StreamEvent {
+                stream_id: Some(7),
+                event: serde_json::json!({
+                    "type": "progress",
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "assistant-1",
+                    "delta": "new output"
+                }),
+            },
+            &mut state,
+        );
+
+        assert_eq!(
+            state.stream.as_ref().expect("stream").status,
+            StreamStatus::Running
+        );
     }
 
     #[test]

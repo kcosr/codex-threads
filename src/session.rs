@@ -346,9 +346,9 @@ async fn scan_since_filtered(
         next_cursor = page["nextCursor"].clone();
         backwards_cursor = page["backwardsCursor"].clone();
 
-        for item in page["data"].as_array().cloned().unwrap_or_default() {
-            if thread_updated_at(&item, projection).unwrap_or(0) >= since {
-                data.push(item);
+        for item in page["data"].as_array().into_iter().flatten() {
+            if thread_updated_at(item, projection).unwrap_or(0) >= since {
+                data.push(item.clone());
                 remaining -= 1;
                 if remaining == 0 {
                     break;

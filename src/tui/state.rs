@@ -652,10 +652,26 @@ impl TuiState {
     }
 
     pub fn extend_detail_older(&mut self, epoch: u64, mut page: DetailState) {
+        let stream_owns_content = self.detail.as_ref().is_some_and(|detail| {
+            detail.epoch == epoch
+                && detail.thread_id == page.thread_id
+                && self.stream_owns_thread_content(&detail.server, &detail.thread_id)
+        });
         let Some(detail) = &mut self.detail else {
             return;
         };
         if detail.epoch != epoch || detail.thread_id != page.thread_id {
+            return;
+        }
+        if stream_owns_content {
+            detail.next_cursor = page.next_cursor;
+            detail.backwards_cursor = page.backwards_cursor.or(detail.backwards_cursor.clone());
+            detail.current_cursor = page.current_cursor;
+            detail.active_turn_id = page.active_turn_id;
+            detail.status = page.status;
+            detail.loading = false;
+            detail.last_refresh_at = Some(Instant::now());
+            detail.last_error = None;
             return;
         }
         let previous_offset = detail.scroll as usize;
@@ -694,10 +710,26 @@ impl TuiState {
     }
 
     pub fn extend_detail_newer(&mut self, epoch: u64, mut page: DetailState) {
+        let stream_owns_content = self.detail.as_ref().is_some_and(|detail| {
+            detail.epoch == epoch
+                && detail.thread_id == page.thread_id
+                && self.stream_owns_thread_content(&detail.server, &detail.thread_id)
+        });
         let Some(detail) = &mut self.detail else {
             return;
         };
         if detail.epoch != epoch || detail.thread_id != page.thread_id {
+            return;
+        }
+        if stream_owns_content {
+            detail.next_cursor = page.next_cursor.or(detail.next_cursor.clone());
+            detail.backwards_cursor = page.backwards_cursor;
+            detail.current_cursor = page.current_cursor;
+            detail.active_turn_id = page.active_turn_id;
+            detail.status = page.status;
+            detail.loading = false;
+            detail.last_refresh_at = Some(Instant::now());
+            detail.last_error = None;
             return;
         }
         let was_at_bottom = detail.scroll == u16::MAX || detail.scroll >= detail.max_scroll();
@@ -986,7 +1018,9 @@ pub fn rendered_line_count(text: &str, width: usize) -> usize {
     if text.is_empty() {
         1
     } else {
-        textwrap::wrap(text, width.max(1)).len().max(1)
+        textwrap::wrap(text, textwrap::Options::new(width.max(1)).break_words(true))
+            .len()
+            .max(1)
     }
 }
 
@@ -1034,8 +1068,17 @@ fn equivalent_persisted_message(existing: &MessageBlock, local: &MessageBlock) -
 
 fn same_message(left: &MessageBlock, right: &MessageBlock) -> bool {
     if left.item_id.is_some() || right.item_id.is_some() {
-        left.item_id == right.item_id
+        left.item_id == right.item_id || same_persisted_live_item(left, right)
     } else {
         left.turn_id == right.turn_id && left.role == right.role && left.lines == right.lines
     }
+}
+
+fn same_persisted_live_item(left: &MessageBlock, right: &MessageBlock) -> bool {
+    left.item_id.is_some()
+        && right.item_id.is_some()
+        && left.turn_id.is_some()
+        && left.turn_id == right.turn_id
+        && left.role == right.role
+        && left.raw_text == right.raw_text
 }

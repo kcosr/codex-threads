@@ -904,7 +904,7 @@ impl TuiPty {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("pty reader");
         let writer = pair.master.take_writer().expect("pty writer");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(PTY_ROWS, PTY_COLS, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(PTY_ROWS, PTY_COLS, 200)));
         let parser_for_thread = Arc::clone(&parser);
         let reader_thread = thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
@@ -942,6 +942,21 @@ impl TuiPty {
 
     fn wait_for(&self, expected: &str) {
         self.wait_for_all(&[expected]);
+    }
+
+    fn wait_for_exactly_once(&self, expected: &str) {
+        let started = Instant::now();
+        while started.elapsed() < WAIT_TIMEOUT {
+            let screen = self.screen();
+            if screen.matches(expected).count() == 1 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "timed out waiting for exactly one {expected:?}\n--- screen ---\n{}",
+            self.screen()
+        );
     }
 
     fn wait_for_all(&self, expected: &[&str]) {
@@ -1086,6 +1101,7 @@ fn tui_detail_compose_stream_updates_screen_and_cli_history() {
     tui.type_text("tui smoke detail");
     tui.write(b"\r");
     tui.wait_for("stream reply for tui smoke detail");
+    tui.wait_for_exactly_once("stream reply for tui smoke detail");
     wait_for_file_contains(&stream_log, "stream reply for tui smoke detail");
     tui.write(b"\x1b");
     tui.wait_for("Threads");
@@ -1124,6 +1140,7 @@ fn tui_detail_enter_send_on_initial_active_thread_follows_started_turn() {
     tui.type_text("detail active followup");
     tui.write(b"\r");
     tui.wait_for("stream reply for detail active followup");
+    tui.wait_for_exactly_once("stream reply for detail active followup");
     wait_for_file_contains(&stream_log, "stream reply for detail active followup");
     tui.quit();
 
@@ -1351,6 +1368,37 @@ fn tui_browser_new_session_flow_continues_when_name_set_fails() {
             .as_str()
             .is_some_and(|id| id.starts_with("thread_created_")),
         "first turn should still target the created thread after rename failure"
+    );
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_browser_new_session_flow_allows_empty_name() {
+    let server = TuiMockServer::start();
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let mut tui = TuiPty::spawn(&server, &state_dir, &stream_log);
+
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"n");
+    tui.wait_for("New session cwd");
+    tui.write(b"\r");
+    tui.wait_for("New session name");
+    tui.write(b"\r");
+    tui.wait_for("New session first message");
+    tui.type_text("hello unnamed session");
+    tui.write(b"\r");
+
+    server.wait_for_method_count("thread/start", 1);
+    server.wait_for_method_count("turn/start", 1);
+    tui.wait_for("hello unnamed session");
+    tui.wait_for("stream reply for hello unnamed session");
+    tui.quit();
+
+    assert_eq!(
+        server.method_count("thread/name/set"),
+        0,
+        "empty new-session name should skip the optional rename RPC"
     );
 }
 
