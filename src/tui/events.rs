@@ -36,6 +36,13 @@ pub(crate) enum FetchRequest {
         server: String,
         thread_id: String,
     },
+    Usage {
+        server: String,
+    },
+    ConsumeRateLimitReset {
+        server: String,
+        idempotency_key: String,
+    },
 }
 
 #[derive(Debug)]
@@ -87,6 +94,24 @@ pub(crate) enum AppEvent {
     ThreadLoadFailed {
         server: String,
         thread_id: String,
+        error: String,
+    },
+    UsageLoaded {
+        server: String,
+        usage: Value,
+    },
+    UsageLoadFailed {
+        server: String,
+        error: String,
+    },
+    RateLimitResetConsumed {
+        server: String,
+        outcome: String,
+        usage: Option<Value>,
+        refresh_error: Option<String>,
+    },
+    RateLimitResetConsumeFailed {
+        server: String,
         error: String,
     },
     SessionCreated {

@@ -49,9 +49,10 @@ use crate::tui::events::{
 use crate::tui::input::{InputAction, ModeKind};
 use crate::tui::prefs::{SortDirectionPref, load_prefs_with_warning, save_prefs};
 use crate::tui::state::{
-    BrowserSource, ComposeState, ComposeTarget, DetailJump, DetailState, MessageBlock, MessageLine,
-    MessageLineKind, MessageSpan, Mode, NewSessionDraft, SendMode, StreamAssistantItem,
-    StreamState, StreamStatus, ThreadRow, TuiInit, TuiState,
+    AccountUsageRow, AccountUsageSnapshot, BrowserSource, ComposeState, ComposeTarget, DetailJump,
+    DetailState, MessageBlock, MessageLine, MessageLineKind, MessageSpan, Mode, NewSessionDraft,
+    ResetConfirmSelection, SendMode, StreamAssistantItem, StreamState, StreamStatus, ThreadRow,
+    TuiInit, TuiState, UsageAction, UsageModalState,
 };
 use crate::turns::{
     AttachTurnOptions, ControlledTurnWaitOptions, StartedTurn, TurnControl, TurnStartOptions,
@@ -106,6 +107,10 @@ impl TuiTargets {
         self.targets
             .get(server)
             .ok_or_else(|| usage_error(format!("unknown TUI server `{server}`")))
+    }
+
+    fn first_server(&self) -> Option<String> {
+        self.targets.keys().next().cloned()
     }
 }
 
@@ -588,6 +593,48 @@ async fn fetch_worker(
                     }
                 }
             }
+            FetchRequest::Usage { server } => {
+                let result = fetch_usage_cached(&targets, &mut clients, &server).await;
+                match result {
+                    Ok(usage) => {
+                        let _ = app_tx.send(AppEvent::UsageLoaded { server, usage });
+                    }
+                    Err(err) => {
+                        let _ = app_tx.send(AppEvent::UsageLoadFailed {
+                            server,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+            FetchRequest::ConsumeRateLimitReset {
+                server,
+                idempotency_key,
+            } => {
+                let result = consume_rate_limit_reset_cached(
+                    &targets,
+                    &mut clients,
+                    &server,
+                    idempotency_key,
+                )
+                .await;
+                match result {
+                    Ok((outcome, usage, refresh_error)) => {
+                        let _ = app_tx.send(AppEvent::RateLimitResetConsumed {
+                            server,
+                            outcome,
+                            usage,
+                            refresh_error,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = app_tx.send(AppEvent::RateLimitResetConsumeFailed {
+                            server,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -850,6 +897,256 @@ async fn load_thread_with_client(
     }
 }
 
+async fn fetch_usage_cached(
+    targets: &TuiTargets,
+    clients: &mut RpcClientCache,
+    server: &str,
+) -> Result<Value> {
+    let target = targets.get(server)?.clone();
+    let cached = clients.take(server);
+    let (result, client) = fetch_usage_with_client(target, cached).await;
+    if let Some(client) = client {
+        clients.insert(server.to_string(), client);
+    }
+    result
+}
+
+async fn fetch_usage_with_client(
+    target: Target,
+    cached: Option<RpcClient>,
+) -> (Result<Value>, Option<RpcClient>) {
+    let mut client = match cached {
+        Some(client) => client,
+        None => match RpcClient::connect(&target.endpoint).await {
+            Ok(client) => client,
+            Err(err) => return (Err(err), None),
+        },
+    };
+    let result = account_usage(&target, &mut client).await;
+    match result {
+        Ok(usage) => (Ok(usage), Some(client)),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            (Err(err), keep.then_some(client))
+        }
+    }
+}
+
+async fn consume_rate_limit_reset_cached(
+    targets: &TuiTargets,
+    clients: &mut RpcClientCache,
+    server: &str,
+    idempotency_key: String,
+) -> Result<(String, Option<Value>, Option<String>)> {
+    let target = targets.get(server)?.clone();
+    let cached = clients.take(server);
+    let (result, client) =
+        consume_rate_limit_reset_with_client(target, cached, idempotency_key).await;
+    if let Some(client) = client {
+        clients.insert(server.to_string(), client);
+    }
+    result
+}
+
+async fn consume_rate_limit_reset_with_client(
+    target: Target,
+    cached: Option<RpcClient>,
+    idempotency_key: String,
+) -> (
+    Result<(String, Option<Value>, Option<String>)>,
+    Option<RpcClient>,
+) {
+    let mut client = match cached {
+        Some(client) => client,
+        None => match RpcClient::connect(&target.endpoint).await {
+            Ok(client) => client,
+            Err(err) => return (Err(err), None),
+        },
+    };
+    let result = client
+        .request(
+            "account/rateLimitResetCredit/consume",
+            json!({ "idempotencyKey": idempotency_key }),
+            |_| {},
+        )
+        .await;
+    let outcome = match result {
+        Ok(result) => result["outcome"].as_str().unwrap_or("unknown").to_string(),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            return (Err(err), keep.then_some(client));
+        }
+    };
+    match account_usage(&target, &mut client).await {
+        Ok(usage) => (Ok((outcome, Some(usage), None)), Some(client)),
+        Err(err) => {
+            let keep = keep_client_after_error(&err);
+            (
+                Ok((outcome, None, Some(err.to_string()))),
+                keep.then_some(client),
+            )
+        }
+    }
+}
+
+async fn account_usage(target: &Target, client: &mut RpcClient) -> Result<Value> {
+    let result = client
+        .request("account/rateLimits/read", json!({}), |_| {})
+        .await?;
+    Ok(json!({
+        "server": target.server,
+        "rateLimits": result["rateLimits"],
+        "rateLimitsByLimitId": result["rateLimitsByLimitId"],
+        "rateLimitResetCredits": result["rateLimitResetCredits"],
+    }))
+}
+
+fn account_usage_snapshot(result: &Value) -> AccountUsageSnapshot {
+    let snapshots = account_usage_snapshots(result);
+    let summary = usage_summary_snapshot(result, &snapshots);
+    let plan = summary
+        .and_then(|snapshot| snapshot["planType"].as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let credits = summary
+        .and_then(|snapshot| snapshot.get("credits"))
+        .map(format_credits)
+        .unwrap_or_else(|| "unknown".to_string());
+    let limit_reached = summary
+        .and_then(|snapshot| snapshot["rateLimitReachedType"].as_str())
+        .unwrap_or("none")
+        .to_string();
+    let reset_credits = result["rateLimitResetCredits"]["availableCount"].as_i64();
+    let rows = snapshots
+        .iter()
+        .flat_map(|(limit_key, snapshot)| account_usage_window_rows(limit_key, snapshot))
+        .collect();
+    AccountUsageSnapshot {
+        plan,
+        credits,
+        limit_reached,
+        reset_credits,
+        rows,
+    }
+}
+
+fn usage_summary_snapshot<'a>(
+    result: &'a Value,
+    snapshots: &'a [(String, &'a Value)],
+) -> Option<&'a Value> {
+    if !result["rateLimits"].is_null() {
+        Some(&result["rateLimits"])
+    } else {
+        snapshots.first().map(|(_, snapshot)| *snapshot)
+    }
+}
+
+fn account_usage_snapshots(result: &Value) -> Vec<(String, &Value)> {
+    let mut snapshots = result["rateLimitsByLimitId"]
+        .as_object()
+        .map(|by_id| {
+            by_id
+                .iter()
+                .map(|(limit_id, snapshot)| (limit_id.clone(), snapshot))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    snapshots.sort_by(|left, right| left.0.cmp(&right.0));
+    if snapshots.is_empty() && !result["rateLimits"].is_null() {
+        let fallback_id = result["rateLimits"]["limitId"]
+            .as_str()
+            .unwrap_or("codex")
+            .to_string();
+        snapshots.push((fallback_id, &result["rateLimits"]));
+    }
+    snapshots
+}
+
+fn account_usage_window_rows(limit_key: &str, snapshot: &Value) -> Vec<AccountUsageRow> {
+    let limit = usage_limit_label(limit_key, snapshot);
+    let reached = snapshot["rateLimitReachedType"]
+        .as_str()
+        .unwrap_or("none")
+        .to_string();
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|window_name| {
+            let window = snapshot.get(window_name)?;
+            if window.is_null() {
+                return None;
+            }
+            Some(AccountUsageRow {
+                limit: limit.clone(),
+                window: window_name.to_string(),
+                used: format_used_percent(&window["usedPercent"]),
+                reached: reached.clone(),
+                resets: format_usage_epoch(window["resetsAt"].as_i64()),
+                duration: format_duration_mins(window["windowDurationMins"].as_i64()),
+            })
+        })
+        .collect()
+}
+
+fn usage_limit_label(limit_key: &str, snapshot: &Value) -> String {
+    let limit_id = snapshot["limitId"].as_str().unwrap_or(limit_key);
+    match snapshot["limitName"].as_str() {
+        Some(name) if name != limit_id => format!("{name} ({limit_id})"),
+        Some(name) => name.to_string(),
+        None => limit_id.to_string(),
+    }
+}
+
+fn format_credits(credits: &Value) -> String {
+    if credits["unlimited"].as_bool().unwrap_or(false) {
+        return "unlimited".to_string();
+    }
+    match (
+        credits["hasCredits"].as_bool(),
+        credits["balance"]
+            .as_str()
+            .filter(|balance| !balance.is_empty()),
+    ) {
+        (Some(true), Some(balance)) => balance.to_string(),
+        (Some(true), None) => "available".to_string(),
+        (Some(false), Some(balance)) => format!("depleted ({balance})"),
+        (Some(false), None) => "depleted".to_string(),
+        (None, Some(balance)) => balance.to_string(),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+fn format_used_percent(value: &Value) -> String {
+    if let Some(percent) = value.as_i64() {
+        return format!("{percent}%");
+    }
+    if let Some(percent) = value.as_f64() {
+        return format!("{percent:.0}%");
+    }
+    "unknown".to_string()
+}
+
+fn format_usage_epoch(timestamp: Option<i64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "unknown".to_string();
+    };
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn format_duration_mins(minutes: Option<i64>) -> String {
+    match minutes {
+        Some(1) => "1 min".to_string(),
+        Some(minutes) => format!("{minutes} mins"),
+        None => "unknown".to_string(),
+    }
+}
+
 async fn fetch_preview_cached(
     targets: &TuiTargets,
     clients: &mut RpcClientCache,
@@ -1029,6 +1326,27 @@ async fn schedule_thread_load(
             Ok(())
         }
     }
+}
+
+async fn schedule_usage_load(fetch_tx: &mpsc::Sender<FetchRequest>, server: String) -> Result<()> {
+    fetch_tx
+        .try_send(FetchRequest::Usage { server })
+        .map_err(|err| usage_error(format!("failed to schedule usage load: {err}")))?;
+    Ok(())
+}
+
+async fn schedule_rate_limit_reset_consume(
+    fetch_tx: &mpsc::Sender<FetchRequest>,
+    server: String,
+    idempotency_key: String,
+) -> Result<()> {
+    fetch_tx
+        .try_send(FetchRequest::ConsumeRateLimitReset {
+            server,
+            idempotency_key,
+        })
+        .map_err(|err| usage_error(format!("failed to schedule rate-limit reset: {err}")))?;
+    Ok(())
 }
 
 async fn schedule_browser_reset(
@@ -1290,6 +1608,12 @@ async fn handle_terminal_event(
         return Ok(TerminalEventOutcome::none());
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        if let Mode::Usage(usage) = &mut state.mode
+            && usage.redeeming
+        {
+            usage.message = Some("Wait for reset redemption to finish.".to_string());
+            return Ok(TerminalEventOutcome::none());
+        }
         if let Some(stream) = &state.stream
             && matches!(
                 stream.status,
@@ -1608,6 +1932,116 @@ async fn handle_terminal_event(
             }
             return Ok(TerminalEventOutcome::none());
         }
+        Mode::Usage(mut usage) => {
+            match key.code {
+                KeyCode::Esc if usage.redeeming => {
+                    usage.message = Some("Wait for reset redemption to finish.".to_string());
+                    state.mode = Mode::Usage(usage);
+                }
+                KeyCode::Esc => state.mode = usage_return_mode(&usage),
+                KeyCode::Char('r') if usage.redeeming => {
+                    usage.message = Some("Wait for reset redemption to finish.".to_string());
+                    state.mode = Mode::Usage(usage);
+                }
+                KeyCode::Char('r') => {
+                    usage.loading = true;
+                    usage.error = None;
+                    if let Err(err) = schedule_usage_load(fetch_tx, usage.server.clone()).await {
+                        usage.loading = false;
+                        usage.error = Some(err.to_string());
+                        state.set_notice(err.to_string());
+                    }
+                    state.mode = Mode::Usage(usage);
+                }
+                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                    usage.selected = usage.selected.next();
+                    state.mode = Mode::Usage(usage);
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    usage.selected = usage.selected.previous();
+                    state.mode = Mode::Usage(usage);
+                }
+                KeyCode::Enter => match usage.selected {
+                    UsageAction::Close if usage.redeeming => {
+                        usage.message = Some("Wait for reset redemption to finish.".to_string());
+                        state.mode = Mode::Usage(usage);
+                    }
+                    UsageAction::Close => state.mode = usage_return_mode(&usage),
+                    UsageAction::Refresh if usage.redeeming => {
+                        usage.message = Some("Wait for reset redemption to finish.".to_string());
+                        state.mode = Mode::Usage(usage);
+                    }
+                    UsageAction::Refresh => {
+                        usage.loading = true;
+                        usage.error = None;
+                        if let Err(err) = schedule_usage_load(fetch_tx, usage.server.clone()).await
+                        {
+                            usage.loading = false;
+                            usage.error = Some(err.to_string());
+                            state.set_notice(err.to_string());
+                        }
+                        state.mode = Mode::Usage(usage);
+                    }
+                    UsageAction::Redeem => {
+                        if usage.redeeming || usage.loading {
+                            state.mode = Mode::Usage(usage);
+                        } else if usage.reset_count().unwrap_or(0) > 0 {
+                            state.mode = Mode::ConfirmRateLimitReset {
+                                usage,
+                                selected: ResetConfirmSelection::Cancel,
+                            };
+                        } else {
+                            usage.message = Some("No banked resets available.".to_string());
+                            state.mode = Mode::Usage(usage);
+                        }
+                    }
+                },
+                _ => state.mode = Mode::Usage(usage),
+            }
+            return Ok(TerminalEventOutcome::none());
+        }
+        Mode::ConfirmRateLimitReset {
+            mut usage,
+            mut selected,
+        } => {
+            match key.code {
+                KeyCode::Esc => state.mode = Mode::Usage(usage),
+                KeyCode::Tab
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('h')
+                | KeyCode::Char('l') => {
+                    selected = selected.toggle();
+                    state.mode = Mode::ConfirmRateLimitReset { usage, selected };
+                }
+                KeyCode::Enter => match selected {
+                    ResetConfirmSelection::Cancel => state.mode = Mode::Usage(usage),
+                    ResetConfirmSelection::Redeem => {
+                        usage.redeeming = true;
+                        usage.error = None;
+                        usage.message = Some("Redeeming rate-limit reset...".to_string());
+                        let server = usage.server.clone();
+                        let idempotency_key = usage
+                            .reset_idempotency_key
+                            .clone()
+                            .unwrap_or_else(create_rate_limit_reset_idempotency_key);
+                        usage.reset_idempotency_key = Some(idempotency_key.clone());
+                        if let Err(err) =
+                            schedule_rate_limit_reset_consume(fetch_tx, server, idempotency_key)
+                                .await
+                        {
+                            usage.redeeming = false;
+                            usage.error = Some(err.to_string());
+                            usage.message = Some("Reset was not scheduled.".to_string());
+                            state.set_notice(err.to_string());
+                        }
+                        state.mode = Mode::Usage(usage);
+                    }
+                },
+                _ => state.mode = Mode::ConfirmRateLimitReset { usage, selected },
+            }
+            return Ok(TerminalEventOutcome::none());
+        }
         Mode::Help => {
             state.mode = Mode::Browser;
             return Ok(TerminalEventOutcome::none());
@@ -1792,6 +2226,22 @@ async fn handle_terminal_event(
             }
             _ => {}
         },
+        KeyCode::Char('u') if matches!(state.mode, Mode::Browser | Mode::Detail) => {
+            if let Some(server) = active_server_or_default(state, targets) {
+                let return_to_detail = matches!(state.mode, Mode::Detail);
+                state.mode =
+                    Mode::Usage(UsageModalState::loading(server.clone(), return_to_detail));
+                if let Err(err) = schedule_usage_load(fetch_tx, server).await {
+                    if let Mode::Usage(usage) = &mut state.mode {
+                        usage.loading = false;
+                        usage.error = Some(err.to_string());
+                    }
+                    state.set_notice(err.to_string());
+                }
+            } else {
+                state.set_notice("no server available for usage");
+            }
+        }
         KeyCode::Char('f') if matches!(state.mode, Mode::Browser) => state.mode = Mode::FilterMenu,
         KeyCode::Char('c') if matches!(state.mode, Mode::Browser) => state.mode = Mode::ColumnsMenu,
         KeyCode::Char('t') => {
@@ -1877,6 +2327,14 @@ async fn handle_goto_key(
             state.pending_goto_top = false;
             Ok(false)
         }
+    }
+}
+
+fn usage_return_mode(usage: &UsageModalState) -> Mode {
+    if usage.return_to_detail {
+        Mode::Detail
+    } else {
+        Mode::Browser
     }
 }
 
@@ -2243,6 +2701,18 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
         | Mode::ConfirmOpenCodex {
             return_to_detail: true,
             ..
+        }
+        | Mode::Usage(UsageModalState {
+            return_to_detail: true,
+            ..
+        })
+        | Mode::ConfirmRateLimitReset {
+            usage:
+                UsageModalState {
+                    return_to_detail: true,
+                    ..
+                },
+            ..
         } => scroll_detail(state, delta),
         Mode::Browser
         | Mode::SearchInput { .. }
@@ -2263,6 +2733,18 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> bool {
         }
         | Mode::ConfirmOpenCodex {
             return_to_detail: false,
+            ..
+        }
+        | Mode::Usage(UsageModalState {
+            return_to_detail: false,
+            ..
+        })
+        | Mode::ConfirmRateLimitReset {
+            usage:
+                UsageModalState {
+                    return_to_detail: false,
+                    ..
+                },
             ..
         } => {
             state.move_selection(delta);
@@ -3617,6 +4099,49 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
         } => {
             state.set_notice(format!("failed to load {server}/{thread_id}: {error}"));
         }
+        AppEvent::UsageLoaded { server, usage } => {
+            apply_usage_loaded(state, server, usage, None);
+        }
+        AppEvent::UsageLoadFailed { server, error } => {
+            apply_usage_error(state, &server, error);
+        }
+        AppEvent::RateLimitResetConsumed {
+            server,
+            outcome,
+            usage,
+            refresh_error,
+        } => {
+            let message = reset_outcome_message(&outcome).to_string();
+            if let Some(usage) = usage {
+                apply_usage_loaded(state, server.clone(), usage, Some(message.clone()));
+            } else {
+                apply_usage_error(
+                    state,
+                    &server,
+                    refresh_error
+                        .clone()
+                        .unwrap_or_else(|| "usage refresh failed after reset".to_string()),
+                );
+                if let Mode::Usage(usage) = &mut state.mode
+                    && usage.server == server
+                {
+                    usage.invalidate_reset_availability();
+                    usage.clear_reset_idempotency_key();
+                    usage.message = Some(message.clone());
+                    usage.redeeming = false;
+                }
+            }
+            state.set_notice(message);
+        }
+        AppEvent::RateLimitResetConsumeFailed { server, error } => {
+            if let Mode::Usage(usage) = &mut state.mode
+                && usage.server == server
+            {
+                usage.redeeming = false;
+                usage.message = Some(format!("Reset failed: {error}"));
+            }
+            state.set_notice(format!("reset failed: {error}"));
+        }
         AppEvent::SessionCreated {
             stream_id,
             server,
@@ -3969,6 +4494,42 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
             detach_stream(state);
             state.should_quit = true;
         }
+    }
+}
+
+fn apply_usage_loaded(state: &mut TuiState, server: String, usage: Value, message: Option<String>) {
+    let snapshot = account_usage_snapshot(&usage);
+    if let Mode::Usage(modal) = &mut state.mode
+        && modal.server == server
+    {
+        modal.loading = false;
+        modal.redeeming = false;
+        modal.error = None;
+        modal.snapshot = Some(snapshot);
+        if let Some(message) = message {
+            modal.clear_reset_idempotency_key();
+            modal.message = Some(message);
+        }
+    }
+}
+
+fn apply_usage_error(state: &mut TuiState, server: &str, error: String) {
+    if let Mode::Usage(modal) = &mut state.mode
+        && modal.server == server
+    {
+        modal.loading = false;
+        modal.redeeming = false;
+        modal.error = Some(error);
+    }
+}
+
+fn reset_outcome_message(outcome: &str) -> &'static str {
+    match outcome {
+        "reset" => "Codex rate limits reset.",
+        "alreadyRedeemed" => "Reset already applied.",
+        "nothingToReset" => "No active Codex limit to reset.",
+        "noCredit" => "No banked resets available.",
+        _ => "Reset response was not recognized.",
     }
 }
 
@@ -5009,6 +5570,21 @@ fn active_thread_key(state: &TuiState) -> Option<(String, String)> {
             .map(|detail| (detail.server.clone(), detail.thread_id.clone())),
         _ => state.selected_thread_key(),
     }
+}
+
+fn active_server_or_default(state: &TuiState, targets: &TuiTargets) -> Option<String> {
+    active_thread_key(state)
+        .map(|(server, _)| server)
+        .or_else(|| state.detail.as_ref().map(|detail| detail.server.clone()))
+        .or_else(|| targets.first_server())
+}
+
+fn create_rate_limit_reset_idempotency_key() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("codex-threads-{millis}-{}", std::process::id())
 }
 
 fn active_thread_cwd(state: &TuiState, server: &str, thread_id: &str) -> Option<String> {
@@ -10784,6 +11360,424 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::empty())
     }
 
+    #[tokio::test]
+    async fn usage_shortcut_opens_modal_and_schedules_usage_load() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        state.browser.rows = vec![test_thread_row("t1", "idle")];
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Char('u'))),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert_eq!(usage.server, "work");
+        assert!(usage.loading);
+        assert!(!usage.return_to_detail);
+
+        let FetchRequest::Usage { server } = fetch_rx.recv().await.expect("usage request") else {
+            panic!("expected usage request");
+        };
+        assert_eq!(server, "work");
+    }
+
+    #[tokio::test]
+    async fn usage_redeem_action_opens_confirmation_with_cancel_selected() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        state.mode = Mode::Usage(usage_modal_with_reset_count(1, UsageAction::Redeem));
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Enter)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::ConfirmRateLimitReset { selected, .. } = &state.mode else {
+            panic!("expected reset confirmation");
+        };
+        assert_eq!(*selected, ResetConfirmSelection::Cancel);
+        assert!(fetch_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn usage_reset_confirmation_cancel_does_not_schedule_redemption() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        state.mode = Mode::ConfirmRateLimitReset {
+            usage: usage_modal_with_reset_count(1, UsageAction::Redeem),
+            selected: ResetConfirmSelection::Cancel,
+        };
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Enter)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Usage(_)));
+        assert!(fetch_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn usage_reset_confirmation_redeem_schedules_redemption() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        state.mode = Mode::ConfirmRateLimitReset {
+            usage: usage_modal_with_reset_count(1, UsageAction::Redeem),
+            selected: ResetConfirmSelection::Cancel,
+        };
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Tab)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Enter)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert!(usage.redeeming);
+        assert_eq!(
+            usage.message.as_deref(),
+            Some("Redeeming rate-limit reset...")
+        );
+        let stored_idempotency_key = usage.reset_idempotency_key.clone();
+
+        let FetchRequest::ConsumeRateLimitReset {
+            server,
+            idempotency_key,
+        } = fetch_rx.recv().await.expect("consume request")
+        else {
+            panic!("expected consume request");
+        };
+        assert_eq!(server, "work");
+        assert!(idempotency_key.starts_with("codex-threads-"));
+        assert_eq!(
+            stored_idempotency_key.as_deref(),
+            Some(idempotency_key.as_str())
+        );
+    }
+
+    #[test]
+    fn consumed_rate_limit_reset_refreshes_usage_modal() {
+        let mut state = test_state();
+        state.mode = Mode::Usage(usage_modal_with_reset_count(1, UsageAction::Redeem));
+        let Mode::Usage(usage) = &mut state.mode else {
+            panic!("expected usage modal");
+        };
+        usage.redeeming = true;
+
+        handle_app_event(
+            AppEvent::RateLimitResetConsumed {
+                server: "work".to_string(),
+                outcome: "reset".to_string(),
+                usage: Some(usage_response(0)),
+                refresh_error: None,
+            },
+            &mut state,
+        );
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert!(!usage.redeeming);
+        assert_eq!(usage.reset_count(), Some(0));
+        assert_eq!(usage.message.as_deref(), Some("Codex rate limits reset."));
+        assert_eq!(
+            state.notice.as_ref().map(|notice| notice.message.as_str()),
+            Some("Codex rate limits reset.")
+        );
+        assert!(usage.reset_idempotency_key.is_none());
+    }
+
+    #[test]
+    fn failed_rate_limit_reset_preserves_idempotency_key_for_retry() {
+        let mut state = test_state();
+        let mut usage = usage_modal_with_reset_count(1, UsageAction::Redeem);
+        usage.redeeming = true;
+        usage.reset_idempotency_key = Some("retry-key".to_string());
+        state.mode = Mode::Usage(usage);
+
+        handle_app_event(
+            AppEvent::RateLimitResetConsumeFailed {
+                server: "work".to_string(),
+                error: "connection lost".to_string(),
+            },
+            &mut state,
+        );
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert!(!usage.redeeming);
+        assert_eq!(usage.reset_idempotency_key.as_deref(), Some("retry-key"));
+        assert_eq!(
+            usage.message.as_deref(),
+            Some("Reset failed: connection lost")
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_retry_reuses_failed_attempt_idempotency_key() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut usage = usage_modal_with_reset_count(1, UsageAction::Redeem);
+        usage.reset_idempotency_key = Some("retry-key".to_string());
+        let mut state = test_state();
+        state.mode = Mode::ConfirmRateLimitReset {
+            usage,
+            selected: ResetConfirmSelection::Redeem,
+        };
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Enter)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let FetchRequest::ConsumeRateLimitReset {
+            server,
+            idempotency_key,
+        } = fetch_rx.recv().await.expect("consume request")
+        else {
+            panic!("expected consume request");
+        };
+        assert_eq!(server, "work");
+        assert_eq!(idempotency_key, "retry-key");
+    }
+
+    #[test]
+    fn consumed_rate_limit_reset_with_refresh_error_disables_stale_redeem() {
+        let mut state = test_state();
+        let mut usage = usage_modal_with_reset_count(2, UsageAction::Redeem);
+        usage.redeeming = true;
+        usage.reset_idempotency_key = Some("completed-key".to_string());
+        state.mode = Mode::Usage(usage);
+
+        handle_app_event(
+            AppEvent::RateLimitResetConsumed {
+                server: "work".to_string(),
+                outcome: "reset".to_string(),
+                usage: None,
+                refresh_error: Some("usage refresh failed".to_string()),
+            },
+            &mut state,
+        );
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert!(!usage.redeeming);
+        assert_eq!(usage.reset_count(), None);
+        assert!(usage.reset_idempotency_key.is_none());
+        assert_eq!(usage.message.as_deref(), Some("Codex rate limits reset."));
+        assert_eq!(usage.error.as_deref(), Some("usage refresh failed"));
+    }
+
+    #[test]
+    fn plain_usage_refresh_preserves_failed_reset_retry_key() {
+        let mut state = test_state();
+        let mut usage = usage_modal_with_reset_count(1, UsageAction::Redeem);
+        usage.reset_idempotency_key = Some("retry-key".to_string());
+        state.mode = Mode::Usage(usage);
+
+        handle_app_event(
+            AppEvent::UsageLoaded {
+                server: "work".to_string(),
+                usage: usage_response(1),
+            },
+            &mut state,
+        );
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert_eq!(usage.reset_idempotency_key.as_deref(), Some("retry-key"));
+    }
+
+    #[tokio::test]
+    async fn reset_schedule_failure_stays_in_usage_modal() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        fetch_tx
+            .try_send(FetchRequest::Usage {
+                server: "work".to_string(),
+            })
+            .unwrap();
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        state.mode = Mode::ConfirmRateLimitReset {
+            usage: usage_modal_with_reset_count(1, UsageAction::Redeem),
+            selected: ResetConfirmSelection::Redeem,
+        };
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Enter)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert!(!usage.redeeming);
+        assert!(
+            usage
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("failed to schedule")
+        );
+        assert_eq!(usage.message.as_deref(), Some("Reset was not scheduled."));
+        assert!(matches!(
+            fetch_rx.try_recv().unwrap(),
+            FetchRequest::Usage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn usage_modal_cannot_close_while_reset_redemption_is_in_flight() {
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut usage = usage_modal_with_reset_count(1, UsageAction::Close);
+        usage.redeeming = true;
+        usage.reset_idempotency_key = Some("in-flight-key".to_string());
+        let mut state = test_state();
+        state.mode = Mode::Usage(usage);
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Esc)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert_eq!(
+            usage.message.as_deref(),
+            Some("Wait for reset redemption to finish.")
+        );
+        assert_eq!(
+            usage.reset_idempotency_key.as_deref(),
+            Some("in-flight-key")
+        );
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Enter)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert_eq!(
+            usage.reset_idempotency_key.as_deref(),
+            Some("in-flight-key")
+        );
+        assert!(fetch_rx.try_recv().is_err());
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        let Mode::Usage(usage) = &state.mode else {
+            panic!("expected usage modal");
+        };
+        assert!(!state.should_quit);
+        assert_eq!(
+            usage.reset_idempotency_key.as_deref(),
+            Some("in-flight-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_esc_returns_to_detail_when_opened_from_detail() {
+        let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        let mut state = test_state();
+        state.mode = Mode::Usage(UsageModalState::loading("work".to_string(), true));
+
+        handle_terminal_event(
+            Event::Key(plain_key(KeyCode::Esc)),
+            &mut state,
+            &test_targets(),
+            false,
+            &fetch_tx,
+            &app_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(state.mode, Mode::Detail));
+    }
+
     #[test]
     fn refresh_results_only_touch_metadata_on_stream_owned_threads() {
         let mut state = TuiState::new(TuiInit {
@@ -11135,6 +12129,58 @@ mod tests {
             message_text(&state.browser.preview.messages[0]),
             "hello there"
         );
+    }
+
+    fn test_state() -> TuiState {
+        TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        })
+    }
+
+    fn usage_response(reset_credits: i64) -> Value {
+        serde_json::json!({
+            "server": "work",
+            "rateLimitResetCredits": {"availableCount": reset_credits},
+            "rateLimits": {
+                "limitId": "codex",
+                "limitName": "Codex",
+                "planType": "pro",
+                "credits": {"hasCredits": true, "balance": "42"},
+                "rateLimitReachedType": "none",
+                "primary": {
+                    "usedPercent": 25,
+                    "resetsAt": 1781740800,
+                    "windowDurationMins": 300
+                },
+                "secondary": {
+                    "usedPercent": 10,
+                    "resetsAt": 1781744400,
+                    "windowDurationMins": 1440
+                }
+            },
+            "rateLimitsByLimitId": {}
+        })
+    }
+
+    fn usage_modal_with_reset_count(reset_credits: i64, selected: UsageAction) -> UsageModalState {
+        UsageModalState {
+            server: "work".to_string(),
+            return_to_detail: false,
+            loading: false,
+            redeeming: false,
+            snapshot: Some(account_usage_snapshot(&usage_response(reset_credits))),
+            error: None,
+            message: None,
+            selected,
+            reset_idempotency_key: None,
+        }
     }
 
     fn test_thread_row(id: &str, status: &str) -> ThreadRow {

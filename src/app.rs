@@ -1300,6 +1300,7 @@ async fn usage_command(
         "server": target.server,
         "rateLimits": result["rateLimits"],
         "rateLimitsByLimitId": result["rateLimitsByLimitId"],
+        "rateLimitResetCredits": result["rateLimitResetCredits"],
     });
     if command.json {
         print_json(&output)?;
@@ -1528,10 +1529,12 @@ fn print_usage(result: &Value) {
         .and_then(|snapshot| snapshot.get("credits"))
         .map(format_credits)
         .unwrap_or_else(|| "unknown".to_string());
+    let reset_credits = format_rate_limit_reset_credits(result);
     let key_values = [
         ("server", result["server"].as_str().unwrap_or("")),
         ("plan", plan),
         ("credits", credits.as_str()),
+        ("resetCredits", reset_credits.as_str()),
         ("limitReached", reached),
     ];
     print_key_values(&key_values);
@@ -1632,6 +1635,13 @@ fn format_credits(credits: &Value) -> String {
         (Some(false), None) => "depleted".to_string(),
         (None, Some(balance)) => balance.to_string(),
         (None, None) => "unknown".to_string(),
+    }
+}
+
+fn format_rate_limit_reset_credits(result: &Value) -> String {
+    match result["rateLimitResetCredits"]["availableCount"].as_i64() {
+        Some(count) => count.to_string(),
+        None => "unknown".to_string(),
     }
 }
 

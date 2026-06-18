@@ -233,7 +233,11 @@ visible columns and updated-time display, `a` to annotate, `e` to rename, `A`
 to confirm archive or unarchive,
 `i` to confirm interrupting the selected active thread, `r` to refresh, `y` to copy the active thread id
 with OSC 52, `o` to confirm opening the active thread in Codex's own TUI, and
-`m` to compose. Use
+`u` to show Codex account usage. The usage modal shows plan, credits,
+reset-credit availability, and rate-limit windows for the active server; when
+banked reset credits are available, the `Redeem reset...` action opens a
+confirmation dialog that defaults to `Cancel` before calling Codex app-server's
+reset-credit redemption RPC. Use
 `l` to explicitly load the selected or open thread, matching
 `status THREAD_ID --load`, then refresh visible metadata and history.
 In the browser, `n` creates a new session: pick the server when more than one
@@ -548,10 +552,11 @@ does not resume unloaded threads; `status THREAD_ID --load` explicitly calls
 `thread/resume` with `excludeTurns: true`, unsubscribes the probing connection,
 then reports status from the loaded app-server view.
 
-`usage --json` returns `{ server, rateLimits, rateLimitsByLimitId }` from
-Codex app-server's `account/rateLimits/read` response. Human output summarizes
-the server, plan, credits, rate-limit reached state, and primary/secondary
-windows for each limit ID.
+`usage --json` returns `{ server, rateLimits, rateLimitsByLimitId,
+rateLimitResetCredits }` from Codex app-server's `account/rateLimits/read`
+response. Human output summarizes the server, plan, credits, reset-credit
+count, rate-limit reached state, and primary/secondary windows for each limit
+ID.
 
 Annotations are local `codex-threads` state, not Codex app-server state. The
 state file is resolved as:
