@@ -8,8 +8,9 @@ use crate::tui::keymap::{
     BROWSER_HELP, COMPOSE_HELP, DEFAULT_HELP, DETAIL_CONNECTED_HELP, DETAIL_HELP,
 };
 use crate::tui::state::{
-    BrowserSource, ComposeState, ComposeTarget, Mode, SendMode, StreamStatus, TuiState,
-    message_header_visible, transcript_rendered_line_count,
+    AccountUsageSnapshot, BrowserSource, ComposeState, ComposeTarget, Mode, ResetConfirmSelection,
+    SendMode, StreamStatus, TuiState, UsageAction, UsageModalState, message_header_visible,
+    transcript_rendered_line_count,
 };
 use crate::tui::state::{MessageColor, MessageLine, MessageLineKind, MessageSpan};
 
@@ -41,6 +42,17 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
             }
             | Mode::ConfirmOpenCodex {
                 return_to_detail: true,
+                ..
+            }
+            | Mode::Usage(UsageModalState {
+                return_to_detail: true,
+                ..
+            })
+            | Mode::ConfirmRateLimitReset {
+                usage: UsageModalState {
+                    return_to_detail: true,
+                    ..
+                },
                 ..
             }
     ) || (matches!(
@@ -107,6 +119,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         }
         Mode::ConfirmOpenCodex { thread_id, cwd, .. } => {
             draw_confirm_open_codex(frame, area, thread_id, cwd);
+        }
+        Mode::Usage(usage) => {
+            draw_usage_modal(frame, area, usage);
+        }
+        Mode::ConfirmRateLimitReset { usage, selected } => {
+            draw_usage_modal(frame, area, usage);
+            draw_confirm_rate_limit_reset(frame, area, *selected);
         }
         Mode::NewSessionServerMenu {
             servers, selected, ..
@@ -1083,6 +1102,194 @@ fn draw_confirm_open_codex(frame: &mut Frame<'_>, area: Rect, thread_id: &str, c
     );
 }
 
+fn draw_usage_modal(frame: &mut Frame<'_>, area: Rect, usage: &UsageModalState) {
+    let modal = centered_rect(area, 88, area.height.saturating_sub(4).clamp(12, 24));
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Block::default()
+            .title(format!("Codex Usage - {}", usage.server))
+            .title_bottom(Line::from(Span::styled(
+                "Tab/arrow select  Enter activate  r refresh  Esc close",
+                Style::default().fg(Color::Gray),
+            )))
+            .borders(Borders::ALL),
+        modal,
+    );
+    let inner = modal.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    draw_usage_summary(frame, chunks[0], usage);
+    draw_usage_table(frame, chunks[1], usage.snapshot.as_ref());
+    draw_usage_actions(frame, chunks[2], usage);
+}
+
+fn draw_usage_summary(frame: &mut Frame<'_>, area: Rect, usage: &UsageModalState) {
+    let mut lines = Vec::new();
+    if usage.loading && usage.snapshot.is_none() {
+        lines.push(Line::from("Loading usage..."));
+    } else if let Some(snapshot) = &usage.snapshot {
+        lines.push(Line::from(vec![
+            Span::styled("plan ", Style::default().fg(Color::Gray)),
+            Span::raw(snapshot.plan.clone()),
+            Span::styled("   credits ", Style::default().fg(Color::Gray)),
+            Span::raw(snapshot.credits.clone()),
+            Span::styled("   resetCredits ", Style::default().fg(Color::Gray)),
+            Span::raw(
+                snapshot
+                    .reset_credits
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("limitReached ", Style::default().fg(Color::Gray)),
+            Span::raw(snapshot.limit_reached.clone()),
+            Span::raw(if usage.loading {
+                "   refreshing..."
+            } else {
+                ""
+            }),
+            Span::raw(if usage.redeeming {
+                "   redeeming..."
+            } else {
+                ""
+            }),
+        ]));
+    }
+    if let Some(error) = &usage.error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some(message) = &usage.message {
+        lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_usage_table(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&AccountUsageSnapshot>) {
+    let rows = snapshot
+        .map(|snapshot| {
+            snapshot
+                .rows
+                .iter()
+                .map(|row| {
+                    Row::new(vec![
+                        Cell::from(row.limit.clone()),
+                        Cell::from(row.window.clone()),
+                        Cell::from(row.used.clone()),
+                        Cell::from(row.reached.clone()),
+                        Cell::from(row.resets.clone()),
+                        Cell::from(row.duration.clone()),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![Row::new(vec![Cell::from("no usage data")])]);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(18),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(16),
+            Constraint::Length(20),
+            Constraint::Length(12),
+        ],
+    )
+    .header(
+        Row::new(["LIMIT", "WINDOW", "USED", "REACHED", "RESETS", "DURATION"])
+            .style(Style::default().fg(Color::Yellow)),
+    )
+    .column_spacing(1)
+    .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(table, area);
+}
+
+fn draw_usage_actions(frame: &mut Frame<'_>, area: Rect, usage: &UsageModalState) {
+    let reset_count = usage.reset_count().unwrap_or(0);
+    let redeem_enabled = reset_count > 0 && !usage.loading && !usage.redeeming;
+    let actions = [
+        (UsageAction::Close, "Close", true),
+        (
+            UsageAction::Refresh,
+            "Refresh",
+            !usage.loading && !usage.redeeming,
+        ),
+        (UsageAction::Redeem, "Redeem reset...", redeem_enabled),
+    ];
+    let spans = actions
+        .into_iter()
+        .flat_map(|(action, label, enabled)| {
+            let selected = usage.selected == action;
+            let style = if selected && enabled {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else if selected {
+                Style::default().fg(Color::DarkGray).bg(Color::White)
+            } else if enabled {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            [Span::styled(format!(" {label} "), style), Span::raw("  ")]
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_confirm_rate_limit_reset(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected: ResetConfirmSelection,
+) {
+    let area = centered_rect(area, 64, 8);
+    frame.render_widget(Clear, area);
+    let cancel_style = if selected == ResetConfirmSelection::Cancel {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let redeem_style = if selected == ResetConfirmSelection::Redeem {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let lines = vec![
+        Line::from("This consumes one banked Codex rate-limit reset."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Cancel ", cancel_style),
+            Span::raw("  "),
+            Span::styled(" Redeem ", redeem_style),
+        ]),
+        Line::from(Span::styled(
+            "Tab/arrow select  Enter activate  Esc cancel",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Redeem Rate-Limit Reset")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
 fn draw_static_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String]) {
     let height = (lines.len() as u16 + 2).max(5);
     let area = centered_rect(area, 70, height);
@@ -1106,7 +1313,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let items = [
         "Global",
         "  ? help  q quit  Ctrl-C quit or interrupt active stream",
-        "  r refresh or poll active stream  R reload/reset  l load thread  y copy thread id",
+        "  r refresh or poll active stream  R reload/reset  u usage  l load thread  y copy thread id",
         "  j/k, arrows, or mouse wheel move/scroll  gg/Home top  G/End bottom",
         "  Browser: [ previous page  ] next page",
         "",
@@ -1138,6 +1345,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Interrupt confirmation: Enter interrupt, Esc cancel",
         "  Archive confirmation: Enter archive/unarchive, Esc cancel",
         "  Open in Codex confirmation: Enter launch, Esc cancel",
+        "  Usage: Tab/arrow select, Enter activate, Esc close; reset confirmation defaults to Cancel",
     ];
     frame.render_widget(
         Paragraph::new(items.join("\n"))
@@ -1203,8 +1411,8 @@ mod tests {
 
     use crate::tui::prefs::TuiPrefs;
     use crate::tui::state::{
-        ComposeState, DetailState, MessageBlock, MessageLine, MessageLineKind, Mode, StreamState,
-        ThreadRow, TuiInit, TuiState,
+        AccountUsageRow, ComposeState, DetailState, MessageBlock, MessageLine, MessageLineKind,
+        Mode, StreamState, ThreadRow, TuiInit, TuiState,
     };
 
     use super::*;
@@ -1512,6 +1720,114 @@ mod tests {
         assert!(text.contains("Esc detach/browser"));
         assert!(text.contains("r poll"));
         assert!(!text.contains("T/S/i"));
+    }
+
+    #[test]
+    fn usage_modal_renders_summary_table_and_actions() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::Usage(UsageModalState {
+            server: "work".to_string(),
+            return_to_detail: false,
+            loading: false,
+            redeeming: false,
+            snapshot: Some(AccountUsageSnapshot {
+                plan: "pro".to_string(),
+                credits: "42".to_string(),
+                limit_reached: "none".to_string(),
+                reset_credits: Some(3),
+                rows: vec![AccountUsageRow {
+                    limit: "Codex".to_string(),
+                    window: "primary".to_string(),
+                    used: "25%".to_string(),
+                    reached: "none".to_string(),
+                    resets: "2026-06-18 10:00:00".to_string(),
+                    duration: "300 mins".to_string(),
+                }],
+            }),
+            error: None,
+            message: Some("Codex rate limits reset.".to_string()),
+            selected: UsageAction::Redeem,
+            reset_idempotency_key: None,
+        });
+
+        let backend = TestBackend::new(140, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Codex Usage - work"));
+        assert!(text.contains("resetCredits"));
+        assert!(text.contains("Codex"));
+        assert!(text.contains("primary"));
+        assert!(text.contains("25%"));
+        assert!(text.contains("Redeem reset..."));
+        assert!(text.contains("Codex rate limits reset."));
+    }
+
+    #[test]
+    fn rate_limit_reset_confirmation_renders_default_cancel_action() {
+        let mut state = TuiState::new(TuiInit {
+            query: None,
+            since: None,
+            cwd: None,
+            archived: false,
+            limit: 50,
+            sort: None,
+            descending: true,
+            prefs: TuiPrefs::default(),
+        });
+        state.mode = Mode::ConfirmRateLimitReset {
+            usage: UsageModalState {
+                server: "work".to_string(),
+                return_to_detail: false,
+                loading: false,
+                redeeming: false,
+                snapshot: Some(AccountUsageSnapshot {
+                    plan: "pro".to_string(),
+                    credits: "42".to_string(),
+                    limit_reached: "none".to_string(),
+                    reset_credits: Some(1),
+                    rows: Vec::new(),
+                }),
+                error: None,
+                message: None,
+                selected: UsageAction::Redeem,
+                reset_idempotency_key: None,
+            },
+            selected: ResetConfirmSelection::Cancel,
+        };
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Redeem Rate-Limit Reset"));
+        assert!(text.contains("consumes one banked Codex rate-limit reset"));
+        assert!(text.contains("Cancel"));
+        assert!(text.contains("Redeem"));
+        assert!(text.contains("Esc cancel"));
     }
 
     #[test]

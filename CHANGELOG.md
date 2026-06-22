@@ -2,7 +2,12 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Show Codex rate-limit reset-credit availability in `usage` output when
+  provided by app-server.
+- Add a TUI usage modal with reset-credit display and explicit confirmation
+  before redeeming a banked Codex rate-limit reset.
 
 ## [0.2.0] - 2026-06-15
 

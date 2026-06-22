@@ -739,6 +739,9 @@ fn sample_usage() -> Value {
             "planType": "pro",
             "rateLimitReachedType": null
         },
+        "rateLimitResetCredits": {
+            "availableCount": 2
+        },
         "rateLimitsByLimitId": {
             "codex": {
                 "limitId": "codex",
@@ -1491,6 +1494,7 @@ fn read_only_commands_return_scriptable_json() {
     let usage = run_json(&server, &["usage", "--server", "work", "--json"]);
     assert_eq!(usage["server"], "work");
     assert_eq!(usage["rateLimits"]["credits"]["balance"], "42.50");
+    assert_eq!(usage["rateLimitResetCredits"]["availableCount"], 2);
     assert_eq!(
         usage["rateLimitsByLimitId"]["priority"]["rateLimitReachedType"],
         "rate_limit_reached"
@@ -1860,6 +1864,10 @@ fn usage_human_output_shows_credits_and_limit_windows() {
     assert!(
         text.lines()
             .any(|line| { line.split_whitespace().collect::<Vec<_>>() == ["credits", "42.50"] })
+    );
+    assert!(
+        text.lines()
+            .any(|line| { line.split_whitespace().collect::<Vec<_>>() == ["resetCredits", "2"] })
     );
     assert!(text.contains("LIMIT"));
     assert!(text.contains("WINDOW"));

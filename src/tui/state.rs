@@ -38,6 +38,11 @@ pub enum Mode {
         cwd: String,
         return_to_detail: bool,
     },
+    Usage(UsageModalState),
+    ConfirmRateLimitReset {
+        usage: UsageModalState,
+        selected: ResetConfirmSelection,
+    },
     AnnotationInput {
         server: String,
         thread_id: String,
@@ -70,6 +75,110 @@ pub struct NewSessionDraft {
     pub server: String,
     pub cwd: String,
     pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageModalState {
+    pub server: String,
+    pub return_to_detail: bool,
+    pub loading: bool,
+    pub redeeming: bool,
+    pub snapshot: Option<AccountUsageSnapshot>,
+    pub error: Option<String>,
+    pub message: Option<String>,
+    pub selected: UsageAction,
+    pub reset_idempotency_key: Option<String>,
+}
+
+impl UsageModalState {
+    pub fn loading(server: String, return_to_detail: bool) -> Self {
+        Self {
+            server,
+            return_to_detail,
+            loading: true,
+            redeeming: false,
+            snapshot: None,
+            error: None,
+            message: None,
+            selected: UsageAction::Close,
+            reset_idempotency_key: None,
+        }
+    }
+
+    pub fn reset_count(&self) -> Option<i64> {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.reset_credits)
+    }
+
+    pub fn clear_reset_idempotency_key(&mut self) {
+        self.reset_idempotency_key = None;
+    }
+
+    pub fn invalidate_reset_availability(&mut self) {
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.reset_credits = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageAction {
+    Close,
+    Refresh,
+    Redeem,
+}
+
+impl UsageAction {
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Close => Self::Redeem,
+            Self::Refresh => Self::Close,
+            Self::Redeem => Self::Refresh,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Close => Self::Refresh,
+            Self::Refresh => Self::Redeem,
+            Self::Redeem => Self::Close,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetConfirmSelection {
+    Cancel,
+    Redeem,
+}
+
+impl ResetConfirmSelection {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Cancel => Self::Redeem,
+            Self::Redeem => Self::Cancel,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountUsageSnapshot {
+    pub plan: String,
+    pub credits: String,
+    pub limit_reached: String,
+    pub reset_credits: Option<i64>,
+    pub rows: Vec<AccountUsageRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountUsageRow {
+    pub limit: String,
+    pub window: String,
+    pub used: String,
+    pub reached: String,
+    pub resets: String,
+    pub duration: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
