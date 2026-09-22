@@ -46,6 +46,7 @@ struct ServerState {
     order: Vec<String>,
     next_turn: u64,
     fail_thread_name_set: bool,
+    fail_settings_update: bool,
 }
 
 struct StartedMockTurn {
@@ -316,6 +317,7 @@ impl ServerState {
             ],
             next_turn: 2,
             fail_thread_name_set,
+            fail_settings_update: false,
         }
     }
 
@@ -828,7 +830,10 @@ fn mock_result(
                 "cwd": "/tmp/tui-work"
             })
         }
-        "thread/unsubscribe" => json!({}),
+        "thread/settings/update" if state.fail_settings_update => {
+            return Err(json!({"code": -32000, "message": "mock settings refusal"}));
+        }
+        "thread/unsubscribe" | "thread/settings/update" => json!({}),
         "thread/loaded/list" => page(json!(["thread_active"])),
         "turn/start" => json!({"turn": {"id": "turn_2", "status": "inProgress", "items": []}}),
         "turn/steer" => json!({"turnId": request["params"]["expectedTurnId"].clone()}),
@@ -1079,10 +1084,64 @@ fn tui_codex_launch_hands_pty_input_to_child() {
     tui.wait_for_all(&["Open In Codex", "thread_beta"]);
     tui.write(b"\r");
     tui.wait_for("fake codex ready");
+    let updates = server.requests_for("thread/settings/update");
+    assert_eq!(updates.len(), 1);
+    assert_eq!(
+        updates[0]["params"],
+        json!({
+            "threadId": "thread_beta",
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        })
+    );
     tui.write(b"child-input\r");
     wait_for_file_contains(&fake_stdin_log, "child-input");
     tui.wait_for("codex exited");
     tui.quit();
+}
+
+#[test]
+#[ignore = "PTY smoke; run with `cargo test --test tui_pty_smoke -- --ignored`"]
+fn tui_codex_settings_refusal_prevents_child_and_preserves_browser() {
+    let mut server_state = ServerState::new();
+    server_state.fail_settings_update = true;
+    let server = TuiMockServer::start_with_state(server_state);
+    let state_dir = TempDir::new().expect("state dir");
+    let stream_log = state_dir.path().join("stream.ndjson");
+    let fake_dir = TempDir::new().expect("fake dir");
+    let fake_codex = fake_dir.path().join("fake-codex");
+    let marker = fake_dir.path().join("child-started");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf started > \"$FAKE_CODEX_MARKER\"\n",
+    )
+    .expect("script");
+    let mut permissions = fs::metadata(&fake_codex).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_codex, permissions).unwrap();
+    let mut tui = TuiPty::spawn_with_env(
+        &server,
+        &state_dir,
+        &stream_log,
+        &[
+            ("CODEX_THREADS_CODEX_BIN", fake_codex),
+            ("FAKE_CODEX_MARKER", marker.clone()),
+        ],
+    );
+    tui.wait_for_all(&["Active stream", "Beta task"]);
+    tui.write(b"j");
+    tui.write(b"o");
+    tui.wait_for_all(&["Open In Codex", "thread_beta"]);
+    tui.write(b"\r");
+    tui.wait_for_all(&["failed to prepare codex", "mock settings refusal"]);
+    assert_eq!(server.method_count("thread/settings/update"), 1);
+    tui.write(b"\r");
+    tui.wait_for_all(&["Transcript", "beta opening prompt"]);
+    tui.quit();
+    assert!(
+        !marker.exists(),
+        "refused settings must prevent spawning Codex"
+    );
 }
 
 #[test]

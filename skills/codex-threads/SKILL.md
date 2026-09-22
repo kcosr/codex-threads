@@ -60,15 +60,18 @@ codex-threads servers ping --json
 ```bash
 codex-threads list --limit 20
 codex-threads search threads "query" --limit 20
+codex-threads search messages <thread_id> "query" --limit 20
 codex-threads show <thread_id>
 codex-threads messages <thread_id>
 codex-threads status <thread_id>
 codex-threads send <thread_id> "follow-up message"
 codex-threads new --cwd /abs/path "initial prompt"
 codex-threads fork <thread_id> --last-turn <turn_id>
-codex-threads list --pinned
-codex-threads pin <thread_id>
-codex-threads unpin <thread_id>
+codex-threads sections list
+codex-threads sections create "Work"
+codex-threads list --section <section_id> --sort section-position
+codex-threads section <thread_id> --section <section_id>
+codex-threads section <thread_id> --clear
 codex-threads annotate get <thread_id>
 codex-threads annotate set <thread_id> "note"
 ```
@@ -77,9 +80,12 @@ Use `list --parent <thread_id>` for direct spawned child threads and
 `list --ancestor <thread_id>` for spawned descendants. These filters follow
 app-server `parentThreadId` spawn edges, not `forkedFromId` history forks.
 
-Use `list --pinned` or `list --unpinned` to filter the app-server's persisted
-pin state. `pin` and `unpin` change that Codex-owned state; unlike annotations,
-pins are not local `codex-threads` metadata.
+Use `sections list|create|rename|delete` to manage Codex-owned thread sections.
+`sections list --cursor <cursor>` pages through sections. Use `list --section <id>`
+or `list --unsectioned` to filter membership, and `--sort section-position` for
+section order. `section <thread_id> --section <id> [--before <thread_id>]` moves
+a thread; `section <thread_id> --clear` removes membership. Sections are persisted
+by app-server, unlike local annotations.
 
 Use `--json` whenever you need exact IDs, cwd, role, timestamps, status, cursors, parent IDs, or reliable parsing.
 
@@ -145,9 +151,10 @@ codex-threads messages <thread_id> --last 4 --max-turns 50
 
 Use `search threads` to discover candidate threads across a server. Once the
 thread ID is known, use `messages` for readable recent context or `show` with
-cursors for exact persisted history. Do not attempt `search messages`: Codex
-0.146 only supports occurrence search for paginated-history threads, so the CLI
-does not expose that command yet.
+cursors for exact persisted history. Use `search messages <thread_id> "query"`
+for exact occurrence snippets and turn cursors, with `--cursor` for further matches.
+Codex 0.155.1 creates persisted threads with paginated history by default; older
+legacy-history or ephemeral threads may return a server error for occurrence search.
 
 ### Message limit and filter semantics
 

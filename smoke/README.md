@@ -7,6 +7,24 @@ domain sockets and TCP WebSockets and exercise the compiled CLI binary.
 This directory contains opt-in live smoke checks against a real Codex
 app-server.
 
+## Offline real-Codex qualification
+
+Build the CLI and point the harness at the exact reviewed 0.155.1 executable:
+
+```bash
+cargo build --locked
+CODEX_BIN=/path/to/codex node smoke/offline_codex.mjs
+```
+
+Node.js 24 or newer is required. `BIN` can select a different compiled
+`codex-threads` executable. This is opt-in because it needs the separate Codex
+binary, but it does not use a live provider: it creates a disposable Codex home,
+workspace, state directory, and UDS app-server, serving two model responses from
+a loopback HTTP fixture. It does not read your Codex configuration or credentials.
+It exercises real request parsing, turn streaming, history/occurrence search,
+settings, goals, forks, section lifecycle and ordering, restart/resume, and
+archive/unarchive. Temporary processes and state are cleaned up on completion.
+
 ## Live Smoke
 
 Use the running app-server endpoint:

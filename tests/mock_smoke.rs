@@ -628,16 +628,20 @@ fn mock_result(
                     .unwrap_or("thread_parent")
             )
         ])),
-        "thread/list" if request["params"]["isPinned"].as_bool() == Some(true) => {
-            page(json!([sample_pinned_thread("thread_pinned")]))
+        "thread/list" if request["params"]["sectionId"].as_str() == Some("section_work") => {
+            page(json!([sample_section_thread("thread_section")]))
         }
-        "thread/list" if request["params"]["isPinned"].as_bool() == Some(false) => {
-            page(json!([sample_thread("thread_unpinned")]))
+        "thread/list" if request["params"].get("sectionId") == Some(&Value::Null) => {
+            page(json!([sample_thread("thread_unsectioned")]))
         }
         "thread/list" => page(json!([sample_thread("thread_1")])),
         "thread/search" if request["params"]["searchTerm"].as_str() == Some("paged") => {
             paged_search_results(request)
         }
+        "thread/searchOccurrences" => json!({
+            "data": [{"turnId": "turn_1", "itemId": "item_agent", "snippet": "fixture complete", "snippetMatchRange": {"start": 0, "end": 7}, "turnCursor": "turn_cursor"}],
+            "nextCursor": "occurrence_cursor"
+        }),
         "thread/search" => page(json!([{ "thread": sample_thread("thread_1"), "score": 1.0 }])),
         "thread/read" => {
             let mut thread = sample_thread(thread_id(request));
@@ -663,11 +667,16 @@ fn mock_result(
             "serviceTier": request["params"].get("serviceTier").cloned().unwrap_or(Value::Null)
         }),
         "thread/name/set" => json!({}),
-        "thread/metadata/update" => {
-            let mut thread = sample_thread(thread_id(request));
-            thread["isPinned"] = request["params"]["isPinned"].clone();
-            json!({ "thread": thread })
+        "threadSection/list" => {
+            json!({"data": [{"id": "section_work", "name": "Work", "appearance": null}], "nextCursor": null})
         }
+        "threadSection/create" => {
+            json!({"section": {"id": "section_new", "name": request["params"]["name"], "appearance": null}})
+        }
+        "threadSection/update" => {
+            json!({"section": {"id": request["params"]["sectionId"], "name": request["params"]["name"], "appearance": null}})
+        }
+        "threadSection/delete" | "thread/section/move" => json!({}),
         "turn/start" if malformed_turn_start => {
             json!({ "turn": { "status": "inProgress", "items": [] } })
         }
@@ -927,9 +936,9 @@ fn sample_thread_with_parent(id: &str, parent_id: &str) -> Value {
     thread
 }
 
-fn sample_pinned_thread(id: &str) -> Value {
+fn sample_section_thread(id: &str) -> Value {
     let mut thread = sample_thread(id);
-    thread["isPinned"] = json!(true);
+    thread["section"] = json!({"id": "section_work", "name": "Work", "appearance": null});
     thread
 }
 
@@ -2244,17 +2253,15 @@ fn search_since_filters_locally_across_server_pages() {
 }
 
 #[test]
-fn message_occurrence_search_is_not_exposed_as_a_cli_command() {
+fn message_occurrence_search_requires_thread_and_query() {
     let server = MockServer::start();
     server
         .command()
-        .args(["search", "messages", "thread_1", "release"])
+        .args(["search", "messages", "thread_1"])
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains(
-            "unrecognized subcommand 'messages'",
-        ));
+        .stderr(predicates::str::contains("<QUERY>"));
     assert!(server.params_for("thread/searchOccurrences").is_empty());
 }
 
@@ -2330,34 +2337,101 @@ fn list_passes_provider_and_source_filters() {
 }
 
 #[test]
-fn list_filters_pinned_state_and_marks_pinned_human_rows() {
+fn list_filters_sections_and_distinguishes_omitted_from_null() {
     let server = MockServer::start();
-    let pinned = run_json(&server, &["list", "--server", "work", "--json", "--pinned"]);
-    assert_eq!(pinned["threads"][0]["id"], "thread_pinned");
-    assert_eq!(pinned["threads"][0]["isPinned"], true);
-
-    let unpinned = run_json(
-        &server,
-        &["list", "--server", "work", "--json", "--unpinned"],
-    );
-    assert_eq!(unpinned["threads"][0]["id"], "thread_unpinned");
-
-    let output = server
+    let section = run_json(&server, &["list", "--json", "--section", "section_work"]);
+    assert_eq!(section["threads"][0]["section"]["id"], "section_work");
+    let unsectioned = run_json(&server, &["list", "--json", "--unsectioned"]);
+    assert_eq!(unsectioned["threads"][0]["id"], "thread_unsectioned");
+    run_json(&server, &["list", "--json"]);
+    server
         .command()
-        .args(["list", "--server", "work", "--pinned"])
+        .args([
+            "list",
+            "--section",
+            "section_work",
+            "--sort",
+            "section-position",
+        ])
         .assert()
         .success()
-        .get_output()
-        .stdout
-        .clone();
-    let text = String::from_utf8(output).expect("utf8");
-    assert!(text.lines().next().unwrap_or("").contains("PINNED"));
-    assert!(text.contains("yes"));
-
+        .stdout(predicates::str::contains("SECTION"))
+        .stdout(predicates::str::contains("Work"));
     let params = server.params_for("thread/list");
-    assert_eq!(params[0]["isPinned"], true);
-    assert_eq!(params[1]["isPinned"], false);
-    assert_eq!(params[2]["isPinned"], true);
+    assert_eq!(params[0]["sectionId"], "section_work");
+    assert_eq!(params[1].get("sectionId"), Some(&Value::Null));
+    assert!(params[2].get("sectionId").is_none());
+    assert_eq!(params[3]["sortKey"], "section_position");
+    assert!(params.iter().all(|p| p.get("isPinned").is_none()));
+    server
+        .command()
+        .args(["list", "--section", "section_work", "--unsectioned"])
+        .assert()
+        .code(2);
+    for args in [
+        vec!["pin", "thread_1"],
+        vec!["unpin", "thread_1"],
+        vec!["list", "--pinned"],
+        vec!["list", "--unpinned"],
+    ] {
+        server.command().args(args).assert().code(2);
+    }
+}
+
+#[test]
+fn section_management_uses_current_codex_contract() {
+    let server = MockServer::start();
+    let list = run_json(
+        &server,
+        &[
+            "sections", "list", "--limit", "10", "--cursor", "page", "--json",
+        ],
+    );
+    assert!(list.to_string().contains("section_work"));
+    let created = run_json(&server, &["sections", "create", "Research", "--json"]);
+    assert_eq!(created["section"]["name"], "Research");
+    let renamed = run_json(
+        &server,
+        &["sections", "rename", "section_new", "Review", "--json"],
+    );
+    assert_eq!(renamed["section"]["name"], "Review");
+    run_json(
+        &server,
+        &[
+            "section",
+            "thread_1",
+            "--section",
+            "section_work",
+            "--before",
+            "thread_2",
+            "--json",
+        ],
+    );
+    run_json(&server, &["section", "thread_1", "--clear", "--json"]);
+    run_json(&server, &["sections", "delete", "section_new", "--json"]);
+    assert_eq!(
+        server.params_for("threadSection/create"),
+        vec![json!({"name": "Research"})]
+    );
+    assert_eq!(
+        server.params_for("threadSection/update"),
+        vec![json!({"sectionId": "section_new", "name": "Review"})]
+    );
+    let moves = server.params_for("thread/section/move");
+    assert_eq!(moves[0]["threadId"], "thread_1");
+    assert_eq!(moves[0]["sectionId"], "section_work");
+    assert_eq!(moves[0]["beforeThreadId"], "thread_2");
+    assert_eq!(moves[1].get("sectionId"), Some(&Value::Null));
+    assert_eq!(
+        server.params_for("threadSection/delete"),
+        vec![json!({"sectionId": "section_new"})]
+    );
+    assert!(server.params_for("thread/metadata/update").is_empty());
+    server
+        .command()
+        .args(["section", "thread_1", "--clear", "--before", "thread_2"])
+        .assert()
+        .code(2);
 }
 
 #[test]
@@ -3352,15 +3426,6 @@ fn control_and_goal_commands_return_acknowledgements() {
         )["name"],
         "New name"
     );
-    let pinned = run_json(&server, &["pin", "--server", "work", "--json", "thread_1"]);
-    assert_eq!(pinned["pinned"], true);
-    assert_eq!(pinned["thread"]["isPinned"], true);
-    let unpinned = run_json(
-        &server,
-        &["unpin", "--server", "work", "--json", "thread_1"],
-    );
-    assert_eq!(unpinned["pinned"], false);
-    assert_eq!(unpinned["thread"]["isPinned"], false);
     assert_eq!(
         run_json(
             &server,
@@ -3374,15 +3439,6 @@ fn control_and_goal_commands_return_acknowledgements() {
     );
     assert_eq!(unarchived["archived"], false);
     assert_eq!(unarchived["thread"]["id"], "thread_1");
-    let metadata_params = server.params_for("thread/metadata/update");
-    assert_eq!(
-        metadata_params[0],
-        json!({"threadId": "thread_1", "isPinned": true})
-    );
-    assert_eq!(
-        metadata_params[1],
-        json!({"threadId": "thread_1", "isPinned": false})
-    );
     assert_eq!(
         run_json(
             &server,
@@ -3478,4 +3534,56 @@ fn invalid_new_prompt_flags_fail_before_connecting() {
         .stderr(predicates::str::contains(
             "new without PROMPT cannot use --no-wait",
         ));
+}
+
+#[test]
+fn message_search_preserves_exact_occurrences_and_cursors() {
+    let server = MockServer::start();
+    let result = run_json(
+        &server,
+        &[
+            "search", "messages", "thread_1", "fixture", "--limit", "7", "--cursor", "previous",
+            "--json",
+        ],
+    );
+    assert_eq!(result["threadId"], "thread_1");
+    assert_eq!(result["occurrences"][0]["turnId"], "turn_1");
+    assert_eq!(result["occurrences"][0]["itemId"], "item_agent");
+    assert_eq!(result["occurrences"][0]["turnCursor"], "turn_cursor");
+    assert_eq!(
+        result["occurrences"][0]["snippetMatchRange"],
+        json!({"start": 0, "end": 7})
+    );
+    assert_eq!(result["nextCursor"], "occurrence_cursor");
+    assert_eq!(
+        server.params_for("thread/searchOccurrences"),
+        vec![
+            json!({"threadId": "thread_1", "searchTerm": "fixture", "limit": 7, "cursor": "previous"})
+        ]
+    );
+    server
+        .command()
+        .args(["search", "messages", "thread_1", "fixture"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("fixture complete"))
+        .stdout(predicates::str::contains("occurrence_cursor"));
+}
+
+#[test]
+fn draining_refusal_does_not_resume_or_replay_a_mutation() {
+    let server = MockServer::start_rejecting_turn_start_with(
+        -32600,
+        "Server is draining; retry after reconnecting",
+    );
+    server
+        .command()
+        .args(["send", "thread_1", "continue", "--no-wait"])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "rejected `turn/start` before execution",
+        ));
+    assert_eq!(server.params_for("turn/start").len(), 1);
+    assert!(server.params_for("thread/resume").is_empty());
 }
