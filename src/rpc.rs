@@ -233,11 +233,26 @@ impl RpcClient {
         &mut self,
         method: &str,
         params: Value,
-        mut on_notification: F,
+        on_notification: F,
     ) -> Result<Value>
     where
         F: FnMut(Notification),
     {
+        self.request_with_timeout(method, params, on_notification, REQUEST_READ_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout<F>(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut on_notification: F,
+        timeout: Duration,
+    ) -> Result<Value>
+    where
+        F: FnMut(Notification),
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
         let id = self.next_id;
         self.next_id += 1;
         let request = if params.is_null() {
@@ -245,14 +260,22 @@ impl RpcClient {
         } else {
             json!({ "id": id, "method": method, "params": params })
         };
-        self.send_message(Message::Text(request.to_string().into()))
-            .await
-            .with_context(|| format!("failed to send `{method}` request"))?;
+        tokio::time::timeout_at(
+            deadline,
+            self.send_message(Message::Text(request.to_string().into())),
+        )
+        .await
+        .with_context(|| {
+            format!("timed out sending app-server `{method}` request; outcome unknown")
+        })?
+        .with_context(|| format!("failed to send `{method}` request"))?;
 
         loop {
-            let next = tokio::time::timeout(REQUEST_READ_TIMEOUT, self.next_message())
+            let next = tokio::time::timeout_at(deadline, self.next_message())
                 .await
-                .with_context(|| format!("timed out waiting for app-server `{method}` response"))?;
+                .with_context(|| {
+                    format!("timed out waiting for app-server `{method}` response; outcome unknown")
+                })?;
             let Some(message) = next else {
                 return Err(anyhow!(
                     "app-server connection closed while waiting for `{method}`"
@@ -264,6 +287,15 @@ impl RpcClient {
             };
             let value: Value = serde_json::from_str(&text)
                 .with_context(|| format!("app-server sent invalid JSON: {text}"))?;
+            // Server and client request IDs occupy independent namespaces.
+            if value.get("method").is_some() && value.get("id").is_some() {
+                tokio::time::timeout_at(deadline, self.reject_server_request(&value))
+                    .await
+                    .context(
+                        "timed out rejecting server request; pending request outcome unknown",
+                    )??;
+                continue;
+            }
             if value.get("id").and_then(Value::as_i64) == Some(id) {
                 if let Some(error) = value.get("error") {
                     let error = parse_rpc_error(error);
@@ -272,17 +304,17 @@ impl RpcClient {
                         error,
                     }));
                 }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                return value.get("result").cloned().ok_or_else(|| {
+                    anyhow!(
+                        "app-server `{method}` response missing result or error; outcome unknown"
+                    )
+                });
             }
             if let Some(method) = value.get("method").and_then(Value::as_str) {
-                if value.get("id").is_some() {
-                    self.reject_server_request(&value).await?;
-                } else {
-                    on_notification(Notification {
-                        method: method.to_string(),
-                        params: value.get("params").cloned().unwrap_or(Value::Null),
-                    });
-                }
+                on_notification(Notification {
+                    method: method.to_string(),
+                    params: value.get("params").cloned().unwrap_or(Value::Null),
+                });
             }
         }
     }
@@ -343,12 +375,128 @@ fn parse_rpc_error(error: &Value) -> RpcError {
 }
 
 pub fn format_rpc_error(method: &str, error: &RpcError) -> String {
-    if error.message.contains("experimentalApi") {
+    if error.code == -32600 && error.message == "Server is draining; retry after reconnecting" {
+        format!(
+            "app-server rejected `{method}` before execution because it is draining; reconnect before retrying"
+        )
+    } else if error.message.contains("experimentalApi") {
         format!("app-server rejected `{method}` because it requires experimentalApi capability")
     } else {
         format!(
             "app-server `{method}` error {}: {}",
             error.code, error.message
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    async fn pair() -> (RpcClient, WebSocketStream<UnixStream>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        (
+            RpcClient {
+                stream: RpcStream::Unix(client),
+                next_id: 1,
+                connection_id: 0,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn server_request_id_collision_does_not_complete_client_request() {
+        let (mut client, mut server) = pair().await;
+        let peer = tokio::spawn(async move {
+            server.next().await.unwrap().unwrap();
+            server
+                .send(Message::Text(
+                    json!({"id":1,"method":"item/commandExecution/requestApproval","params":{}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let reply = server.next().await.unwrap().unwrap();
+            let reply: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32601);
+            server
+                .send(Message::Text(
+                    json!({"method":"thread/attachment/updated","params":{"threadId":"t"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            server
+                .send(Message::Text(
+                    json!({"id":1,"result":{"accepted":true}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut notifications = Vec::new();
+        let result = client
+            .request("turn/start", json!({}), |n| notifications.push(n))
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"accepted":true}));
+        assert_eq!(notifications[0].method, "thread/attachment/updated");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notifications_do_not_extend_request_deadline() {
+        let (mut client, mut server) = pair().await;
+        let peer = tokio::spawn(async move {
+            server.next().await.unwrap().unwrap();
+            loop {
+                if server
+                    .send(Message::Text(
+                        json!({"method":"thread/status/changed","params":{}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.request_with_timeout("turn/start", json!({}), |_| {}, Duration::from_millis(50)),
+        )
+        .await
+        .expect("broadcasts must not postpone the deadline");
+        assert!(result.unwrap_err().to_string().contains("outcome unknown"));
+        peer.abort();
+    }
+
+    #[test]
+    fn only_exact_drain_rejection_claims_non_execution() {
+        let error = RpcError {
+            code: -32600,
+            message: "Server is draining; retry after reconnecting".to_string(),
+        };
+        assert!(format_rpc_error("turn/start", &error).contains("before execution"));
+        assert!(
+            !format_rpc_error(
+                "turn/start",
+                &RpcError {
+                    code: -32000,
+                    ..error
+                }
+            )
+            .contains("before execution")
+        );
     }
 }

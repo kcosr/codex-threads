@@ -2,7 +2,39 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+
+- Replace Codex 0.155.1's removed pin/unpin
+  commands and pinned filters with server-owned section commands and filters;
+  older Codex servers do not support the new section contract
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+
+### Added
+
+- Add section list/create/rename/delete, thread movement and ordering, section
+  filters, section-position sorting, and section display in CLI and TUI output.
+- Expose `search messages THREAD_ID QUERY` with occurrence IDs, match ranges,
+  and history cursors for Codex paginated-history threads.
+- Add an isolated real-Codex offline smoke harness covering thread lifecycle,
+  settings, goals, history, sections, and persisted resume without provider usage
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+
+### Changed
+
+- Review Codex 0.156.1 and update the offline smoke baseline. Verify symlink
+  socket connections in mock CLI tests and real app-server startup/restart;
+  existing runtime connections need no changes
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+
+### Fixed
+
+- Apply yolo permissions through the app-server before opening a remote Codex
+  TUI, supporting 0.155.1's remote-resume restrictions.
+- Separate server-request IDs from client-response IDs and bound RPC deadlines
+  while unrelated notifications arrive.
+- Report daemon-draining refusals without automatically replaying work, and
+  correlate polled turns by their exact IDs instead of prompt/time heuristics
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
 
 ## [0.2.4] - 2026-07-30
 

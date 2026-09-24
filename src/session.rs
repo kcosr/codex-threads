@@ -20,7 +20,7 @@ pub struct ListThreadsRequest {
     pub since: Option<i64>,
     pub cwd: Option<String>,
     pub archived: bool,
-    pub is_pinned: Option<bool>,
+    pub section_id: Option<Option<String>>,
     pub model_providers: Vec<String>,
     pub source_kinds: Vec<ThreadSourceKind>,
     pub parent_thread_id: Option<String>,
@@ -41,7 +41,6 @@ pub struct SearchThreadsRequest {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Retained for a future Codex release with generally available paginated history.
 pub struct SearchMessageOccurrencesRequest {
     pub thread_id: String,
     pub query: String,
@@ -113,8 +112,8 @@ pub async fn list_threads(
     if request.archived {
         params.insert("archived".to_string(), json!(true));
     }
-    if let Some(is_pinned) = request.is_pinned {
-        params.insert("isPinned".to_string(), json!(is_pinned));
+    if let Some(section_id) = request.section_id {
+        params.insert("sectionId".to_string(), json!(section_id));
     }
     if !request.source_kinds.is_empty() {
         params.insert("sourceKinds".to_string(), json!(request.source_kinds));
@@ -199,7 +198,6 @@ pub async fn search_threads(
     Ok(result)
 }
 
-#[allow(dead_code)] // Intentionally has no CLI caller until occurrence search supports normal threads.
 pub async fn search_message_occurrences(
     target: &Target,
     client: &mut RpcClient,
@@ -215,7 +213,6 @@ pub async fn search_message_occurrences(
     Ok(occurrence_search_result(target, &request, &result))
 }
 
-#[allow(dead_code)]
 fn occurrence_search_params(request: &SearchMessageOccurrencesRequest) -> Value {
     json!({
         "threadId": request.thread_id,
@@ -225,7 +222,6 @@ fn occurrence_search_params(request: &SearchMessageOccurrencesRequest) -> Value 
     })
 }
 
-#[allow(dead_code)]
 fn occurrence_search_result(
     target: &Target,
     request: &SearchMessageOccurrencesRequest,
@@ -846,6 +842,7 @@ fn sort_key(sort: SortKey) -> &'static str {
     match sort {
         SortKey::Updated => "updated_at",
         SortKey::Created => "created_at",
+        SortKey::SectionPosition => "section_position",
     }
 }
 
@@ -899,7 +896,7 @@ mod occurrence_search_tests {
     }
 
     #[test]
-    fn retained_occurrence_search_uses_the_codex_0146_protocol_shape() {
+    fn occurrence_search_uses_the_codex_0155_protocol_shape() {
         assert_eq!(
             occurrence_search_params(&request(Some("occurrence_page_2"))),
             json!({

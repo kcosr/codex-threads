@@ -61,8 +61,8 @@ pub enum Command {
     Steer(SteerCommand),
     Interrupt(InterruptCommand),
     Name(NameCommand),
-    Pin(ThreadOnlyCommand),
-    Unpin(ThreadOnlyCommand),
+    Sections(SectionsCommand),
+    Section(SectionCommand),
     Archive(ThreadOnlyCommand),
     Unarchive(ThreadOnlyCommand),
     Models(ModelsCommand),
@@ -123,10 +123,10 @@ pub struct ListCommand {
     pub cwd: Option<String>,
     #[arg(long)]
     pub archived: bool,
-    #[arg(long, conflicts_with = "unpinned")]
-    pub pinned: bool,
-    #[arg(long, conflicts_with = "pinned")]
-    pub unpinned: bool,
+    #[arg(long, conflicts_with = "unsectioned")]
+    pub section: Option<String>,
+    #[arg(long, conflicts_with = "section")]
+    pub unsectioned: bool,
     #[arg(long = "provider", value_name = "PROVIDER")]
     pub model_providers: Vec<String>,
     #[arg(long = "source", value_enum)]
@@ -155,6 +155,22 @@ pub struct SearchCommand {
 pub enum SearchSubcommand {
     #[command(about = "Find candidate threads across one app-server")]
     Threads(SearchThreadsCommand),
+    #[command(about = "Search message occurrences in persisted thread history")]
+    Messages(SearchMessagesCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SearchMessagesCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    pub query: String,
+    #[arg(long)]
+    pub limit: Option<u32>,
+    #[arg(long)]
+    pub cursor: Option<String>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -407,6 +423,51 @@ pub struct ThreadOnlyCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct SectionsCommand {
+    #[arg(long, global = true)]
+    pub server: Option<String>,
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub command: SectionsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SectionsSubcommand {
+    List {
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    Create {
+        name: String,
+    },
+    Rename {
+        section_id: String,
+        name: String,
+    },
+    Delete {
+        section_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct SectionCommand {
+    #[command(flatten)]
+    pub server: ServerOpt,
+    pub thread_id: String,
+    #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+    pub section: Option<String>,
+    #[arg(long, required_unless_present = "section")]
+    pub clear: bool,
+    #[arg(long, requires = "section", conflicts_with = "clear")]
+    pub before: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ModelsCommand {
     #[command(flatten)]
     pub server: ServerOpt,
@@ -560,6 +621,7 @@ pub struct AnnotatePruneCommand {
 pub enum SortKey {
     Updated,
     Created,
+    SectionPosition,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -622,4 +684,46 @@ pub enum CompletionShell {
     Bash,
     Zsh,
     Fish,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_move_requires_explicit_membership_and_valid_ordering() {
+        for args in [
+            vec!["codex-threads", "section", "t"],
+            vec![
+                "codex-threads",
+                "section",
+                "t",
+                "--clear",
+                "--before",
+                "other",
+            ],
+            vec!["codex-threads", "section", "t", "--clear", "--section", "s"],
+            vec!["codex-threads", "list", "--section", "s", "--unsectioned"],
+            vec!["codex-threads", "pin", "t"],
+            vec!["codex-threads", "list", "--pinned"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "codex-threads",
+                "section",
+                "t",
+                "--section",
+                "s",
+                "--before",
+                "other"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["codex-threads", "section", "t", "--clear"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["codex-threads", "list", "--sort", "section-position"]).is_ok()
+        );
+    }
 }

@@ -40,8 +40,9 @@ use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::{RpcClient, RpcRequestError};
 use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStartOptions,
-    ThreadStatusRequest, delete_thread, list_threads, read_thread_detail, search_threads,
-    set_thread_archived, set_thread_name, start_thread, thread_id_from_start, thread_status,
+    ThreadStatusRequest, delete_thread, list_threads, read_thread_detail,
+    request_with_resume_retry, search_threads, set_thread_archived, set_thread_name, start_thread,
+    thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::tui::events::{
@@ -446,12 +447,29 @@ fn resume_terminal_events(events: &mut Option<EventStream>) {
     *events = Some(EventStream::new());
 }
 
-fn build_codex_resume_launch(
-    target: &Target,
-    thread_id: &str,
-    cwd: &str,
-    yolo: bool,
-) -> CodexResumeLaunch {
+async fn prepare_codex_resume(target: &Target, thread_id: &str, yolo: bool) -> Result<()> {
+    if !yolo {
+        return Ok(());
+    }
+    let mut client = RpcClient::connect(&target.endpoint).await?;
+    request_with_resume_retry(
+        &mut client,
+        "thread/settings/update",
+        json!({
+            "threadId": thread_id,
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }),
+        thread_id,
+        yolo,
+        || {},
+        |_| {},
+    )
+    .await?;
+    Ok(())
+}
+
+fn build_codex_resume_launch(target: &Target, thread_id: &str, cwd: &str) -> CodexResumeLaunch {
     let mut args = vec![
         OsString::from("resume"),
         OsString::from(thread_id),
@@ -467,9 +485,6 @@ fn build_codex_resume_launch(
         args.push(OsString::from("--remote-auth-token-env"));
         args.push(OsString::from(CODEX_REMOTE_AUTH_ENV));
         env.push((OsString::from(CODEX_REMOTE_AUTH_ENV), OsString::from(token)));
-    }
-    if yolo {
-        args.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"));
     }
     args.push(OsString::from("--cd"));
     args.push(OsString::from(cwd));
@@ -702,7 +717,10 @@ impl RpcClientCache {
 }
 
 fn keep_client_after_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<RpcRequestError>().is_some()
+    err.downcast_ref::<RpcRequestError>().is_some_and(|error| {
+        !(error.error.code == -32600
+            && error.error.message == "Server is draining; retry after reconnecting")
+    })
 }
 
 async fn fetch_browser(
@@ -721,7 +739,7 @@ async fn fetch_browser(
                     since: query.since,
                     cwd: query.cwd,
                     archived: query.archived,
-                    is_pinned: None,
+                    section_id: None,
                     model_providers: query.model_providers,
                     source_kinds: query.source_kinds,
                     parent_thread_id: None,
@@ -2027,10 +2045,14 @@ async fn handle_terminal_event(
                 KeyCode::Esc => state.mode = return_mode,
                 KeyCode::Enter => {
                     state.mode = return_mode;
+                    if let Err(error) = prepare_codex_resume(target, &thread_id, yolo).await {
+                        state.set_notice(format!("failed to prepare codex: {error}"));
+                        return Ok(TerminalEventOutcome::none());
+                    }
                     detach_stream(state);
                     return Ok(TerminalEventOutcome {
                         codex_launch: Some(PendingCodexLaunch {
-                            launch: build_codex_resume_launch(target, &thread_id, &cwd, yolo),
+                            launch: build_codex_resume_launch(target, &thread_id, &cwd),
                             server,
                             thread_id,
                         }),
@@ -10598,7 +10620,48 @@ mod tests {
     }
 
     #[test]
-    fn codex_resume_launch_uses_remote_cwd_and_yolo_flag() {
+    fn draining_connection_is_not_cached_for_the_next_action() {
+        for (code, message, keep) in [
+            (
+                -32600,
+                "Server is draining; retry after reconnecting",
+                false,
+            ),
+            (-32600, "Invalid request", true),
+            (-32000, "Server is draining; retry after reconnecting", true),
+        ] {
+            let error = anyhow::Error::new(RpcRequestError {
+                method: "thread/list".to_string(),
+                error: crate::rpc::RpcError {
+                    code,
+                    message: message.to_string(),
+                },
+            });
+            assert_eq!(keep_client_after_error(&error), keep);
+        }
+        assert!(!keep_client_after_error(&anyhow::anyhow!(
+            "connection closed"
+        )));
+    }
+
+    #[tokio::test]
+    async fn remote_resume_no_yolo_preserves_server_permissions_without_connecting() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/nonexistent/codex.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        prepare_codex_resume(&target, "thread", false)
+            .await
+            .expect("no settings override");
+        assert!(prepare_codex_resume(&target, "thread", true).await.is_err());
+    }
+
+    #[test]
+    fn codex_resume_launch_uses_remote_cwd_without_permission_overrides() {
         let target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
@@ -10608,7 +10671,7 @@ mod tests {
             model_reasoning_effort: None,
         };
 
-        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project", true);
+        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project");
         let args = launch
             .args
             .iter()
@@ -10622,7 +10685,6 @@ mod tests {
                 "session-1",
                 "--remote",
                 "unix:///tmp/codex.sock",
-                "--dangerously-bypass-approvals-and-sandbox",
                 "--cd",
                 "/tmp/project",
             ]
@@ -10642,7 +10704,7 @@ mod tests {
             model_reasoning_effort: None,
         };
 
-        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project", false);
+        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project");
         let args = launch
             .args
             .iter()

@@ -520,7 +520,7 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         (vec![Line::from("No message preview available")], 0)
     };
-    let title = if stream_is_live_for(state, &row.server, &row.id) {
+    let mut title = if stream_is_live_for(state, &row.server, &row.id) {
         Line::from(vec![
             Span::raw(" Recent Messages "),
             live_indicator_span(" "),
@@ -528,6 +528,10 @@ fn draw_browser_preview(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         Line::from(" Recent Messages ")
     };
+    let thread = row.raw.get("thread").unwrap_or(&row.raw);
+    if let Some(section) = thread["section"]["name"].as_str() {
+        title.spans.push(Span::raw(format!(" Section: {section} ")));
+    }
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -2700,6 +2704,25 @@ mod tests {
             !text.contains(" live"),
             "no live indicator without a running stream"
         );
+
+        for raw in [
+            serde_json::json!({"section": {"id": "section-1", "name": "Work"}}),
+            serde_json::json!({"thread": {"section": {"id": "section-1", "name": "Work"}}, "snippet": "match"}),
+        ] {
+            state.browser.rows[0].raw = raw;
+            terminal.draw(|frame| draw(frame, &state)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                text.contains("Section: Work"),
+                "section shown for list and search rows"
+            );
+        }
 
         state.stream = Some(StreamState::new(
             "thread-1".to_string(),

@@ -60,12 +60,12 @@ CLI as a safety boundary.
 - Model, reasoning effort, and service-tier settings where Codex app-server
   supports them.
 - Thread naming, archive/unarchive, TUI-only delete, active-turn steer/interrupt,
-  pin/unpin, model listing, and goal get/set/clear.
+  section management and ordering, model listing, and goal get/set/clear.
 
 ## Codex compatibility
 
 The current app-server integration has been reviewed through Codex application
-release 0.146, using the exact upstream reference recorded in
+release 0.156.1, using the exact upstream reference recorded in
 [`CODEX_COMPATIBILITY.md`](CODEX_COMPATIBILITY.md). That file links each
 intentional Codex API review to the `codex-threads` release that adopted it and
 records reviewed features that were deferred.
@@ -73,10 +73,23 @@ records reviewed features that were deferred.
 This is a reviewed API baseline, not a compatibility fallback: commands that
 depend on newer app-server methods will fail normally against an older server.
 
-Codex 0.146 includes `thread/searchOccurrences`, but only supports it for
-paginated-history threads while the app-server default remains legacy history.
-The implementation is retained internally for a future Codex release, but no
-message-occurrence search command is currently exposed.
+Codex 0.156.1 exposes its Unix socket endpoint as a symlink to a protected
+socket. Keep using the configured `unix://` endpoint; `codex-threads` follows
+the symlink when connecting. No configuration change is needed.
+
+The retired `pin`, `unpin`, `list --pinned`, and `list --unpinned` interfaces
+are replaced by server-owned sections. Use `sections list` to discover current
+section IDs, `section THREAD_ID --section ID` to move a thread, and
+`list --section ID --sort section-position --asc` to read that ordering.
+`list --unsectioned` selects threads with no section; omitting both filters
+includes all threads. No pin aliases or legacy wire requests are retained.
+
+`search messages THREAD_ID QUERY` uses `thread/searchOccurrences` for
+paginated-history threads. Codex 0.155.1 normally creates persisted local
+threads in paginated mode when a state database is available. Older legacy
+threads and stores without paginated history report an unsupported-operation
+error; this CLI does not migrate them. Results include `turnId`, `itemId`,
+`snippetMatchRange`, and `turnCursor` for exact follow-up history paging.
 
 ## Screenshot
 
@@ -310,10 +323,12 @@ there. Detail views refresh in place while open, and `Esc` returns to the
 browser after unlinking the local detail view and detaching any local stream.
 Local detach leaves remote turns running.
 Opening in Codex temporarily returns terminal control to `codex resume
-<thread-id> --remote <server-endpoint> --cd <thread-cwd>`, adding
-`--dangerously-bypass-approvals-and-sandbox` when the codex-threads TUI was
-launched with yolo enabled, then redraws and refreshes the codex-threads TUI
-after Codex exits.
+<thread-id> --remote <server-endpoint> --cd <thread-cwd>`, then redraws and
+refreshes the codex-threads TUI after Codex exits. Codex 0.155.1 rejects
+permission overrides on remote resume. When yolo is enabled, codex-threads
+applies its approval and sandbox settings through the app-server before
+launching Codex; if that update fails, launch stops. With `--no-yolo`, it
+preserves the app-server settings.
 Transcript rendering is markdown-aware for common headings, blockquotes, lists,
 paragraph spacing, and fenced code blocks. Message headings show role and
 timestamp without repeating turn IDs. Fenced code blocks gain syntax-highlighted
@@ -440,8 +455,9 @@ explicitly.
 | --- | --- |
 | `servers [--json]` | List configured server aliases without connecting. |
 | `servers ping [--server ALIAS\|--all] [--json]` | Connect, initialize, and report reachability. |
-| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--pinned` or `--unpinned`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
+| `list` | List threads with `--limit`, `--cursor`, `--since`, `--cwd`, `--archived`, `--section ID` or `--unsectioned`, repeatable `--provider` and `--source`, `--parent`, `--ancestor`, `--sort`, `--asc`, `--desc`. Defaults to `--limit 50`. |
 | `search threads QUERY` | Search threads on one server with `--limit`, `--cursor`, `--since`, and `--archived`. |
+| `search messages THREAD_ID QUERY` | Search persisted message occurrences in a paginated-history thread, with `--limit` and `--cursor`. |
 | `show THREAD_ID` | Show thread detail and turns with `--last`, `--cursor`, `--asc`, `--desc`, `--items summary\|full\|none`. Defaults to `--last 20`. |
 | `tui` | Launch the interactive browser across all configured servers by default, or one server with `--server`; accepts `--query`, `--since`, `--cwd`, `--archived`, repeatable `--provider` and `--source`, `--limit`, `--sort`, `--asc`, and `--desc` initial filters. |
 | `messages THREAD_ID` | Flatten messages from recent turns with `--last`, `--since`, `--role user\|assistant`, and `--max-turns`. |
@@ -454,7 +470,9 @@ explicitly.
 | `steer THREAD_ID TURN_ID PROMPT` | Send steering input to an active turn. |
 | `interrupt THREAD_ID TURN_ID` | Interrupt an active turn. |
 | `name THREAD_ID NAME` | Set a thread name. |
-| `pin THREAD_ID` / `unpin THREAD_ID` | Persist or clear a thread's Codex pin state. |
+| `sections list [--limit N] [--cursor CURSOR]` | List one page of server-owned sections. |
+| `sections create NAME` / `sections rename ID NAME` / `sections delete ID` | Manage server-owned sections. Deleting a section leaves its threads unsectioned. |
+| `section THREAD_ID --section ID [--before THREAD_ID]` / `section THREAD_ID --clear` | Move, reorder, or remove a thread from a section. |
 | `archive THREAD_ID` / `unarchive THREAD_ID` | Archive or restore a thread. |
 | `models` | List available models from the app-server. |
 | `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. `usage redeem` redeems the best available reset credit only when permitted for the selected server. |
@@ -546,7 +564,7 @@ codex-threads completion script fish > ~/.config/fish/completions/codex-threads.
 Regenerate the completion file after upgrading `codex-threads`.
 
 Completions suggest command names, nested subcommands, option names, static
-values such as `--sort updated|created`, `--items summary|full|none`,
+values such as `--sort updated|created|section-position`, `--items summary|full|none`,
 `--role user|assistant`,
 known `--effort` values such as `none|minimal|low|medium|high|xhigh|max|ultra`,
 goal status values, shell names for `completion`, and local configured server
@@ -585,16 +603,21 @@ without a prompt.
 Human `list` and `search threads` output includes a `PARENT ID` column when any
 displayed thread has `parentThreadId`; use `--json` for a stable
 machine-readable shape. Forked threads expose `forkedFromId` in thread objects,
-not `parentThreadId`. When displayed results include a pinned thread, human
-output also includes a `PINNED` column. JSON thread objects expose the
-app-server's `isPinned` field.
+not `parentThreadId`. When displayed results include a section, human output
+also includes a `SECTION` column. JSON thread objects expose the app-server's
+`section` object and `sectionEnteredAt` timestamp.
 
 Blocking `new PROMPT` and `send` commands wait up to one hour for the turn to
 reach a terminal status. They consume realtime notifications when available and
 poll recent turns as a fallback so callers still get a final JSON response if a
 notification is missed.
 If the local one-hour wait times out, the command exits with code `3`; the
-remote Codex turn may still be running.
+remote Codex turn may still be running. RPC deadlines are bounded even when
+unrelated notifications keep arriving. A lost response or timeout leaves the
+remote outcome unknown; inspect the thread before deciding whether to submit
+again. A daemon-draining refusal is reported as rejected before execution,
+and the command is not automatically replayed. Turn polling follows the exact
+turn ID returned by Codex, never a match based on prompt text and timestamp.
 
 `status --json` without a thread ID returns `{ server, reachable,
 loadedThreadIds, nextCursor }`. `status THREAD_ID --json` returns the selected
@@ -741,6 +764,14 @@ stateful mock app-server:
 
 ```bash
 cargo test --test tui_pty_smoke -- --ignored
+```
+
+A real Codex 0.156.1 app-server can also be tested without account credentials
+or provider usage. The harness uses a temporary home and loopback model fixture
+(requires Node.js 24 or newer and a built debug binary):
+
+```bash
+CODEX_BIN=/path/to/codex node smoke/offline_codex.mjs
 ```
 
 Live smoke checks are opt-in:
