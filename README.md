@@ -65,13 +65,17 @@ CLI as a safety boundary.
 ## Codex compatibility
 
 The current app-server integration has been reviewed through Codex application
-release 0.155.1, using the exact upstream reference recorded in
+release 0.156.1, using the exact upstream reference recorded in
 [`CODEX_COMPATIBILITY.md`](CODEX_COMPATIBILITY.md). That file links each
 intentional Codex API review to the `codex-threads` release that adopted it and
 records reviewed features that were deferred.
 
 This is a reviewed API baseline, not a compatibility fallback: commands that
 depend on newer app-server methods will fail normally against an older server.
+
+Codex 0.156.1 exposes its Unix socket endpoint as a symlink to a protected
+socket. Keep using the configured `unix://` endpoint; `codex-threads` follows
+the symlink when connecting. No configuration change is needed.
 
 The retired `pin`, `unpin`, `list --pinned`, and `list --unpinned` interfaces
 are replaced by server-owned sections. Use `sections list` to discover current
@@ -762,7 +766,7 @@ stateful mock app-server:
 cargo test --test tui_pty_smoke -- --ignored
 ```
 
-A real Codex 0.155.1 app-server can also be tested without account credentials
+A real Codex 0.156.1 app-server can also be tested without account credentials
 or provider usage. The harness uses a temporary home and loopback model fixture
 (requires Node.js 24 or newer and a built debug binary):
 

@@ -1052,6 +1052,28 @@ fn assert_no_yolo_params(params: &Value) {
 }
 
 #[test]
+fn symlink_socket_supports_configured_and_direct_connections() {
+    let server = MockServer::start();
+    let alias = server.config.parent().unwrap().join("alias.sock");
+    std::os::unix::fs::symlink(&server.socket, &alias).expect("socket symlink");
+    let endpoint = format!("unix://{}", alias.display());
+    write_config(
+        &server,
+        format!("[servers.work]\nendpoint = {}\n", toml_string(&endpoint)),
+    );
+
+    let configured = run_json(&server, &["list", "--json"]);
+    assert_eq!(configured["server"], "work");
+    assert_eq!(configured["threads"][0]["id"], "thread_1");
+
+    let direct = run_json(&server, &["--connect", &endpoint, "list", "--json"]);
+    assert_eq!(direct["server"], endpoint);
+    assert_eq!(direct["threads"][0]["id"], "thread_1");
+    assert_eq!(server.params_for("initialize").len(), 2);
+    assert_eq!(server.params_for("thread/list").len(), 2);
+}
+
+#[test]
 fn connect_bypasses_config_and_lists_threads() {
     let server = MockServer::start();
     let output = Command::cargo_bin("codex-threads")

@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,7 +16,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const codex = process.env.CODEX_BIN ?? 'codex';
 const cli = process.env.BIN ?? path.join(root, 'target/debug/codex-threads');
 const version = (await exec(codex, ['--version'])).stdout.trim();
-assert.equal(version, 'codex-cli 0.155.1', 'use the reviewed Codex release');
+assert.equal(version, 'codex-cli 0.156.1', 'use the reviewed Codex release');
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'ct-offline-'));
 const codexHome = path.join(temporary, 'codex');
 const workspace = path.join(temporary, 'workspace');
@@ -74,7 +74,11 @@ async function startDaemon() {
   daemon.stderr.on('data', chunk => { daemonLog += chunk; });
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (daemon.exitCode !== null) throw new Error(`app-server exited: ${daemonLog}`);
-    if (await stat(`${temporary}/app.sock`).then(s => s.isSocket(), () => false)) return;
+    if (await stat(`${temporary}/app.sock`).then(s => s.isSocket(), () => false)) {
+      assert.ok((await lstat(`${temporary}/app.sock`)).isSymbolicLink(),
+        'the reviewed Codex release must expose a symlink socket');
+      return;
+    }
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   throw new Error(`app-server socket timeout: ${daemonLog}`);

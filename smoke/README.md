@@ -2,14 +2,15 @@
 
 Deterministic mock smoke coverage lives in `tests/mock_smoke.rs` and runs as
 part of `cargo test`. Those tests launch mock Codex app-servers over Unix
-domain sockets and TCP WebSockets and exercise the compiled CLI binary.
+domain sockets and TCP WebSockets and exercise the compiled CLI binary,
+including configured and direct connections through a symlink socket endpoint.
 
 This directory contains opt-in live smoke checks against a real Codex
 app-server.
 
 ## Offline real-Codex qualification
 
-Build the CLI and point the harness at the exact reviewed 0.155.1 executable:
+Build the CLI and point the harness at the exact reviewed 0.156.1 executable:
 
 ```bash
 cargo build --locked
@@ -23,7 +24,9 @@ workspace, state directory, and UDS app-server, serving two model responses from
 a loopback HTTP fixture. It does not read your Codex configuration or credentials.
 It exercises real request parsing, turn streaming, history/occurrence search,
 settings, goals, forks, section lifecycle and ordering, restart/resume, and
-archive/unarchive. Temporary processes and state are cleaned up on completion.
+archive/unarchive. Each app-server startup verifies that the configured socket
+is a symlink resolving to a socket, including after restart. Temporary processes
+and state are cleaned up on completion.
 
 ## Live Smoke
 

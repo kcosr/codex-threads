@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- Update the reviewed Codex baseline to 0.155.1. Replace removed pin/unpin
+- Replace Codex 0.155.1's removed pin/unpin
   commands and pinned filters with server-owned section commands and filters;
   older Codex servers do not support the new section contract
   ([#13](https://github.com/kcosr/codex-threads/pull/13)).
@@ -17,6 +17,13 @@
   and history cursors for Codex paginated-history threads.
 - Add an isolated real-Codex offline smoke harness covering thread lifecycle,
   settings, goals, history, sections, and persisted resume without provider usage
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+
+### Changed
+
+- Review Codex 0.156.1 and update the offline smoke baseline. Verify symlink
+  socket connections in mock CLI tests and real app-server startup/restart;
+  existing runtime connections need no changes
   ([#13](https://github.com/kcosr/codex-threads/pull/13)).
 
 ### Fixed
