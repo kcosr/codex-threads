@@ -1009,7 +1009,8 @@ async fn poll_turn_completion(
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
-    let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": &wait.turn_id, "status": status, "source": "poll"});
+    let mut event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": &wait.turn_id, "status": status, "source": "poll"});
+    copy_turn_error(turn, &mut event);
     events.push(event);
     Ok(Some(turn_terminal(wait, status, assistant, events)))
 }
@@ -1071,7 +1072,7 @@ fn turn_terminal(
     events: &[Value],
 ) -> TurnTerminal {
     let final_text = assistant.final_text();
-    let output = json!({
+    let mut output = json!({
         "server": wait.target.server,
         "threadId": wait.thread_id,
         "turnId": &wait.turn_id,
@@ -1080,12 +1081,21 @@ fn turn_terminal(
         "assistantResponses": assistant.to_json(),
         "finalAssistantText": final_text
     });
+    if let Some(event) = events.last() {
+        copy_turn_error(event, &mut output);
+    }
     let exit_code = if output["status"].as_str() == Some("completed") {
         0
     } else {
         1
     };
     TurnTerminal { output, exit_code }
+}
+
+fn copy_turn_error(source: &Value, destination: &mut Value) {
+    if let Some(error) = source.get("error").filter(|error| !error.is_null()) {
+        destination["error"] = error.clone();
+    }
 }
 
 fn turn_event(
@@ -1152,9 +1162,9 @@ fn turn_event(
         {
             reject_unknown_turn_status(&notification.params["turn"])?;
             let status = turn_status(&notification.params["turn"]);
-            Ok(Some(
-                json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status}),
-            ))
+            let mut event = json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status});
+            copy_turn_error(&notification.params["turn"], &mut event);
+            Ok(Some(event))
         }
         _ => Ok(None),
     }
@@ -1820,5 +1830,192 @@ mod tests {
 
         assert!(poll_result_turn(&wait, &result).is_none());
         assert_eq!(wait.turn_id, "returned-id");
+    }
+
+    #[test]
+    fn terminal_notifications_preserve_structured_turn_errors() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "turn-1".to_string(),
+            poll_limit: 50,
+        };
+        let error = json!({
+            "message": "Guardian reached its denial limit",
+            "codexErrorInfo": "tooManyDenials",
+            "misalignment": null,
+            "additionalDetails": "fixture diagnostics",
+            "futureDetails": {"retryable": false}
+        });
+        for status in ["failed", "interrupted"] {
+            let mut assistant = AssistantResponses::default();
+            assistant.complete_live(Some("assistant-1"), "Partial answer");
+            let mut events = Vec::new();
+            let terminal = process_turn_notification(
+                &wait,
+                Notification {
+                    method: "turn/completed".to_string(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": status, "error": error}
+                    }),
+                },
+                &mut assistant,
+                &mut events,
+            )
+            .unwrap()
+            .expect("terminal notification");
+
+            assert_eq!(terminal.exit_code, 1);
+            assert_eq!(terminal.output["status"], status);
+            assert_eq!(terminal.output["error"], error);
+            assert_eq!(terminal.output["finalAssistantText"], "Partial answer");
+            assert_eq!(events.last().unwrap()["error"], error);
+            assert_eq!(terminal.output["progress"][0]["error"], error);
+        }
+    }
+
+    #[test]
+    fn successful_terminal_notifications_omit_empty_errors() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "turn-1".to_string(),
+            poll_limit: 50,
+        };
+        for include_null_error in [false, true] {
+            let mut turn = json!({"id": "turn-1", "status": "completed"});
+            if include_null_error {
+                turn["error"] = Value::Null;
+            }
+            let mut events = Vec::new();
+            let terminal = process_turn_notification(
+                &wait,
+                Notification {
+                    method: "turn/completed".to_string(),
+                    params: json!({"threadId": "thread-1", "turn": turn}),
+                },
+                &mut AssistantResponses::default(),
+                &mut events,
+            )
+            .unwrap()
+            .expect("successful completion");
+
+            assert_eq!(terminal.exit_code, 0);
+            assert!(terminal.output.get("error").is_none());
+            assert!(events.last().unwrap().get("error").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn polled_terminal_turns_preserve_errors_and_success_shape() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        for status in ["failed", "interrupted", "completed"] {
+            let error = if status == "completed" {
+                Value::Null
+            } else {
+                json!({
+                    "message": "The requested work stopped",
+                    "codexErrorInfo": "tooManyDenials",
+                    "additionalDetails": "fixture diagnostics"
+                })
+            };
+            let turn = json!({
+                "id": "turn-1",
+                "rootTurnId": "root-turn",
+                "status": status,
+                "error": error,
+                "items": [{"id": "assistant-1", "type": "agentMessage", "text": "Partial answer"}]
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = Target {
+                server: "work".to_string(),
+                endpoint: Endpoint::WebSocket {
+                    url: format!("ws://{}", listener.local_addr().unwrap()),
+                    auth_token: None,
+                },
+                model: None,
+                model_reasoning_effort: None,
+            };
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for method in ["initialize", "initialized", "thread/turns/list"] {
+                    let frame = websocket.next().await.unwrap().unwrap();
+                    let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], method);
+                    if method == "initialized" {
+                        continue;
+                    }
+                    let result = if method == "initialize" {
+                        json!({})
+                    } else {
+                        assert_eq!(request["params"]["threadId"], "thread-1");
+                        assert_eq!(request["params"]["itemsView"], "full");
+                        json!({"data": [turn], "nextCursor": null})
+                    };
+                    websocket
+                        .send(Message::Text(
+                            json!({"id": request["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            });
+            let mut client = RpcClient::connect(&target.endpoint).await.unwrap();
+            let wait = TurnWaitContext {
+                target: &target,
+                thread_id: "thread-1",
+                turn_id: "turn-1".to_string(),
+                poll_limit: 50,
+            };
+            let mut events = Vec::new();
+            let terminal = poll_turn_completion(
+                &mut client,
+                &wait,
+                &mut AssistantResponses::default(),
+                &mut events,
+            )
+            .await
+            .unwrap()
+            .expect("polled terminal turn");
+            let event = events.last().unwrap();
+
+            assert_eq!(terminal.output["status"], status);
+            assert_eq!(terminal.output["finalAssistantText"], "Partial answer");
+            assert_eq!(event["source"], "poll");
+            if status == "completed" {
+                assert_eq!(terminal.exit_code, 0);
+                assert!(terminal.output.get("error").is_none());
+                assert!(event.get("error").is_none());
+            } else {
+                assert_eq!(terminal.exit_code, 1);
+                assert_eq!(terminal.output["error"], error);
+                assert_eq!(event["error"], error);
+                assert_eq!(terminal.output["progress"][1]["error"], error);
+            }
+            peer.await.unwrap();
+        }
     }
 }

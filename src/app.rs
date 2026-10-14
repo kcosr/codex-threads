@@ -1078,6 +1078,9 @@ fn emit_turn_terminal_output(
             ),
             ("turnId", terminal.output["turnId"].as_str().unwrap_or("")),
         ]);
+        if let Some(message) = terminal.output["error"]["message"].as_str() {
+            eprintln!("{message}");
+        }
     }
     Ok(terminal.exit_code)
 }
@@ -1693,6 +1696,7 @@ async fn goal_set_command(
     }
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(command.thread_id));
+    params.insert("origin".to_string(), json!(command.origin.as_str()));
     insert_opt(&mut params, "objective", command.objective);
     if let Some(status) = command.status {
         params.insert("status".to_string(), json!(goal_status(&status)?));
@@ -1715,7 +1719,7 @@ async fn goal_clear_command(
     let result = client
         .request(
             "thread/goal/clear",
-            json!({"threadId": command.thread_id}),
+            json!({"threadId": command.thread_id, "origin": command.origin.as_str()}),
             |_| {},
         )
         .await?;

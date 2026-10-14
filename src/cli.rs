@@ -517,6 +517,13 @@ pub struct GoalSetCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub thread_id: String,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = GoalMutationOrigin::Automatic,
+        help = "Use user for an explicitly requested goal change; automatic for agent lifecycle changes"
+    )]
+    pub origin: GoalMutationOrigin,
     #[arg(long)]
     pub objective: Option<String>,
     #[arg(long = "token-budget")]
@@ -539,8 +546,30 @@ pub struct GoalClearCommand {
     #[command(flatten)]
     pub server: ServerOpt,
     pub thread_id: String,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = GoalMutationOrigin::Automatic,
+        help = "Use user for an explicitly requested goal clear; automatic for agent lifecycle changes"
+    )]
+    pub origin: GoalMutationOrigin,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GoalMutationOrigin {
+    User,
+    Automatic,
+}
+
+impl GoalMutationOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Automatic => "automatic",
+        }
+    }
 }
 
 #[derive(Debug, Args)]

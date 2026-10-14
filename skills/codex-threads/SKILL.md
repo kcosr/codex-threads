@@ -155,6 +155,24 @@ cursors for exact persisted history. Use `search messages <thread_id> "query"`
 for exact occurrence snippets and turn cursors, with `--cursor` for further matches.
 Codex 0.155.1 creates persisted threads with paginated history by default; older
 legacy-history or ephemeral threads may return a server error for occurrence search.
+The reviewed Codex 0.162.1 search includes partial and final assistant answers
+along with visible user messages.
+
+## Goal Mutations
+
+`goal set <thread_id>` and `goal clear <thread_id>` accept
+`--origin user|automatic`, defaulting to `automatic`. Use `user` only when
+carrying out an explicit user request to change or clear a goal. Use `automatic`
+for agent lifecycle updates, such as marking authorized work complete. Codex
+records user-origin objective/status changes and clears as model-visible user
+context; automatic changes do not create user authorization. Budget-only edits
+do not create a user instruction even with `--origin user`.
+
+```bash
+codex-threads goal set <thread_id> --objective "Finish the refactor" --origin user
+codex-threads goal set <thread_id> --status complete --origin automatic
+codex-threads goal clear <thread_id> --origin user
+```
 
 ### Message limit and filter semantics
 
@@ -323,6 +341,10 @@ codex-threads send <thread_id> "message" --no-wait --json
 ```
 
 Blocking sends wait up to one hour. If the local wait times out, the command exits with code `3` and the remote turn may still be running.
+Failed and interrupted turns exit with code `1`. When app-server provides an
+error, final JSON and terminal NDJSON events retain the structured `error`
+object. Inspect `error.message` and `error.codexErrorInfo` before deciding on a
+follow-up; an interrupted turn may include a server-side refusal reason.
 
 If `send`, `steer`, or `settings set` sees Codex app-server's unloaded-thread error, it resumes/loads the thread and retries once. The resume uses yolo permissions by default unless global `--no-yolo` is passed.
 

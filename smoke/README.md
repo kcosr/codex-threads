@@ -10,7 +10,7 @@ app-server.
 
 ## Offline real-Codex qualification
 
-Build the CLI and point the harness at the exact reviewed 0.156.1 executable:
+Build the CLI and point the harness at the exact reviewed 0.162.1 executable:
 
 ```bash
 cargo build --locked
@@ -23,8 +23,11 @@ binary, but it does not use a live provider: it creates a disposable Codex home,
 workspace, state directory, and UDS app-server, serving two model responses from
 a loopback HTTP fixture. It does not read your Codex configuration or credentials.
 It exercises real request parsing, turn streaming, history/occurrence search,
-settings, goals, forks, section lifecycle and ordering, restart/resume, and
-archive/unarchive. Each app-server startup verifies that the configured socket
+partial and final assistant answers, direct turn lineage, model listing,
+settings, goal provenance, forks, section lifecycle and ordering, restart/resume,
+and archive/unarchive. It checks that explicit user goal edits survive restart
+as model-visible user context and automatic edits do not add user authorization.
+Each app-server startup verifies that the configured socket
 is a symlink resolving to a socket, including after restart. Temporary processes
 and state are cleaned up on completion.
 
@@ -66,7 +69,7 @@ To include a real turn:
 
 ```bash
 RUN_CODEX_TURN=1 \
-CODEX_MODEL=gpt-5.5 \
+CODEX_MODEL=gpt-6.1-sol \
 CODEX_EFFORT=high \
 CODEX_ENDPOINT=unix:///var/run/user/1000/codex.sock \
 smoke/live_smoke.sh

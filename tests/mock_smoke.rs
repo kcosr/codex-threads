@@ -133,6 +133,7 @@ enum TurnNotificationMode {
     None,
     WrongTurnCompleted,
     Failed,
+    Interrupted,
     UnknownStatus,
 }
 
@@ -538,6 +539,7 @@ async fn send_turn_notifications(
         TurnNotificationMode::Complete => ("turn_1", "completed", "done"),
         TurnNotificationMode::WrongTurnCompleted => ("turn_other", "failed", "done"),
         TurnNotificationMode::Failed => ("turn_1", "failed", "failed"),
+        TurnNotificationMode::Interrupted => ("turn_1", "interrupted", "partial answer"),
         TurnNotificationMode::UnknownStatus => ("turn_1", "mystery", "mystery"),
         TurnNotificationMode::None => return,
     };
@@ -574,19 +576,35 @@ async fn send_turn_notifications(
             .into(),
         ))
         .await;
+    let mut turn = json!({ "id": turn_id, "status": terminal_status, "items": [] });
+    if matches!(
+        mode,
+        TurnNotificationMode::Failed | TurnNotificationMode::Interrupted
+    ) {
+        turn["error"] = mock_turn_error();
+    }
     let _ = ws
         .send(Message::Text(
             json!({
                 "method": "turn/completed",
                 "params": {
                     "threadId": thread_id,
-                    "turn": { "id": turn_id, "status": terminal_status, "items": [] }
+                    "turn": turn
                 }
             })
             .to_string()
             .into(),
         ))
         .await;
+}
+
+fn mock_turn_error() -> Value {
+    json!({
+        "message": "Guardian reached its denial limit",
+        "codexErrorInfo": "tooManyDenials",
+        "additionalDetails": "fixture diagnostics",
+        "misalignment": null
+    })
 }
 
 fn mock_result(
@@ -3378,6 +3396,60 @@ fn failed_turn_exits_one_and_returns_terminal_json() {
     assert_eq!(failed["turnId"], "turn_1");
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["finalAssistantText"], "failed");
+    assert_eq!(failed["error"], mock_turn_error());
+    assert_eq!(
+        failed["progress"].as_array().unwrap().last().unwrap()["error"],
+        mock_turn_error()
+    );
+}
+
+#[test]
+fn terminal_turn_errors_reach_json_streams_and_human_stderr() {
+    for (mode, status) in [
+        (TurnNotificationMode::Failed, "failed"),
+        (TurnNotificationMode::Interrupted, "interrupted"),
+    ] {
+        let server = MockServer::start_with_options(mode, false, RejectFirst::none());
+
+        let output = server
+            .command()
+            .args(["send", "thread_1", "continue", "--json"])
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let terminal: Value = serde_json::from_slice(&output).expect("terminal JSON");
+        assert_eq!(terminal["status"], status);
+        assert_eq!(terminal["error"], mock_turn_error());
+
+        let output = server
+            .command()
+            .args(["send", "thread_1", "continue", "--json", "--stream"])
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let events: Vec<Value> = String::from_utf8(output)
+            .expect("UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("NDJSON event"))
+            .collect();
+        let event = events.last().expect("terminal event");
+        assert_eq!(event["status"], status);
+        assert_eq!(event["error"], mock_turn_error());
+
+        server
+            .command()
+            .args(["send", "thread_1", "continue"])
+            .assert()
+            .code(1)
+            .stdout(predicates::str::contains(status))
+            .stderr(predicates::str::contains(
+                "Guardian reached its denial limit",
+            ));
+    }
 }
 
 #[test]
@@ -3503,6 +3575,30 @@ fn control_and_goal_commands_return_acknowledgements() {
     let methods = server.methods();
     assert!(methods.iter().any(|method| method == "turn/steer"));
     assert!(methods.iter().any(|method| method == "thread/goal/clear"));
+}
+
+#[test]
+fn goal_mutations_send_explicit_origin() {
+    let server = MockServer::start();
+
+    for origin in [None, Some("user"), Some("automatic")] {
+        let mut set_args = vec!["goal", "set", "thread_1", "--objective", "Ship", "--json"];
+        let mut clear_args = vec!["goal", "clear", "thread_1", "--json"];
+        if let Some(origin) = origin {
+            set_args.extend(["--origin", origin]);
+            clear_args.extend(["--origin", origin]);
+        }
+        run_json(&server, &set_args);
+        run_json(&server, &clear_args);
+    }
+
+    for method in ["thread/goal/set", "thread/goal/clear"] {
+        let params = server.params_for(method);
+        assert_eq!(params.len(), 3);
+        for (params, origin) in params.iter().zip(["automatic", "user", "automatic"]) {
+            assert_eq!(params["origin"], origin);
+        }
+    }
 }
 
 #[test]

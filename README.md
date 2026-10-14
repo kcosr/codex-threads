@@ -65,7 +65,7 @@ CLI as a safety boundary.
 ## Codex compatibility
 
 The current app-server integration has been reviewed through Codex application
-release 0.156.1, using the exact upstream reference recorded in
+release 0.162.1, using the exact upstream reference recorded in
 [`CODEX_COMPATIBILITY.md`](CODEX_COMPATIBILITY.md). That file links each
 intentional Codex API review to the `codex-threads` release that adopted it and
 records reviewed features that were deferred.
@@ -90,6 +90,7 @@ threads in paginated mode when a state database is available. Older legacy
 threads and stores without paginated history report an unsupported-operation
 error; this CLI does not migrate them. Results include `turnId`, `itemId`,
 `snippetMatchRange`, and `turnCursor` for exact follow-up history paging.
+Search covers visible user messages and partial and final assistant answers.
 
 ## Screenshot
 
@@ -172,7 +173,7 @@ For the common one-server case, configure one server at
 `~/.config/codex-threads/config.toml`:
 
 ```toml
-model = "gpt-5.5"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "high"
 
 [servers.main]
@@ -200,7 +201,7 @@ endpoint = "unix:///path/to/main/codex.sock"
 
 [servers.work]
 endpoint = "ws://127.0.0.1:8765"
-model = "gpt-5.5"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "low"
 ```
 
@@ -477,8 +478,8 @@ explicitly.
 | `models` | List available models from the app-server. |
 | `usage` | Show account usage, rate-limit windows, plan, and credits from the app-server. `usage redeem` redeems the best available reset credit only when permitted for the selected server. |
 | `goal get THREAD_ID` | Read the active goal. |
-| `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. |
-| `goal clear THREAD_ID` | Clear the active goal. |
+| `goal set THREAD_ID` | Set `--objective`, `--status`, or `--token-budget`; at least one flag is required. Supports `--origin user\|automatic` (default: `automatic`). |
+| `goal clear THREAD_ID` | Clear the active goal. Supports `--origin user\|automatic` (default: `automatic`). |
 | `annotate set THREAD_ID TEXT` | Set or replace a local annotation for a thread. |
 | `annotate get THREAD_ID` | Read a local annotation. Missing annotations exit with code `2`. |
 | `annotate clear THREAD_ID` | Clear a local annotation. |
@@ -517,6 +518,19 @@ Absent or null capability data is treated as unknown, not as a rejection.
 Built-in completion suggestions are `none`, `minimal`, `low`, `medium`, `high`,
 `xhigh`, `max`, and `ultra`. Accepted `goal set --status` values are `active`,
 `paused`, `blocked`, `usage-limited`, `budget-limited`, and `complete`.
+
+Goal mutations default to `--origin automatic`. Use `--origin user` when
+carrying out an explicit user request to set, change, pause, resume, or clear a
+goal. Codex records user-origin objective/status changes and clears in the
+thread's model-visible user context; automatic lifecycle edits update goal
+state without adding user authorization. Token-budget-only changes update the
+budget without adding a user instruction, regardless of origin.
+
+```bash
+codex-threads goal set THREAD_ID --objective "Finish the refactor" --origin user
+codex-threads goal set THREAD_ID --status complete --origin automatic
+codex-threads goal clear THREAD_ID --origin user
+```
 
 ## Shell Completion
 
@@ -590,6 +604,12 @@ commands. Blocking `new PROMPT --json` and `send --json` include:
 Streamed assistant progress events include Codex `itemId` when available, and
 `assistantResponses` contains one entry per assistant item so clients can keep
 separate assistant messages distinct.
+
+When Codex supplies a terminal turn error, final JSON output and the terminal
+progress/NDJSON event include its complete `error` object. Failed and interrupted
+turns both retain this detail, including `codexErrorInfo` such as
+`tooManyDenials`. Human output prints the error message to stderr, and the TUI
+shows the message while retaining the turn's reported status.
 
 `--json --stream` is available for `new PROMPT` and `send`. It emits NDJSON:
 one accepted event, zero or more progress events, and one terminal event.
@@ -766,7 +786,7 @@ stateful mock app-server:
 cargo test --test tui_pty_smoke -- --ignored
 ```
 
-A real Codex 0.156.1 app-server can also be tested without account credentials
+A real Codex 0.162.1 app-server can also be tested without account credentials
 or provider usage. The harness uses a temporary home and loopback model fixture
 (requires Node.js 24 or newer and a built debug binary):
 

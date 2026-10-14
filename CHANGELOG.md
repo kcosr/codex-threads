@@ -18,12 +18,20 @@
 - Add an isolated real-Codex offline smoke harness covering thread lifecycle,
   settings, goals, history, sections, and persisted resume without provider usage
   ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+- Add `--origin user|automatic` to `goal set` and `goal clear` for Codex goal
+  mutation provenance, defaulting to `automatic` so agent lifecycle edits do
+  not create user authorization
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
 
 ### Changed
 
 - Review Codex 0.156.1 and update the offline smoke baseline. Verify symlink
   socket connections in mock CLI tests and real app-server startup/restart;
   existing runtime connections need no changes
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+- Update the reviewed Codex app-server baseline and real-Codex offline smoke to
+  0.162.1, including partial answers, turn lineage, and goal provenance. Update
+  model examples and the live smoke default to `gpt-6.1-sol`
   ([#13](https://github.com/kcosr/codex-threads/pull/13)).
 
 ### Fixed
@@ -34,6 +42,10 @@
   while unrelated notifications arrive.
 - Report daemon-draining refusals without automatically replaying work, and
   correlate polled turns by their exact IDs instead of prompt/time heuristics
+  ([#13](https://github.com/kcosr/codex-threads/pull/13)).
+- Preserve structured errors from failed and interrupted turns in final JSON,
+  terminal stream events, human output, and the TUI. Keep interrupted TUI turns
+  marked interrupted after completion
   ([#13](https://github.com/kcosr/codex-threads/pull/13)).
 
 ## [0.2.4] - 2026-07-30

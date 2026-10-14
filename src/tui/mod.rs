@@ -3503,11 +3503,9 @@ fn stream_status_from_wait_outcome(
 ) -> StreamStatus {
     match outcome {
         TurnWaitOutcome::Terminal(terminal) => {
+            let status = stream_status_after_event(StreamStatus::Running, &terminal.output);
             send_stream_event(app_tx, stream_id, terminal.output);
-            match terminal.exit_code {
-                0 => StreamStatus::Completed,
-                _ => StreamStatus::Failed,
-            }
+            status
         }
         TurnWaitOutcome::LocalInterrupt { .. } => StreamStatus::Detached,
     }
@@ -4590,6 +4588,14 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     ));
                 }
                 stream.status = stream_status_after_event(stream.status, &event);
+                if let Some(error) = event.get("error").filter(|error| !error.is_null()) {
+                    stream.last_error = Some(
+                        error["message"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| error.to_string()),
+                    );
+                }
                 if event["source"].as_str() == Some("poll") {
                     stream.last_poll_at = Some(std::time::Instant::now());
                 }
@@ -12756,6 +12762,52 @@ mod tests {
             message_text(&state.browser.preview.messages[0]),
             "hello there"
         );
+    }
+
+    #[test]
+    fn terminal_turn_errors_remain_visible_after_stream_finishes() {
+        for (status, expected) in [
+            ("failed", StreamStatus::Failed),
+            ("interrupted", StreamStatus::Interrupted),
+        ] {
+            let mut state = test_state();
+            state.stream = Some(StreamState::new_for_server_with_id(
+                7,
+                "work".to_string(),
+                "t1".to_string(),
+                Some("turn-1".to_string()),
+                StreamStatus::Running,
+                false,
+            ));
+            let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+            let actual = stream_status_from_wait_outcome(
+                TurnWaitOutcome::Terminal(crate::turns::TurnTerminal {
+                    output: serde_json::json!({
+                        "server": "work",
+                        "threadId": "t1",
+                        "turnId": "turn-1",
+                        "status": status,
+                        "error": {
+                            "message": "Guardian reached its denial limit",
+                            "codexErrorInfo": "tooManyDenials"
+                        }
+                    }),
+                    exit_code: 1,
+                }),
+                7,
+                &app_tx,
+            );
+            assert_eq!(actual, expected);
+            handle_app_event(app_rx.try_recv().unwrap(), &mut state);
+            handle_app_event(stream_finished(7, "t1", Some("turn-1"), actual), &mut state);
+
+            let stream = state.stream.as_ref().expect("stream");
+            assert_eq!(stream.status, expected);
+            assert_eq!(
+                stream.last_error.as_deref(),
+                Some("Guardian reached its denial limit")
+            );
+        }
     }
 
     fn test_state() -> TuiState {
