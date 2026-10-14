@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/debug/codex-threads}"
 CODEX_ENDPOINT="${CODEX_ENDPOINT:-${CODEX_SOCK:-unix:///var/run/user/1000/codex.sock}}"
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-6.1-sol}"
 CODEX_EFFORT="${CODEX_EFFORT:-high}"
 CODEX_AUTH_TOKEN_ENV="${CODEX_AUTH_TOKEN_ENV:-}"
 CODEX_AUTH_TOKEN="${CODEX_AUTH_TOKEN:-}"

@@ -2,10 +2,34 @@
 
 Deterministic mock smoke coverage lives in `tests/mock_smoke.rs` and runs as
 part of `cargo test`. Those tests launch mock Codex app-servers over Unix
-domain sockets and TCP WebSockets and exercise the compiled CLI binary.
+domain sockets and TCP WebSockets and exercise the compiled CLI binary,
+including configured and direct connections through a symlink socket endpoint.
 
 This directory contains opt-in live smoke checks against a real Codex
 app-server.
+
+## Offline real-Codex qualification
+
+Build the CLI and point the harness at the exact reviewed 0.162.1 executable:
+
+```bash
+cargo build --locked
+CODEX_BIN=/path/to/codex node smoke/offline_codex.mjs
+```
+
+Node.js 24 or newer is required. `BIN` can select a different compiled
+`codex-threads` executable. This is opt-in because it needs the separate Codex
+binary, but it does not use a live provider: it creates a disposable Codex home,
+workspace, state directory, and UDS app-server, serving two model responses from
+a loopback HTTP fixture. It does not read your Codex configuration or credentials.
+It exercises real request parsing, turn streaming, history/occurrence search,
+partial and final assistant answers, direct turn lineage, model listing,
+settings, goal provenance, forks, section lifecycle and ordering, restart/resume,
+and archive/unarchive. It checks that explicit user goal edits survive restart
+as model-visible user context and automatic edits do not add user authorization.
+Each app-server startup verifies that the configured socket
+is a symlink resolving to a socket, including after restart. Temporary processes
+and state are cleaned up on completion.
 
 ## Live Smoke
 
@@ -45,7 +69,7 @@ To include a real turn:
 
 ```bash
 RUN_CODEX_TURN=1 \
-CODEX_MODEL=gpt-5.5 \
+CODEX_MODEL=gpt-6.1-sol \
 CODEX_EFFORT=high \
 CODEX_ENDPOINT=unix:///var/run/user/1000/codex.sock \
 smoke/live_smoke.sh

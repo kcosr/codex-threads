@@ -412,6 +412,19 @@ mod tests {
     #[test]
     fn completes_nested_subcommands() {
         assert_eq!(
+            completion_candidates("", &[String::from("sections")])
+                .lines()
+                .filter(|line| !line.starts_with('-'))
+                .collect::<Vec<_>>(),
+            vec!["list", "create", "rename", "delete"]
+        );
+        assert!(
+            !completion_candidates("", &[])
+                .lines()
+                .any(|line| matches!(line, "pin" | "unpin"))
+        );
+        assert!(completion_candidates("--sec", &[String::from("list")]).contains("--section\n"));
+        assert_eq!(
             completion_candidates("p", &[String::from("servers")]),
             "ping\n"
         );
@@ -427,7 +440,10 @@ mod tests {
             completion_candidates("r", &[String::from("usage")]),
             "redeem\n"
         );
-        assert_eq!(completion_candidates("m", &[String::from("search")]), "");
+        assert_eq!(
+            completion_candidates("m", &[String::from("search")]),
+            "messages\n"
+        );
         assert_eq!(
             completion_candidates("t", &[String::from("search")]),
             "threads\n"

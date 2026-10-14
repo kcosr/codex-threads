@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
@@ -45,8 +45,8 @@ pub struct StartedTurn {
     pub acceptance: Value,
     pub thread_id: String,
     pub turn_id: String,
+    #[cfg(feature = "tui")]
     prompt: Option<String>,
-    started_after_epoch: Option<i64>,
     early_notifications: Vec<Notification>,
     assistant_seed: AssistantResponses,
 }
@@ -145,6 +145,7 @@ impl AssistantResponses {
         self.find_index(item_id).is_some()
     }
 
+    #[cfg(any(feature = "tui", test))]
     fn text_for_item(&self, item_id: Option<&str>) -> Option<&str> {
         self.find_index(item_id)
             .map(|index| self.items[index].text.as_str())
@@ -252,6 +253,7 @@ impl AssistantResponses {
 
     /// Seeds one snapshot item during attach; order of calls must follow the
     /// item order within the turn.
+    #[cfg(any(feature = "tui", test))]
     fn seed_snapshot_item(&mut self, item_id: Option<&str>, text: &str) {
         let mut item = AssistantResponse::new(item_id.map(str::to_string));
         item.text = text.to_string();
@@ -646,7 +648,6 @@ where
             thread_id: options.thread_id,
             turn_id: options.turn_id,
             prompt: None,
-            started_after_epoch: None,
             early_notifications,
             assistant_seed,
         },
@@ -675,12 +676,10 @@ where
 {
     let mut events = vec![started.acceptance];
     let mut assistant = started.assistant_seed;
-    let mut wait = TurnWaitContext {
+    let wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
         turn_id: started.turn_id.clone(),
-        prompt: started.prompt.as_deref(),
-        started_after_epoch: started.started_after_epoch,
         poll_limit: options.poll_limit,
     };
     for notification in started.early_notifications {
@@ -697,8 +696,7 @@ where
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The live subscription is the primary transport; polling is only the
-    // fallback for turns whose notifications stop arriving (or never match,
-    // e.g. when turn/start returned a temporary turn id).
+    // fallback for turns whose notifications stop arriving.
     let mut last_turn_evidence = std::time::Instant::now();
     let turn_timeout = tokio::time::sleep(options.timeout);
     tokio::pin!(turn_timeout);
@@ -716,7 +714,7 @@ where
                         let before_len = events.len();
                         let terminal = poll_turn_completion(
                             client,
-                            &mut wait,
+                            &wait,
                             &mut assistant,
                             &mut events,
                         ).await?;
@@ -782,7 +780,7 @@ where
                 let before_len = events.len();
                 let terminal = poll_turn_completion(
                     client,
-                    &mut wait,
+                    &wait,
                     &mut assistant,
                     &mut events,
                 ).await?;
@@ -800,8 +798,6 @@ struct TurnWaitContext<'a> {
     target: &'a Target,
     thread_id: &'a str,
     turn_id: String,
-    prompt: Option<&'a str>,
-    started_after_epoch: Option<i64>,
     poll_limit: u32,
 }
 
@@ -825,8 +821,8 @@ pub async fn start_turn(
 ) -> Result<StartedTurn> {
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
-    let prompt_for_match = prompt.clone();
-    let started_after_epoch = Some(current_epoch_seconds().saturating_sub(1));
+    #[cfg(feature = "tui")]
+    let submitted_prompt = prompt.clone();
     params.insert(
         "input".to_string(),
         json!([{"type": "text", "text": prompt, "textElements": []}]),
@@ -874,8 +870,8 @@ pub async fn start_turn(
         acceptance,
         thread_id,
         turn_id,
-        prompt: Some(prompt_for_match),
-        started_after_epoch,
+        #[cfg(feature = "tui")]
+        prompt: Some(submitted_prompt),
         early_notifications: early_notifications
             .lock()
             .expect("early notification buffer poisoned")
@@ -897,12 +893,10 @@ where
 {
     let mut events = vec![started.acceptance];
     let mut assistant = started.assistant_seed;
-    let mut wait = TurnWaitContext {
+    let wait = TurnWaitContext {
         target,
         thread_id: &started.thread_id,
         turn_id: started.turn_id.clone(),
-        prompt: started.prompt.as_deref(),
-        started_after_epoch: started.started_after_epoch,
         poll_limit,
     };
     for notification in started.early_notifications {
@@ -960,7 +954,7 @@ where
                 let before_len = events.len();
                 let terminal = poll_turn_completion(
                     client,
-                    &mut wait,
+                    &wait,
                     &mut assistant,
                     &mut events,
                 ).await?;
@@ -976,7 +970,7 @@ where
 
 async fn poll_turn_completion(
     client: &mut RpcClient,
-    wait: &mut TurnWaitContext<'_>,
+    wait: &TurnWaitContext<'_>,
     assistant: &mut AssistantResponses,
     events: &mut Vec<Value>,
 ) -> Result<Option<TurnTerminal>> {
@@ -1015,59 +1009,19 @@ async fn poll_turn_completion(
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return Ok(None);
     }
-    let event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": &wait.turn_id, "status": status, "source": "poll"});
+    let mut event = json!({"type": status, "server": wait.target.server, "threadId": wait.thread_id, "turnId": &wait.turn_id, "status": status, "source": "poll"});
+    copy_turn_error(turn, &mut event);
     events.push(event);
     Ok(Some(turn_terminal(wait, status, assistant, events)))
 }
 
-fn poll_result_turn<'a>(wait: &mut TurnWaitContext<'_>, result: &'a Value) -> Option<&'a Value> {
-    let turns = result["data"].as_array()?;
-    if let Some(turn) = turns
+fn poll_result_turn<'a>(wait: &TurnWaitContext<'_>, result: &'a Value) -> Option<&'a Value> {
+    // turn/start returns the authoritative turn ID, including when it steers an
+    // existing turn. Prompt text cannot distinguish concurrent identical inputs.
+    result["data"]
+        .as_array()?
         .iter()
         .find(|turn| turn["id"].as_str() == Some(wait.turn_id.as_str()))
-    {
-        return Some(turn);
-    }
-    let prompt = wait.prompt?;
-    let turn = turns.first()?;
-    if !turn_matches_prompt(turn, prompt) || !turn_started_after(turn, wait.started_after_epoch) {
-        return None;
-    }
-    if let Some(turn_id) = turn["id"].as_str() {
-        wait.turn_id = turn_id.to_string();
-    }
-    Some(turn)
-}
-
-fn turn_matches_prompt(turn: &Value, prompt: &str) -> bool {
-    let Some(items) = turn["items"].as_array() else {
-        return false;
-    };
-    items.iter().any(|item| {
-        item["type"].as_str() == Some("userMessage")
-            && user_message_text(item).as_deref() == Some(prompt)
-    })
-}
-
-fn user_message_text(item: &Value) -> Option<String> {
-    let content = item["content"].as_array()?;
-    Some(
-        content
-            .iter()
-            .filter_map(|input| input["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
-fn turn_started_after(turn: &Value, started_after_epoch: Option<i64>) -> bool {
-    let Some(started_after_epoch) = started_after_epoch else {
-        return false;
-    };
-    turn["startedAt"]
-        .as_i64()
-        .or_else(|| turn["completedAt"].as_i64())
-        .is_some_and(|timestamp| timestamp >= started_after_epoch)
 }
 
 fn emit_new_events(
@@ -1118,7 +1072,7 @@ fn turn_terminal(
     events: &[Value],
 ) -> TurnTerminal {
     let final_text = assistant.final_text();
-    let output = json!({
+    let mut output = json!({
         "server": wait.target.server,
         "threadId": wait.thread_id,
         "turnId": &wait.turn_id,
@@ -1127,12 +1081,21 @@ fn turn_terminal(
         "assistantResponses": assistant.to_json(),
         "finalAssistantText": final_text
     });
+    if let Some(event) = events.last() {
+        copy_turn_error(event, &mut output);
+    }
     let exit_code = if output["status"].as_str() == Some("completed") {
         0
     } else {
         1
     };
     TurnTerminal { output, exit_code }
+}
+
+fn copy_turn_error(source: &Value, destination: &mut Value) {
+    if let Some(error) = source.get("error").filter(|error| !error.is_null()) {
+        destination["error"] = error.clone();
+    }
 }
 
 fn turn_event(
@@ -1199,9 +1162,9 @@ fn turn_event(
         {
             reject_unknown_turn_status(&notification.params["turn"])?;
             let status = turn_status(&notification.params["turn"]);
-            Ok(Some(
-                json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status}),
-            ))
+            let mut event = json!({"type": status, "server": server, "threadId": thread_id, "turnId": turn_id, "status": status});
+            copy_turn_error(&notification.params["turn"], &mut event);
+            Ok(Some(event))
         }
         _ => Ok(None),
     }
@@ -1230,13 +1193,6 @@ fn insert_turn_yolo_permissions(map: &mut Map<String, Value>) {
     );
 }
 
-fn current_epoch_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 fn turn_status(turn: &Value) -> &'static str {
     match turn["status"].as_str().unwrap_or("inProgress") {
         "completed" => "completed",
@@ -1251,7 +1207,7 @@ fn reject_unknown_turn_status(turn: &Value) -> Result<()> {
         return Ok(());
     };
     match status {
-        "completed" | "interrupted" | "failed" | "inProgress" | "running" | "pending" => Ok(()),
+        "completed" | "interrupted" | "failed" | "inProgress" => Ok(()),
         _ => Err(app_server_error(format!(
             "app-server returned unrecognized turn status `{status}`"
         ))),
@@ -1619,8 +1575,6 @@ mod tests {
             target: &target,
             thread_id: "thread-1",
             turn_id: "turn-1".to_string(),
-            prompt: None,
-            started_after_epoch: None,
             poll_limit: 50,
         };
         let mut assistant = AssistantResponses::default();
@@ -1720,8 +1674,6 @@ mod tests {
             target: &target,
             thread_id: "thread-1",
             turn_id: "turn-1".to_string(),
-            prompt: None,
-            started_after_epoch: None,
             poll_limit: 50,
         };
         let mut assistant = AssistantResponses::default();
@@ -1790,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_result_turn_adopts_persisted_turn_id_by_prompt_when_start_id_is_absent() {
+    fn poll_result_turn_does_not_adopt_another_turn_with_identical_prompt() {
         let target = Target {
             server: "work".to_string(),
             endpoint: Endpoint::Unix {
@@ -1799,12 +1751,10 @@ mod tests {
             model: None,
             model_reasoning_effort: None,
         };
-        let mut wait = TurnWaitContext {
+        let wait = TurnWaitContext {
             target: &target,
             thread_id: "thread-1",
             turn_id: "returned-id".to_string(),
-            prompt: Some("Reply with exactly: ok"),
-            started_after_epoch: Some(1_700_000_000),
             poll_limit: 50,
         };
         let result = json!({
@@ -1829,10 +1779,8 @@ mod tests {
             ]
         });
 
-        let turn = poll_result_turn(&mut wait, &result).expect("aliased turn");
-
-        assert_eq!(turn["id"], "persisted-id");
-        assert_eq!(wait.turn_id, "persisted-id");
+        assert!(poll_result_turn(&wait, &result).is_none());
+        assert_eq!(wait.turn_id, "returned-id");
     }
 
     #[test]
@@ -1845,12 +1793,10 @@ mod tests {
             model: None,
             model_reasoning_effort: None,
         };
-        let mut wait = TurnWaitContext {
+        let wait = TurnWaitContext {
             target: &target,
             thread_id: "thread-1",
             turn_id: "returned-id".to_string(),
-            prompt: Some("repeat prompt"),
-            started_after_epoch: Some(1_700_000_000),
             poll_limit: 50,
         };
         let result = json!({
@@ -1882,7 +1828,194 @@ mod tests {
             ]
         });
 
-        assert!(poll_result_turn(&mut wait, &result).is_none());
+        assert!(poll_result_turn(&wait, &result).is_none());
         assert_eq!(wait.turn_id, "returned-id");
+    }
+
+    #[test]
+    fn terminal_notifications_preserve_structured_turn_errors() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "turn-1".to_string(),
+            poll_limit: 50,
+        };
+        let error = json!({
+            "message": "Guardian reached its denial limit",
+            "codexErrorInfo": "tooManyDenials",
+            "misalignment": null,
+            "additionalDetails": "fixture diagnostics",
+            "futureDetails": {"retryable": false}
+        });
+        for status in ["failed", "interrupted"] {
+            let mut assistant = AssistantResponses::default();
+            assistant.complete_live(Some("assistant-1"), "Partial answer");
+            let mut events = Vec::new();
+            let terminal = process_turn_notification(
+                &wait,
+                Notification {
+                    method: "turn/completed".to_string(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": status, "error": error}
+                    }),
+                },
+                &mut assistant,
+                &mut events,
+            )
+            .unwrap()
+            .expect("terminal notification");
+
+            assert_eq!(terminal.exit_code, 1);
+            assert_eq!(terminal.output["status"], status);
+            assert_eq!(terminal.output["error"], error);
+            assert_eq!(terminal.output["finalAssistantText"], "Partial answer");
+            assert_eq!(events.last().unwrap()["error"], error);
+            assert_eq!(terminal.output["progress"][0]["error"], error);
+        }
+    }
+
+    #[test]
+    fn successful_terminal_notifications_omit_empty_errors() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: Endpoint::Unix {
+                path: PathBuf::from("/tmp/mock.sock"),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        let wait = TurnWaitContext {
+            target: &target,
+            thread_id: "thread-1",
+            turn_id: "turn-1".to_string(),
+            poll_limit: 50,
+        };
+        for include_null_error in [false, true] {
+            let mut turn = json!({"id": "turn-1", "status": "completed"});
+            if include_null_error {
+                turn["error"] = Value::Null;
+            }
+            let mut events = Vec::new();
+            let terminal = process_turn_notification(
+                &wait,
+                Notification {
+                    method: "turn/completed".to_string(),
+                    params: json!({"threadId": "thread-1", "turn": turn}),
+                },
+                &mut AssistantResponses::default(),
+                &mut events,
+            )
+            .unwrap()
+            .expect("successful completion");
+
+            assert_eq!(terminal.exit_code, 0);
+            assert!(terminal.output.get("error").is_none());
+            assert!(events.last().unwrap().get("error").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn polled_terminal_turns_preserve_errors_and_success_shape() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        for status in ["failed", "interrupted", "completed"] {
+            let error = if status == "completed" {
+                Value::Null
+            } else {
+                json!({
+                    "message": "The requested work stopped",
+                    "codexErrorInfo": "tooManyDenials",
+                    "additionalDetails": "fixture diagnostics"
+                })
+            };
+            let turn = json!({
+                "id": "turn-1",
+                "rootTurnId": "root-turn",
+                "status": status,
+                "error": error,
+                "items": [{"id": "assistant-1", "type": "agentMessage", "text": "Partial answer"}]
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = Target {
+                server: "work".to_string(),
+                endpoint: Endpoint::WebSocket {
+                    url: format!("ws://{}", listener.local_addr().unwrap()),
+                    auth_token: None,
+                },
+                model: None,
+                model_reasoning_effort: None,
+            };
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for method in ["initialize", "initialized", "thread/turns/list"] {
+                    let frame = websocket.next().await.unwrap().unwrap();
+                    let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], method);
+                    if method == "initialized" {
+                        continue;
+                    }
+                    let result = if method == "initialize" {
+                        json!({})
+                    } else {
+                        assert_eq!(request["params"]["threadId"], "thread-1");
+                        assert_eq!(request["params"]["itemsView"], "full");
+                        json!({"data": [turn], "nextCursor": null})
+                    };
+                    websocket
+                        .send(Message::Text(
+                            json!({"id": request["id"], "result": result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            });
+            let mut client = RpcClient::connect(&target.endpoint).await.unwrap();
+            let wait = TurnWaitContext {
+                target: &target,
+                thread_id: "thread-1",
+                turn_id: "turn-1".to_string(),
+                poll_limit: 50,
+            };
+            let mut events = Vec::new();
+            let terminal = poll_turn_completion(
+                &mut client,
+                &wait,
+                &mut AssistantResponses::default(),
+                &mut events,
+            )
+            .await
+            .unwrap()
+            .expect("polled terminal turn");
+            let event = events.last().unwrap();
+
+            assert_eq!(terminal.output["status"], status);
+            assert_eq!(terminal.output["finalAssistantText"], "Partial answer");
+            assert_eq!(event["source"], "poll");
+            if status == "completed" {
+                assert_eq!(terminal.exit_code, 0);
+                assert!(terminal.output.get("error").is_none());
+                assert!(event.get("error").is_none());
+            } else {
+                assert_eq!(terminal.exit_code, 1);
+                assert_eq!(terminal.output["error"], error);
+                assert_eq!(event["error"], error);
+                assert_eq!(terminal.output["progress"][1]["error"], error);
+            }
+            peer.await.unwrap();
+        }
     }
 }

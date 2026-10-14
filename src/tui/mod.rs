@@ -40,8 +40,9 @@ use crate::rate_limit_reset::select_best_rate_limit_reset_credit;
 use crate::rpc::{RpcClient, RpcRequestError};
 use crate::session::{
     ListThreadsRequest, SearchThreadsRequest, ShowThreadRequest, ThreadStartOptions,
-    ThreadStatusRequest, delete_thread, list_threads, read_thread_detail, search_threads,
-    set_thread_archived, set_thread_name, start_thread, thread_id_from_start, thread_status,
+    ThreadStatusRequest, delete_thread, list_threads, read_thread_detail,
+    request_with_resume_retry, search_threads, set_thread_archived, set_thread_name, start_thread,
+    thread_id_from_start, thread_status,
 };
 use crate::time_filter::parse_since;
 use crate::tui::events::{
@@ -446,12 +447,29 @@ fn resume_terminal_events(events: &mut Option<EventStream>) {
     *events = Some(EventStream::new());
 }
 
-fn build_codex_resume_launch(
-    target: &Target,
-    thread_id: &str,
-    cwd: &str,
-    yolo: bool,
-) -> CodexResumeLaunch {
+async fn prepare_codex_resume(target: &Target, thread_id: &str, yolo: bool) -> Result<()> {
+    if !yolo {
+        return Ok(());
+    }
+    let mut client = RpcClient::connect(&target.endpoint).await?;
+    request_with_resume_retry(
+        &mut client,
+        "thread/settings/update",
+        json!({
+            "threadId": thread_id,
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }),
+        thread_id,
+        yolo,
+        || {},
+        |_| {},
+    )
+    .await?;
+    Ok(())
+}
+
+fn build_codex_resume_launch(target: &Target, thread_id: &str, cwd: &str) -> CodexResumeLaunch {
     let mut args = vec![
         OsString::from("resume"),
         OsString::from(thread_id),
@@ -467,9 +485,6 @@ fn build_codex_resume_launch(
         args.push(OsString::from("--remote-auth-token-env"));
         args.push(OsString::from(CODEX_REMOTE_AUTH_ENV));
         env.push((OsString::from(CODEX_REMOTE_AUTH_ENV), OsString::from(token)));
-    }
-    if yolo {
-        args.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"));
     }
     args.push(OsString::from("--cd"));
     args.push(OsString::from(cwd));
@@ -702,7 +717,10 @@ impl RpcClientCache {
 }
 
 fn keep_client_after_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<RpcRequestError>().is_some()
+    err.downcast_ref::<RpcRequestError>().is_some_and(|error| {
+        !(error.error.code == -32600
+            && error.error.message == "Server is draining; retry after reconnecting")
+    })
 }
 
 async fn fetch_browser(
@@ -721,7 +739,7 @@ async fn fetch_browser(
                     since: query.since,
                     cwd: query.cwd,
                     archived: query.archived,
-                    is_pinned: None,
+                    section_id: None,
                     model_providers: query.model_providers,
                     source_kinds: query.source_kinds,
                     parent_thread_id: None,
@@ -2027,10 +2045,14 @@ async fn handle_terminal_event(
                 KeyCode::Esc => state.mode = return_mode,
                 KeyCode::Enter => {
                     state.mode = return_mode;
+                    if let Err(error) = prepare_codex_resume(target, &thread_id, yolo).await {
+                        state.set_notice(format!("failed to prepare codex: {error}"));
+                        return Ok(TerminalEventOutcome::none());
+                    }
                     detach_stream(state);
                     return Ok(TerminalEventOutcome {
                         codex_launch: Some(PendingCodexLaunch {
-                            launch: build_codex_resume_launch(target, &thread_id, &cwd, yolo),
+                            launch: build_codex_resume_launch(target, &thread_id, &cwd),
                             server,
                             thread_id,
                         }),
@@ -3481,11 +3503,9 @@ fn stream_status_from_wait_outcome(
 ) -> StreamStatus {
     match outcome {
         TurnWaitOutcome::Terminal(terminal) => {
+            let status = stream_status_after_event(StreamStatus::Running, &terminal.output);
             send_stream_event(app_tx, stream_id, terminal.output);
-            match terminal.exit_code {
-                0 => StreamStatus::Completed,
-                _ => StreamStatus::Failed,
-            }
+            status
         }
         TurnWaitOutcome::LocalInterrupt { .. } => StreamStatus::Detached,
     }
@@ -4568,6 +4588,14 @@ fn handle_app_event(event: AppEvent, state: &mut TuiState) {
                     ));
                 }
                 stream.status = stream_status_after_event(stream.status, &event);
+                if let Some(error) = event.get("error").filter(|error| !error.is_null()) {
+                    stream.last_error = Some(
+                        error["message"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| error.to_string()),
+                    );
+                }
                 if event["source"].as_str() == Some("poll") {
                     stream.last_poll_at = Some(std::time::Instant::now());
                 }
@@ -10598,7 +10626,48 @@ mod tests {
     }
 
     #[test]
-    fn codex_resume_launch_uses_remote_cwd_and_yolo_flag() {
+    fn draining_connection_is_not_cached_for_the_next_action() {
+        for (code, message, keep) in [
+            (
+                -32600,
+                "Server is draining; retry after reconnecting",
+                false,
+            ),
+            (-32600, "Invalid request", true),
+            (-32000, "Server is draining; retry after reconnecting", true),
+        ] {
+            let error = anyhow::Error::new(RpcRequestError {
+                method: "thread/list".to_string(),
+                error: crate::rpc::RpcError {
+                    code,
+                    message: message.to_string(),
+                },
+            });
+            assert_eq!(keep_client_after_error(&error), keep);
+        }
+        assert!(!keep_client_after_error(&anyhow::anyhow!(
+            "connection closed"
+        )));
+    }
+
+    #[tokio::test]
+    async fn remote_resume_no_yolo_preserves_server_permissions_without_connecting() {
+        let target = Target {
+            server: "work".to_string(),
+            endpoint: crate::config::Endpoint::Unix {
+                path: "/nonexistent/codex.sock".into(),
+            },
+            model: None,
+            model_reasoning_effort: None,
+        };
+        prepare_codex_resume(&target, "thread", false)
+            .await
+            .expect("no settings override");
+        assert!(prepare_codex_resume(&target, "thread", true).await.is_err());
+    }
+
+    #[test]
+    fn codex_resume_launch_uses_remote_cwd_without_permission_overrides() {
         let target = Target {
             server: "work".to_string(),
             endpoint: crate::config::Endpoint::Unix {
@@ -10608,7 +10677,7 @@ mod tests {
             model_reasoning_effort: None,
         };
 
-        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project", true);
+        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project");
         let args = launch
             .args
             .iter()
@@ -10622,7 +10691,6 @@ mod tests {
                 "session-1",
                 "--remote",
                 "unix:///tmp/codex.sock",
-                "--dangerously-bypass-approvals-and-sandbox",
                 "--cd",
                 "/tmp/project",
             ]
@@ -10642,7 +10710,7 @@ mod tests {
             model_reasoning_effort: None,
         };
 
-        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project", false);
+        let launch = build_codex_resume_launch(&target, "session-1", "/tmp/project");
         let args = launch
             .args
             .iter()
@@ -12694,6 +12762,52 @@ mod tests {
             message_text(&state.browser.preview.messages[0]),
             "hello there"
         );
+    }
+
+    #[test]
+    fn terminal_turn_errors_remain_visible_after_stream_finishes() {
+        for (status, expected) in [
+            ("failed", StreamStatus::Failed),
+            ("interrupted", StreamStatus::Interrupted),
+        ] {
+            let mut state = test_state();
+            state.stream = Some(StreamState::new_for_server_with_id(
+                7,
+                "work".to_string(),
+                "t1".to_string(),
+                Some("turn-1".to_string()),
+                StreamStatus::Running,
+                false,
+            ));
+            let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+            let actual = stream_status_from_wait_outcome(
+                TurnWaitOutcome::Terminal(crate::turns::TurnTerminal {
+                    output: serde_json::json!({
+                        "server": "work",
+                        "threadId": "t1",
+                        "turnId": "turn-1",
+                        "status": status,
+                        "error": {
+                            "message": "Guardian reached its denial limit",
+                            "codexErrorInfo": "tooManyDenials"
+                        }
+                    }),
+                    exit_code: 1,
+                }),
+                7,
+                &app_tx,
+            );
+            assert_eq!(actual, expected);
+            handle_app_event(app_rx.try_recv().unwrap(), &mut state);
+            handle_app_event(stream_finished(7, "t1", Some("turn-1"), actual), &mut state);
+
+            let stream = state.stream.as_ref().expect("stream");
+            assert_eq!(stream.status, expected);
+            assert_eq!(
+                stream.last_error.as_deref(),
+                Some("Guardian reached its denial limit")
+            );
+        }
     }
 
     fn test_state() -> TuiState {
